@@ -22,7 +22,7 @@ pub use konomind::{
     KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
 };
 pub use nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
-pub use node::{KonoNode, PeerInfo};
+pub use node::{KonoNode, PeerInfo, RelayAppHandle};
 pub use protocol::{MessageBody, WireEnvelope, KNP_VERSION};
 pub use punch::{PunchSchedule, PUNCH_AUTH_TTL, PUNCH_MAX_ATTEMPTS, PUNCH_START_DELAY};
 pub use relay::{
