@@ -190,6 +190,29 @@ struct AutoRelayFallback {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppTransport {
+    Direct(SocketAddr),
+    Relay {
+        relay_endpoint: SocketAddr,
+        circuit_id: u64,
+    },
+}
+
+fn preferred_app_transport(
+    direct: Option<SocketAddr>,
+    relay: Option<(SocketAddr, u64)>,
+) -> Option<AppTransport> {
+    direct
+        .map(AppTransport::Direct)
+        .or_else(|| {
+            relay.map(|(relay_endpoint, circuit_id)| AppTransport::Relay {
+                relay_endpoint,
+                circuit_id,
+            })
+        })
+}
+
 pub struct KonoNode {
     identity: NodeIdentity,
     socket: Arc<UdpSocket>,
@@ -1101,11 +1124,11 @@ impl KonoNode {
                     "filtering test unavailable from this coordinator"
                 );
             }
-            SecurePayload::RelayAppFragment { .. } | SecurePayload::RelayAppAck { .. } => {
-                debug!(
-                    peer = %sender_node_id,
-                    "ignored relay application payload outside relay E2E session"
-                );
+            SecurePayload::RelayAppFragment { fragment } => {
+                self.handle_app_fragment(sender_node_id, fragment).await?;
+            }
+            SecurePayload::RelayAppAck { message_id } => {
+                self.handle_app_ack(sender_node_id, message_id);
             }
             SecurePayload::DhtStore { record } => {
                 let record_node_id = record.node_id.clone();
@@ -1958,47 +1981,10 @@ impl KonoNode {
                         );
                     }
                     SecurePayload::RelayAppFragment { fragment } => {
-                        let message_id = fragment.message_id;
-                        let status = self.relay_app.accept_fragment(
-                            peer_node_id,
-                            fragment,
-                            Instant::now(),
-                        )?;
-
-                        if matches!(
-                            status,
-                            RelayAppReceiveStatus::Completed
-                                | RelayAppReceiveStatus::DuplicateCompleted
-                        ) {
-                            let ack = {
-                                let session = self
-                                    .relay_e2e_sessions
-                                    .get_mut(&key)
-                                    .ok_or_else(|| anyhow!("relay E2E session disappeared"))?;
-                                encode_relay_payload(
-                                    session,
-                                    &SecurePayload::RelayAppAck { message_id },
-                                )?
-                            };
-                            self.send_relay_inner(relay_endpoint, circuit_id, ack)
-                                .await?;
-                        }
-
-                        if status == RelayAppReceiveStatus::Completed {
-                            self.flush_relay_app_events();
-                            self.flush_relay_app_failures();
-                        }
+                        self.handle_app_fragment(peer_node_id, fragment).await?;
                     }
                     SecurePayload::RelayAppAck { message_id } => {
-                        if self.relay_app.acknowledge(peer_node_id, message_id) {
-                            debug!(
-                                %relay_endpoint,
-                                peer = %peer_node_id,
-                                circuit_id,
-                                message_id,
-                                "relay application message acknowledged"
-                            );
-                        }
+                        self.handle_app_ack(peer_node_id, message_id);
                     }
                     _ => {
                         debug!(
@@ -2014,6 +2000,86 @@ impl KonoNode {
         }
 
         Ok(())
+    }
+
+    async fn handle_app_fragment(
+        &mut self,
+        peer_node_id: &str,
+        fragment: crate::relay_app::RelayAppFragment,
+    ) -> Result<()> {
+        let message_id = fragment.message_id;
+        let status = self
+            .relay_app
+            .accept_fragment(peer_node_id, fragment, Instant::now())?;
+
+        if matches!(
+            status,
+            RelayAppReceiveStatus::Completed | RelayAppReceiveStatus::DuplicateCompleted
+        ) {
+            self.send_app_secure_payload(
+                peer_node_id,
+                SecurePayload::RelayAppAck { message_id },
+            )
+            .await?;
+        }
+
+        if status == RelayAppReceiveStatus::Completed {
+            self.flush_relay_app_events();
+            self.flush_relay_app_failures();
+        }
+
+        Ok(())
+    }
+
+    fn handle_app_ack(&mut self, peer_node_id: &str, message_id: u64) {
+        if self.relay_app.acknowledge(peer_node_id, message_id) {
+            debug!(
+                peer = %peer_node_id,
+                message_id,
+                "application message acknowledged"
+            );
+        }
+    }
+
+    async fn send_app_secure_payload(
+        &mut self,
+        peer_node_id: &str,
+        payload: SecurePayload,
+    ) -> Result<bool> {
+        let direct = self.direct_app_endpoint_for_peer(peer_node_id);
+        let relay = self.relay_e2e_path_for_peer(peer_node_id);
+
+        match preferred_app_transport(direct, relay) {
+            Some(AppTransport::Direct(endpoint)) => {
+                self.send_secure_payload(endpoint, payload).await?;
+                Ok(true)
+            }
+            Some(AppTransport::Relay {
+                relay_endpoint,
+                circuit_id,
+            }) => {
+                let encoded = {
+                    let Some(session) = self
+                        .relay_e2e_sessions
+                        .get_mut(&(relay_endpoint, circuit_id))
+                    else {
+                        return Ok(false);
+                    };
+                    encode_relay_payload(session, &payload)?
+                };
+                self.send_relay_inner(relay_endpoint, circuit_id, encoded)
+                    .await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn direct_app_endpoint_for_peer(&self, peer_node_id: &str) -> Option<SocketAddr> {
+        let endpoint = self.peer_endpoint_by_node_id(peer_node_id)?;
+        self.confirmed_sessions
+            .contains(&endpoint)
+            .then_some(endpoint)
     }
 
     fn handle_relay_app_command(&mut self, command: RelayAppCommand) {
@@ -2087,7 +2153,7 @@ impl KonoNode {
             );
         }
 
-        let ready_peers: HashSet<String> = self
+        let mut ready_peers: HashSet<String> = self
             .relay_e2e_sessions
             .keys()
             .filter_map(|key| {
@@ -2099,55 +2165,33 @@ impl KonoNode {
             })
             .collect();
 
+        ready_peers.extend(self.confirmed_sessions.iter().filter_map(|endpoint| {
+            self.peers.get(endpoint).map(|peer| peer.node_id.clone())
+        }));
+
         for _ in 0..RELAY_APP_BURST_PER_TICK {
             let Some(outbound) = self.relay_app.peek_next(&ready_peers) else {
                 break;
             };
 
-            let Some((relay_endpoint, circuit_id)) =
-                self.relay_e2e_path_for_peer(&outbound.peer_node_id)
-            else {
-                break;
+            let payload = SecurePayload::RelayAppFragment {
+                fragment: outbound.fragment.clone(),
             };
 
-            let encoded = {
-                let Some(session) = self
-                    .relay_e2e_sessions
-                    .get_mut(&(relay_endpoint, circuit_id))
-                else {
-                    break;
-                };
-
-                match encode_relay_payload(
-                    session,
-                    &SecurePayload::RelayAppFragment {
-                        fragment: outbound.fragment.clone(),
-                    },
-                ) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        debug!(
-                            peer = %outbound.peer_node_id,
-                            %error,
-                            "relay application fragment encryption failed"
-                        );
-                        break;
-                    }
-                }
-            };
-
-            if let Err(error) = self
-                .send_relay_inner(relay_endpoint, circuit_id, encoded)
+            match self
+                .send_app_secure_payload(&outbound.peer_node_id, payload)
                 .await
             {
-                debug!(
-                    peer = %outbound.peer_node_id,
-                    %relay_endpoint,
-                    circuit_id,
-                    %error,
-                    "relay application fragment send failed"
-                );
-                break;
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    debug!(
+                        peer = %outbound.peer_node_id,
+                        %error,
+                        "application fragment send failed on selected path"
+                    );
+                    break;
+                }
             }
 
             if let Err(error) = self.relay_app.mark_fragment_sent(
@@ -3315,6 +3359,7 @@ fn local_features() -> Vec<String> {
         "relay-e2e-session".to_owned(),
         "relay-app-fragmentation".to_owned(),
         "relay-app-backpressure".to_owned(),
+        "direct-relay-app-migration".to_owned(),
         "punch-to-relay-fallback".to_owned(),
         "multi-candidate-relay-fallback".to_owned(),
         "consent-filter-probe".to_owned(),
@@ -3322,4 +3367,29 @@ fn local_features() -> Vec<String> {
         "udp-punch-burst-v1".to_owned(),
         "secure-ping-pong".to_owned(),
     ]
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_transport_prefers_direct_and_falls_back_to_relay() {
+        let direct: SocketAddr = "203.0.113.1:47000".parse().unwrap();
+        let relay: SocketAddr = "198.51.100.2:47000".parse().unwrap();
+
+        assert_eq!(
+            preferred_app_transport(Some(direct), Some((relay, 7))),
+            Some(AppTransport::Direct(direct))
+        );
+        assert_eq!(
+            preferred_app_transport(None, Some((relay, 7))),
+            Some(AppTransport::Relay {
+                relay_endpoint: relay,
+                circuit_id: 7,
+            })
+        );
+        assert_eq!(preferred_app_transport(None, None), None);
+    }
 }
