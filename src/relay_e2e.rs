@@ -1,11 +1,12 @@
 use crate::identity::{
     node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN,
 };
+use crate::relay::MAX_RELAY_CELL_BYTES;
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const MAX_RELAY_INNER_PACKET_BYTES: usize = 12 * 1024;
+pub const MAX_RELAY_INNER_PACKET_BYTES: usize = MAX_RELAY_CELL_BYTES;
 const RELAY_E2E_CONTEXT: &str = "knp-relay-e2e-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
