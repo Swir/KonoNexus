@@ -4,6 +4,14 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added a separate Ed25519-authenticated relay inner handshake bound to circuit ID and both endpoint NodeIDs.
+- Added fresh X25519/HKDF/ChaCha20-Poly1305 end-to-end sessions inside cooperative relay circuits; the relay never receives the derived keys.
+- Added inner encrypted relay PING/PONG validation, ciphertext tamper tests, circuit-binding tests, and expected-peer identity tests.
+- Added endpoint-side relay transport sequence checks and inner secure-session replay protection.
+- Added deterministic automatic fallback from an expired hole-punch burst to the same rendezvous coordinator as a single-hop relay.
+- Limited raw relay cells to 3 KiB so nested hex + AEAD framing stays inside the 16 KiB KNP datagram ceiling.
+- Bumped the implementation package to 0.1.0-alpha.10.
+
 - Added persistent routing hints saved only from currently authenticated encrypted peers.
 - Added routing-cache age/bounds validation, restart loading, configurable cache path, periodic refresh, and shutdown persistence.
 - Cached peers remain untrusted bootstrap hints and must repeat the full KNP admission and encrypted handshake after restart.
