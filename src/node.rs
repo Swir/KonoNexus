@@ -356,6 +356,17 @@ impl KonoNode {
                     return Ok(());
                 }
 
+                if let Some(pending) = self.pending_punches.get(&punch_token) {
+                    if pending.candidate_endpoint != source {
+                        debug!(
+                            offered = %pending.candidate_endpoint,
+                            actual = %source,
+                            peer = %sender_node_id,
+                            "punch peer arrived from an alternate mapped endpoint"
+                        );
+                    }
+                }
+
                 self.record_peer(&envelope, source);
                 self.pending_punches.remove(&punch_token);
 
@@ -389,6 +400,17 @@ impl KonoNode {
                         "ignoring unauthorized punch ack"
                     );
                     return Ok(());
+                }
+
+                if let Some(pending) = self.pending_punches.get(&punch_token) {
+                    if pending.candidate_endpoint != source {
+                        debug!(
+                            offered = %pending.candidate_endpoint,
+                            actual = %source,
+                            peer = %sender_node_id,
+                            "punch ack arrived from an alternate mapped endpoint"
+                        );
+                    }
                 }
 
                 self.record_peer(&envelope, source);
