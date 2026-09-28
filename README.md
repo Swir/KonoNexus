@@ -85,7 +85,8 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Bounded recursive multi-hop DHT over encrypted peers
 - [x] In-memory k-bucket-style routing table
 - [x] Persistent authenticated-peer routing hints across restarts
-- [ ] Persistent full k-bucket state and large-mesh convergence
+- [x] Persistent full bounded k-bucket state across restarts
+- [ ] Large-mesh convergence and churn validation
 - [x] Single-hop cooperative relay circuit/control foundation
 - [x] Bounded opaque relay cell forwarding
 - [x] Authenticated end-to-end inner session over relay
@@ -154,7 +155,7 @@ DHT control messages travel inside the existing encrypted KNP session:
 
 The local table is bounded to 4,096 records and responses to at most 8 records. Records expire automatically. KNP may cache nearest records, but it **does not automatically dial arbitrary nearest nodes**. A new network connection is attempted only from an exact valid record for a NodeID that the local user/application is already trying to reach.
 
-This is the DHT foundation, not yet a complete Kademlia implementation. Multi-hop iterative lookups, persistent k-buckets, endpoint attestations, and convergence testing across a large mesh remain future work.
+This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup and persistent bounded k-bucket snapshots are implemented; endpoint attestations, replication/refresh policy, Sybil-resistant diversity, and convergence testing across a large mesh remain future work.
 
 
 ### Bounded multi-hop DHT
@@ -173,11 +174,11 @@ A lookup is recursive but deliberately bounded:
 The lookup walks only existing encrypted mesh edges. It does **not** open connections to arbitrary nearest records returned by gossip. A new outbound discovery attempt still requires an exact, valid signed record for the NodeID the local application explicitly requested.
 
 
-### Persistent routing hints
+### Persistent routing buckets
 
-Alpha.9 writes a small `routing-cache.json` next to `identity.key` by default. Only peers that currently have an authenticated encrypted KNP session are saved. Cached entries are capped, age-limited, validated when loaded, and are treated only as bootstrap hints after restart. They never bypass signature checks, endpoint cookies, peer admission, or the X25519 encrypted-session handshake.
+KNP persists the complete bounded routing-table membership snapshot in `routing-cache.json`: bucket index, peer NodeID, endpoint, and last-seen time. The snapshot is bound to the local NodeID, validates bucket membership on load, rejects stale/future entries, and preserves the 8-entry limit for each of 256 XOR-distance buckets. Version-1 flat routing-hint files remain readable and migrate on the next save.
 
-The cache contains peer NodeIDs and endpoints, so it is metadata rather than secret key material. Operators can override its path with `--routing-cache`.
+Restart never restores authentication from disk. Only the 256 freshest cached endpoints are used as bounded bootstrap hints; every peer must pass signed HELLO, endpoint-cookie admission, identity verification, and a fresh X25519 session handshake before it can re-enter the live routing table. The cache is metadata, not secret key material. Operators can override its path with `--routing-cache`.
 
 ### Cooperative relay foundation
 
@@ -237,13 +238,13 @@ Alpha.13 retransmits the same `SESSION_INIT` after a one-second timeout, up to f
 When direct UDP punching fails, the preferred relay remains the rendezvous coordinator that helped produce the punch candidate. If that relay is gone, cannot open the target, or rejects the circuit, the lower-NodeID endpoint can try other already-authenticated encrypted peers. Alpha.13 tries at most three distinct relay candidates in a 30-second fallback state, never repeats the same candidate, and stops as soon as a direct or relay path to the target becomes active.
 
 
-### Direct session key rotation
+### Direct and relay-inner session key rotation
 
 Alpha.14 rotates confirmed **direct KNP sessions** using a fresh ephemeral X25519 exchange carried inside the already authenticated encrypted session. Only the lexicographically lower NodeID initiates periodic rekey, avoiding simultaneous competing rotations. Rekey starts after roughly 10 minutes, retries every second for at most four sends, and reuses the same rekey ID and initiator ephemeral key across retries.
 
 The responder returns the matching new X25519 public key over the old authenticated session, caches the ACK briefly for duplicate retries, and then switches to the newly derived HKDF/ChaCha20-Poly1305 session. Both endpoints retain the previous session for a 30-second grace window so authenticated packets already in flight under the old session ID can still be decrypted. New ordinary traffic uses the new session immediately.
 
-This rotation currently applies to direct KNP sessions. Periodic rekey of the inner E2E session inside relay circuits remains separate work.
+Relay-inner E2E sessions use the same bounded fresh-X25519 rotation pattern: lower-NodeID initiation, one-second retry cadence with at most four sends, cached responder ACKs, and a 30-second previous-session grace window. The relay forwards opaque cells and never receives the endpoint-to-endpoint derived keys.
 
 ### Live direct ↔ relay application migration
 
@@ -278,7 +279,7 @@ The next validation phase must use separate machines/networks and will check:
 3. different NATs / mobile hotspot,
 4. CGNAT or restrictive NAT causing cooperative relay fallback,
 5. direct↔relay migration while messages remain queued,
-6. reconnect/restart with persistent routing hints,
+6. reconnect/restart with persistent bounded routing buckets,
 7. delivery receipts/failures under temporary packet loss.
 
 See `docs/TESTING.md` for the controlled operator procedure.
