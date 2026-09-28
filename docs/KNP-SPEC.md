@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Full persistent k-bucket state, endpoint attestations, broad convergence testing, robust NAT/filtering classification, and application-facing relay payload APIs are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Reliable retransmission, UDP reordering tolerance, full persistent k-bucket state, endpoint attestations, broad convergence testing, and robust NAT/filtering validation are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -188,8 +188,18 @@ The core sends an encrypted inner PING after the initiator completes the handsha
 - route migration between direct and relay paths,
 - optional multi-relay paths and privacy analysis.
 
-## 20. Versioning
+## 20. RelayApp application transport
 
-## 20. Versioning
+Relay application messages are accepted only through an established inner E2E relay session. An application message is limited to 256 KiB and is split into 512-byte fragments. Each fragment carries a random message ID, fragment index/count, total message length, and hex-encoded data inside the encrypted inner `SecurePayload`.
+
+The sender keeps at most 64 outbound messages and 2 MiB of queued application bytes. A message remains accounted against those limits after all fragments are sent until the remote endpoint completes reassembly and returns encrypted `RelayAppAck(message_id)`. Outbound state expires after 120 seconds.
+
+The receiver permits at most 64 simultaneous reassemblies and reserves at most 4 MiB for their declared total lengths. Fragment count and lengths must exactly match the declared total length. Identical duplicate fragments are harmless; conflicting duplicates or metadata changes are rejected. Incomplete reassemblies expire after 30 seconds. Completed messages are held in a bounded queue of at most 128 messages / 4 MiB if the application consumer is temporarily backpressured.
+
+`RelayAppHandle` uses bounded Tokio channels. Application `send()` waits for command-channel capacity, the node validates/queues the message, and a oneshot response returns the assigned message ID or queue error. `recv()` yields only fully authenticated, decrypted, and reassembled messages. The node transmits at most four application fragments per 50 ms transport tick to bound work added to the event loop.
+
+The current implementation does not retransmit lost application fragments or ACKs. It also inherits the current secure-session rule that rejects reordered encrypted UDP frames. These reliability properties must be hardened before stable use.
+
+## 21. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
