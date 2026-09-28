@@ -11,8 +11,8 @@ use crate::relay_app::{
     RelayAppDeliveryFailure, RelayAppManager, RelayAppMessage, RelayAppReceiveStatus,
 };
 use crate::relay_e2e::{
-    accept_relay_init, decode_relay_payload, encode_relay_payload,
-    encode_relay_payload_on_session, packet_kind, RelayE2eInitiator,
+    accept_relay_init, decode_relay_payload, encode_relay_payload, encode_relay_payload_on_session,
+    packet_kind, RelayE2eInitiator,
 };
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
@@ -278,8 +278,7 @@ pub struct KonoNode {
     relay_e2e_pending: HashMap<(SocketAddr, u64), RelayE2eInitiator>,
     relay_e2e_sessions: HashMap<(SocketAddr, u64), SessionSlot>,
     pending_relay_e2e_rekeys: HashMap<(SocketAddr, u64), PendingRelayE2eRekey>,
-    responder_relay_e2e_rekey_acks:
-        HashMap<(SocketAddr, u64, u64), ResponderRelayE2eRekeyAck>,
+    responder_relay_e2e_rekey_acks: HashMap<(SocketAddr, u64, u64), ResponderRelayE2eRekeyAck>,
     last_relay_e2e_rekey: HashMap<(SocketAddr, u64), Instant>,
     relay_app: RelayAppManager,
     relay_app_command_rx: Option<mpsc::Receiver<RelayAppCommand>>,
@@ -1593,9 +1592,7 @@ impl KonoNode {
                     self.relay_e2e_sessions.remove(&(source, circuit_id));
                     self.pending_relay_e2e_rekeys.remove(&(source, circuit_id));
                     self.responder_relay_e2e_rekey_acks
-                        .retain(|(endpoint, cid, _), _| {
-                            *endpoint != source || *cid != circuit_id
-                        });
+                        .retain(|(endpoint, cid, _), _| *endpoint != source || *cid != circuit_id);
                     self.last_relay_e2e_rekey.remove(&(source, circuit_id));
                     self.pending_relay_requests.remove(&circuit_id);
                     self.pending_relay_accepts.remove(&(source, circuit_id));
@@ -2079,9 +2076,7 @@ impl KonoNode {
                         };
                         slot.rotate(new_session, Instant::now(), RELAY_E2E_REKEY_GRACE)?;
 
-                        if self.responder_relay_e2e_rekey_acks.len()
-                            >= MAX_RELAY_E2E_REKEY_ACKS
-                        {
+                        if self.responder_relay_e2e_rekey_acks.len() >= MAX_RELAY_E2E_REKEY_ACKS {
                             if let Some(oldest) = self
                                 .responder_relay_e2e_rekey_acks
                                 .iter()
@@ -2116,13 +2111,13 @@ impl KonoNode {
                         rekey_id,
                         ephemeral_public_key,
                     } => {
-                        let valid = self
-                            .pending_relay_e2e_rekeys
-                            .get(&key)
-                            .is_some_and(|attempt| {
-                                attempt.rekey_id == rekey_id
-                                    && attempt.peer_node_id == peer_node_id
-                            });
+                        let valid =
+                            self.pending_relay_e2e_rekeys
+                                .get(&key)
+                                .is_some_and(|attempt| {
+                                    attempt.rekey_id == rekey_id
+                                        && attempt.peer_node_id == peer_node_id
+                                });
                         if !valid {
                             return Ok(());
                         }
