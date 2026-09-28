@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod punch;
 pub mod relay;
 pub mod relay_e2e;
+pub mod relay_app;
 pub mod rendezvous;
 pub mod routing_cache;
 pub mod security;
@@ -31,6 +32,11 @@ pub use relay::{
 pub use relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
     RelayInnerPacket, MAX_RELAY_INNER_PACKET_BYTES,
+};
+pub use relay_app::{
+    RelayAppFragment, RelayAppManager, RelayAppMessage, RelayAppOutboundFragment,
+    MAX_RELAY_APP_MESSAGE_BYTES, MAX_RELAY_APP_OUTBOUND_BYTES, MAX_RELAY_APP_OUTBOUND_MESSAGES,
+    RELAY_APP_FRAGMENT_BYTES,
 };
 pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 pub use routing_cache::{
