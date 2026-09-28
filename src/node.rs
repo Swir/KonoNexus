@@ -557,8 +557,7 @@ impl KonoNode {
 
     fn authorize_punch(&self, token: u64, sender_node_id: &str) -> bool {
         self.pending_punches.get(&token).is_some_and(|pending| {
-            pending.expected_node_id == sender_node_id
-                && pending.expires_at > Instant::now()
+            pending.expected_node_id == sender_node_id && pending.expires_at > Instant::now()
         })
     }
 
