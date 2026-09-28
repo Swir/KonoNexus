@@ -16,7 +16,10 @@ use crate::relay_e2e::{
     packet_kind, RelayE2eInitiator,
 };
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
-use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
+use crate::routing_cache::{
+    load_routing_bucket_snapshot, new_bucket_cache_entry, save_routing_bucket_snapshot,
+    MAX_ROUTING_BOOTSTRAP_HINTS,
+};
 use crate::security::{CookieGuard, ReplayGuard, SequenceWindow};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SessionSlot};
 use anyhow::{anyhow, bail, Context, Result};
@@ -465,10 +468,12 @@ impl KonoNode {
     }
 
     pub fn configure_routing_cache(&mut self, path: PathBuf) -> Result<usize> {
-        let hints = load_routing_hints(&path)?;
-        let mut loaded = 0_usize;
+        let local_node_id = self.node_id();
+        let mut hints = load_routing_bucket_snapshot(&path, &local_node_id)?;
+        hints.sort_by_key(|entry| std::cmp::Reverse(entry.last_seen_unix_ms));
 
-        for hint in hints {
+        let mut loaded = 0_usize;
+        for hint in hints.into_iter().take(MAX_ROUTING_BOOTSTRAP_HINTS) {
             let Ok(endpoint) = hint.endpoint.parse::<SocketAddr>() else {
                 continue;
             };
@@ -2609,15 +2614,23 @@ impl KonoNode {
             return Ok(());
         };
 
+        let local_node_id = self.node_id();
+        let now = Instant::now();
         let mut entries = Vec::new();
-        for endpoint in self.sessions.keys() {
-            let Some(peer) = self.peers.get(endpoint) else {
+        for (bucket_index, peer) in self.routing.bucket_entries() {
+            let entry = new_bucket_cache_entry(
+                &local_node_id,
+                peer.node_id,
+                peer.endpoint,
+                now.saturating_duration_since(peer.last_seen),
+            )?;
+            if usize::from(entry.bucket_index) != bucket_index {
                 continue;
-            };
-            entries.push(new_cache_entry(peer.node_id.clone(), *endpoint)?);
+            }
+            entries.push(entry);
         }
 
-        save_routing_hints(path, &entries)
+        save_routing_bucket_snapshot(path, &local_node_id, &entries)
     }
 
     async fn flush_filter_test_request(&mut self, coordinator: SocketAddr) -> Result<()> {

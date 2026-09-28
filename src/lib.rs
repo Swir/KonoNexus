@@ -16,8 +16,8 @@ pub mod security;
 pub mod session;
 
 pub use dht::{
-    endpoint_publishable, DhtTable, PeerRecord, RoutingPeer, RoutingTable, DHT_MAX_HOPS,
-    DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
+    endpoint_publishable, routing_bucket_index, DhtTable, PeerRecord, RoutingPeer, RoutingTable,
+    DHT_MAX_HOPS, DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
 };
 pub use identity::NodeIdentity;
 pub use invite::InviteCode;
@@ -50,8 +50,9 @@ pub use relay_e2e::{
 };
 pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 pub use routing_cache::{
-    load_routing_hints, new_cache_entry, save_routing_hints, RoutingCacheEntry,
-    MAX_ROUTING_CACHE_ENTRIES,
+    load_routing_bucket_snapshot, load_routing_hints, new_bucket_cache_entry, new_cache_entry,
+    save_routing_bucket_snapshot, save_routing_hints, RoutingBucketCacheEntry, RoutingCacheEntry,
+    MAX_ROUTING_BOOTSTRAP_HINTS, MAX_ROUTING_BUCKET_CACHE_ENTRIES, MAX_ROUTING_CACHE_ENTRIES,
 };
 pub use security::SequenceWindow;
 pub use session::{

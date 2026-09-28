@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Alpha.13 adds explicit RelayApp delivery-failure events, bounded direct-session handshake retransmission with cached responder ACKs, responder-side confirmation before deferred encrypted control traffic is flushed, and bounded alternate relay selection across existing encrypted peers. Alpha.14 adds periodic fresh-X25519 rekey for direct KNP sessions with previous-session grace, plus NodeID-centric RelayApp transport migration that prefers confirmed direct sessions and falls back to relay E2E without resetting application message state. Relay-inner periodic rekey, full persistent k-bucket state, endpoint attestations, broad convergence testing, multi-network validation, and production hardening are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Alpha.13 adds explicit RelayApp delivery-failure events, bounded direct-session handshake retransmission with cached responder ACKs, responder-side confirmation before deferred encrypted control traffic is flushed, and bounded alternate relay selection across existing encrypted peers. Alpha.14 adds periodic fresh-X25519 rekey for direct KNP sessions with previous-session grace, plus NodeID-centric RelayApp transport migration that prefers confirmed direct sessions and falls back to relay E2E without resetting application message state. The current main branch also rotates relay-inner E2E sessions with the same bounded fresh-X25519 pattern and persists the complete bounded k-bucket membership snapshot for restart bootstrap. Endpoint attestations, broad convergence testing, multi-network validation, and production hardening are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -141,18 +141,17 @@ To constrain amplification and loops, query state expires after 8 seconds, forwa
 
 ## 15. Remaining DHT work
 
-- persistence of routing buckets across restarts,
 - endpoint ownership/observation attestations,
 - replication/refresh strategy,
 - stronger long-window query rate limiting,
 - Sybil-resistant routing diversity,
 - large-mesh convergence and churn testing.
 
-## 16. Persistent routing hints
+## 16. Persistent routing bucket snapshot
 
-The runtime may persist a bounded JSON cache of peers that currently have an authenticated encrypted KNP session. Each entry stores NodeID, endpoint, and save time. Entries older than seven days or with invalid NodeID/endpoint syntax are discarded when loading, and the cache is capped at 256 entries.
+The runtime persists the complete bounded routing-table membership snapshot: bucket index, NodeID, endpoint, and last-seen time. The file is bound to the local NodeID, stores at most 8 entries in each of the 256 XOR-distance buckets (2,048 entries total), rejects future/stale entries older than seven days, validates that every stored NodeID maps back to the claimed bucket, and keeps atomic replace semantics. Legacy version-1 flat hint caches are accepted and migrated on the next save.
 
-Loaded entries are only bootstrap hints. They are not inserted as authenticated peers or routing-table members until they complete the normal signed HELLO, anti-amplification cookie, identity verification, and encrypted-session handshake again. The cache is refreshed periodically and during clean shutdown from the currently active encrypted sessions.
+Restart does **not** restore trust. At most the 256 freshest cached endpoints are promoted to bootstrap probes, and every one must complete the normal signed HELLO, anti-amplification cookie, identity verification, and encrypted-session handshake before it can again participate as an authenticated routing peer. This keeps restart recovery bounded while preserving the full k-bucket layout on disk for safe revalidation.
 
 ## 17. Cooperative relay circuit foundation
 
@@ -182,11 +181,10 @@ The core sends an encrypted inner PING after the initiator completes the handsha
 
 ## 19. Remaining relay work
 
-- expose application send/receive APIs and backpressure on top of the inner session,
-- per-peer bandwidth/rate quotas and abuse accounting,
-- broader automatic relay selection when the latest rendezvous coordinator is unavailable,
-- route migration between direct and relay paths,
-- optional multi-relay paths and privacy analysis.
+- longer-window abuse accounting and adaptive quotas,
+- full control-plane path migration rather than RelayApp-only migration,
+- optional multi-relay path selection/failover and privacy analysis,
+- real multi-network/CGNAT load and churn validation.
 
 ## 20. RelayApp application transport
 
@@ -216,7 +214,7 @@ The responder may derive and store the session immediately, but it does not trea
 
 Automatic relay fallback is bounded to three distinct currently encrypted peers. The last rendezvous coordinator is preferred when available. A rejection or failed candidate advances the fallback state to another encrypted peer without retrying the same endpoint. The fallback state expires after 30 seconds and is removed immediately when either a direct peer session or a relay path to the target becomes active.
 
-## 23. Direct-session rekey
+## 23. Direct and relay-inner session rekey
 
 Direct KNP session rotation is initiated only by the endpoint with the lexicographically lower NodeID. A confirmed session becomes eligible for rekey after approximately ten minutes.
 
@@ -226,7 +224,7 @@ The responder derives a new session with the existing authenticated identity-bou
 
 After a valid ACK, the initiator derives the same new session. Both sides switch ordinary sends to the new session immediately and retain the previous session for a 30-second grace window. During that window the old session may decrypt authenticated in-flight frames; the responder may also use it to resend a cached rekey ACK. After expiry, old session keys are dropped/zeroized with the normal `SecureSession` lifecycle.
 
-This periodic rekey currently applies to direct KNP sessions. Relay-inner E2E session rotation is not yet included.
+Relay-inner E2E sessions use the same lower-NodeID initiation rule, fresh X25519 material, one-second/four-send retry bound, cached responder ACK behavior, and 30-second previous-session grace. Rekey control remains inside the authenticated inner session and is bound to the active relay circuit; the relay never receives the derived endpoint-to-endpoint keys.
 
 ## 24. NodeID-centric application path migration
 
