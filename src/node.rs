@@ -1960,7 +1960,9 @@ impl KonoNode {
                 let (session, ack) =
                     accept_relay_init(&self.identity, circuit_id, peer_node_id, encoded)?;
                 let session_id = session.session_id().to_owned();
-                self.relay_e2e_sessions.insert(key, session);
+                self.relay_e2e_sessions
+                    .insert(key, SessionSlot::new(session));
+                self.last_relay_e2e_rekey.insert(key, Instant::now());
                 self.send_relay_inner(relay_endpoint, circuit_id, ack)
                     .await?;
 
@@ -1976,12 +1978,14 @@ impl KonoNode {
                 let Some(pending) = self.relay_e2e_pending.remove(&key) else {
                     return Ok(());
                 };
-                let mut session = pending.complete(&self.identity, encoded)?;
+                let session = pending.complete(&self.identity, encoded)?;
                 let session_id = session.session_id().to_owned();
+                let mut slot = SessionSlot::new(session);
                 let ping_token: u64 = random();
                 let ping =
-                    encode_relay_payload(&mut session, &SecurePayload::Ping { token: ping_token })?;
-                self.relay_e2e_sessions.insert(key, session);
+                    encode_relay_payload(&mut slot, &SecurePayload::Ping { token: ping_token })?;
+                self.relay_e2e_sessions.insert(key, slot);
+                self.last_relay_e2e_rekey.insert(key, Instant::now());
                 self.send_relay_inner(relay_endpoint, circuit_id, ping)
                     .await?;
 
@@ -1994,14 +1998,158 @@ impl KonoNode {
                 );
             }
             "data" => {
-                let payload = {
+                let (incoming_session_id, payload) = {
                     let Some(session) = self.relay_e2e_sessions.get_mut(&key) else {
                         return Ok(());
                     };
-                    decode_relay_payload(session, encoded)?
+                    decode_relay_payload(session, encoded, Instant::now())?
                 };
 
                 match payload {
+                    SecurePayload::SessionRekeyInit {
+                        rekey_id,
+                        ephemeral_public_key,
+                    } => {
+                        let local_node_id = self.node_id();
+                        if local_node_id.as_str() < peer_node_id {
+                            debug!(
+                                %relay_endpoint,
+                                peer = %peer_node_id,
+                                circuit_id,
+                                rekey_id,
+                                "ignored relay E2E rekey init from non-designated initiator"
+                            );
+                            return Ok(());
+                        }
+
+                        let ack_key = (relay_endpoint, circuit_id, rekey_id);
+                        if let Some(cached) =
+                            self.responder_relay_e2e_rekey_acks.get(&ack_key).cloned()
+                        {
+                            if cached.expires_at > Instant::now()
+                                && cached.peer_node_id == peer_node_id
+                                && cached.initiator_public_key == ephemeral_public_key
+                            {
+                                let ack = {
+                                    let Some(slot) = self.relay_e2e_sessions.get_mut(&key) else {
+                                        return Ok(());
+                                    };
+                                    encode_relay_payload_on_session(
+                                        slot,
+                                        &incoming_session_id,
+                                        &SecurePayload::SessionRekeyAck {
+                                            rekey_id,
+                                            ephemeral_public_key: cached.responder_public_key,
+                                        },
+                                        Instant::now(),
+                                    )?
+                                };
+                                self.send_relay_inner(relay_endpoint, circuit_id, ack)
+                                    .await?;
+                                return Ok(());
+                            }
+                        }
+
+                        let (new_session, responder_public_key) = respond_handshake(
+                            &local_node_id,
+                            peer_node_id,
+                            rekey_id,
+                            &ephemeral_public_key,
+                        )?;
+
+                        let ack = {
+                            let Some(slot) = self.relay_e2e_sessions.get_mut(&key) else {
+                                return Ok(());
+                            };
+                            encode_relay_payload_on_session(
+                                slot,
+                                &incoming_session_id,
+                                &SecurePayload::SessionRekeyAck {
+                                    rekey_id,
+                                    ephemeral_public_key: responder_public_key.clone(),
+                                },
+                                Instant::now(),
+                            )?
+                        };
+                        self.send_relay_inner(relay_endpoint, circuit_id, ack)
+                            .await?;
+
+                        let Some(slot) = self.relay_e2e_sessions.get_mut(&key) else {
+                            return Ok(());
+                        };
+                        slot.rotate(new_session, Instant::now(), RELAY_E2E_REKEY_GRACE)?;
+
+                        if self.responder_relay_e2e_rekey_acks.len()
+                            >= MAX_RELAY_E2E_REKEY_ACKS
+                        {
+                            if let Some(oldest) = self
+                                .responder_relay_e2e_rekey_acks
+                                .iter()
+                                .min_by_key(|(_, state)| state.expires_at)
+                                .map(|(key, _)| *key)
+                            {
+                                self.responder_relay_e2e_rekey_acks.remove(&oldest);
+                            }
+                        }
+
+                        self.responder_relay_e2e_rekey_acks.insert(
+                            ack_key,
+                            ResponderRelayE2eRekeyAck {
+                                peer_node_id: peer_node_id.to_owned(),
+                                initiator_public_key: ephemeral_public_key,
+                                responder_public_key,
+                                expires_at: Instant::now() + RELAY_E2E_REKEY_ACK_TTL,
+                            },
+                        );
+                        self.last_relay_e2e_rekey.insert(key, Instant::now());
+
+                        info!(
+                            %relay_endpoint,
+                            peer = %peer_node_id,
+                            circuit_id,
+                            rekey_id,
+                            session_id = %slot.current_session_id(),
+                            "rotated relay E2E session keys as responder"
+                        );
+                    }
+                    SecurePayload::SessionRekeyAck {
+                        rekey_id,
+                        ephemeral_public_key,
+                    } => {
+                        let valid = self
+                            .pending_relay_e2e_rekeys
+                            .get(&key)
+                            .is_some_and(|attempt| {
+                                attempt.rekey_id == rekey_id
+                                    && attempt.peer_node_id == peer_node_id
+                            });
+                        if !valid {
+                            return Ok(());
+                        }
+
+                        let attempt = self
+                            .pending_relay_e2e_rekeys
+                            .remove(&key)
+                            .expect("pending relay E2E rekey checked above");
+                        let new_session = attempt
+                            .pending
+                            .complete(&self.node_id(), &ephemeral_public_key)?;
+
+                        let Some(slot) = self.relay_e2e_sessions.get_mut(&key) else {
+                            return Ok(());
+                        };
+                        slot.rotate(new_session, Instant::now(), RELAY_E2E_REKEY_GRACE)?;
+                        self.last_relay_e2e_rekey.insert(key, Instant::now());
+
+                        info!(
+                            %relay_endpoint,
+                            peer = %peer_node_id,
+                            circuit_id,
+                            rekey_id,
+                            session_id = %slot.current_session_id(),
+                            "rotated relay E2E session keys as initiator"
+                        );
+                    }
                     SecurePayload::Ping { token } => {
                         let pong = {
                             let session = self
@@ -2879,6 +3027,173 @@ impl KonoNode {
         }
     }
 
+    async fn drive_relay_e2e_rekeys(&mut self) {
+        let now = Instant::now();
+        self.responder_relay_e2e_rekey_acks
+            .retain(|_, state| state.expires_at > now);
+        for session in self.relay_e2e_sessions.values_mut() {
+            session.expire_previous(now);
+        }
+
+        let due: Vec<(SocketAddr, u64)> = self
+            .pending_relay_e2e_rekeys
+            .iter()
+            .filter(|(_, attempt)| attempt.next_retry_at <= now)
+            .map(|(key, _)| *key)
+            .collect();
+
+        let mut retries = Vec::new();
+        for key in due {
+            let Some(attempt) = self.pending_relay_e2e_rekeys.get_mut(&key) else {
+                continue;
+            };
+
+            if attempt.attempts >= RELAY_E2E_REKEY_MAX_ATTEMPTS {
+                let peer_node_id = attempt.peer_node_id.clone();
+                self.pending_relay_e2e_rekeys.remove(&key);
+                self.last_relay_e2e_rekey.insert(key, now);
+                debug!(
+                    relay = %key.0,
+                    circuit_id = key.1,
+                    peer = %peer_node_id,
+                    "relay E2E rekey retries exhausted"
+                );
+                continue;
+            }
+
+            attempt.attempts += 1;
+            attempt.next_retry_at = now + RELAY_E2E_REKEY_RETRY_DELAY;
+            retries.push((
+                key,
+                attempt.rekey_id,
+                attempt.ephemeral_public_key.clone(),
+                attempt.peer_node_id.clone(),
+                attempt.attempts,
+            ));
+        }
+
+        for (key, rekey_id, ephemeral_public_key, peer_node_id, attempt) in retries {
+            let encoded = {
+                let Some(slot) = self.relay_e2e_sessions.get_mut(&key) else {
+                    continue;
+                };
+                match encode_relay_payload(
+                    slot,
+                    &SecurePayload::SessionRekeyInit {
+                        rekey_id,
+                        ephemeral_public_key,
+                    },
+                ) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        debug!(
+                            relay = %key.0,
+                            circuit_id = key.1,
+                            peer = %peer_node_id,
+                            rekey_id,
+                            attempt,
+                            %error,
+                            "relay E2E rekey encode failed"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            if let Err(error) = self.send_relay_inner(key.0, key.1, encoded).await {
+                debug!(
+                    relay = %key.0,
+                    circuit_id = key.1,
+                    peer = %peer_node_id,
+                    rekey_id,
+                    attempt,
+                    %error,
+                    "relay E2E rekey retransmission failed"
+                );
+            }
+        }
+
+        let local_node_id = self.node_id();
+        let candidates: Vec<((SocketAddr, u64), String)> = self
+            .relay_e2e_sessions
+            .keys()
+            .filter_map(|key| {
+                if self.pending_relay_e2e_rekeys.contains_key(key) {
+                    return None;
+                }
+
+                let last = self.last_relay_e2e_rekey.get(key)?;
+                if now.duration_since(*last) < RELAY_E2E_REKEY_INTERVAL {
+                    return None;
+                }
+
+                let path = self.relay_paths.get(key)?;
+                if local_node_id.as_str() >= path.peer_node_id.as_str() {
+                    return None;
+                }
+
+                Some((*key, path.peer_node_id.clone()))
+            })
+            .collect();
+
+        for (key, peer_node_id) in candidates {
+            let pending = PendingHandshake::new(peer_node_id.clone());
+            let rekey_id = pending.handshake_id();
+            let ephemeral_public_key = pending.public_key_hex();
+
+            self.pending_relay_e2e_rekeys.insert(
+                key,
+                PendingRelayE2eRekey {
+                    pending,
+                    rekey_id,
+                    peer_node_id: peer_node_id.clone(),
+                    ephemeral_public_key: ephemeral_public_key.clone(),
+                    attempts: 1,
+                    next_retry_at: now + RELAY_E2E_REKEY_RETRY_DELAY,
+                },
+            );
+
+            let encoded = {
+                let Some(slot) = self.relay_e2e_sessions.get_mut(&key) else {
+                    self.pending_relay_e2e_rekeys.remove(&key);
+                    continue;
+                };
+                encode_relay_payload(
+                    slot,
+                    &SecurePayload::SessionRekeyInit {
+                        rekey_id,
+                        ephemeral_public_key,
+                    },
+                )
+            };
+
+            match encoded {
+                Ok(encoded) => {
+                    if let Err(error) = self.send_relay_inner(key.0, key.1, encoded).await {
+                        debug!(
+                            relay = %key.0,
+                            circuit_id = key.1,
+                            peer = %peer_node_id,
+                            rekey_id,
+                            %error,
+                            "initial relay E2E rekey send failed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        relay = %key.0,
+                        circuit_id = key.1,
+                        peer = %peer_node_id,
+                        rekey_id,
+                        %error,
+                        "initial relay E2E rekey encode failed"
+                    );
+                }
+            }
+        }
+    }
+
     async fn drive_session_rekeys(&mut self) {
         let now = Instant::now();
         self.responder_rekey_acks
@@ -3342,6 +3657,15 @@ impl KonoNode {
         self.relay_e2e_pending
             .retain(|key, _| self.relay_paths.contains_key(key));
         self.relay_e2e_sessions
+            .retain(|key, _| self.relay_paths.contains_key(key));
+        self.pending_relay_e2e_rekeys
+            .retain(|key, _| self.relay_paths.contains_key(key));
+        self.responder_relay_e2e_rekey_acks
+            .retain(|(endpoint, circuit_id, _), state| {
+                self.relay_paths.contains_key(&(*endpoint, *circuit_id))
+                    && state.expires_at > Instant::now()
+            });
+        self.last_relay_e2e_rekey
             .retain(|key, _| self.relay_paths.contains_key(key));
         self.pending_relay_accepts
             .retain(|_, pending| pending.expires_at > Instant::now());
