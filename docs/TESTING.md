@@ -91,7 +91,20 @@ Expected:
 - C receives the payload
 - B receives `DELIVERED`
 
-## 4. Different-network test
+## 4. Windows GUI WAN test
+
+Use `KonoNexus-Network-Tester.exe` for the normal two-PC test:
+
+1. Start the tester on PC A and click **Kopiuj invite**.
+2. Transfer the single `KNX1...` code to PC B.
+3. On PC B click **Wklej invite**, then **Połącz** and **START TESTU WAN**.
+4. The GUI reports `DIRECT`, `UDP HOLE PUNCH`, or `RELAY`, authenticated delivery RTT, delivery loss, NAT/endpoint evidence, NodeIDs, and a technical log.
+
+The invite is signed with the node's Ed25519 identity and contains no private key. It expires after 24 hours. A modified or malformed invite is rejected before dialing.
+
+The result is honest by design: two fresh nodes behind unrelated NATs cannot universally discover each other without a mutually reachable peer/coordinator. If the invite contains only a private endpoint and no reachable mesh bootstrap exists, the GUI reports failure or inconclusive NAT evidence rather than a false `CONNECTED` status.
+
+## 5. Different-network diagnostic probe test
 
 For the first WAN test, at least one initial seed endpoint must actually be reachable from the other machine.
 
@@ -118,7 +131,7 @@ Record whether the logs show:
 - relay fallback,
 - delivery receipt or failure.
 
-## 5. NAT/CGNAT matrix
+## 6. NAT/CGNAT matrix
 
 Run separate tests for:
 
@@ -132,13 +145,13 @@ Run separate tests for:
 
 For each test save logs from both endpoints.
 
-## 6. Firewall
+## 7. Firewall
 
 Allow inbound and outbound UDP for the probe's selected port (default 47000).
 
 Windows Defender Firewall may prompt on first launch. Allow the app on the network profile being tested.
 
-## 7. What counts as a pass
+## 8. What counts as a pass
 
 A message test passes only when:
 
@@ -150,7 +163,7 @@ A message test passes only when:
 
 A timeout or `FAILED` event is evidence to diagnose, not something to hide by increasing timeouts.
 
-## 8. Current testing limitation
+## 9. Current testing limitation
 
 Automated CI now passes a real three-node localhost runtime harness. That proves the runtime/API/discovery delivery path works under controlled conditions.
 

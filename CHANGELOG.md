@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0-alpha.16
+
+- Added the Windows x64 KonoNexus Network Tester GUI as the normal two-PC test surface.
+- Added signed, versioned, 24-hour `KNX1` invite codes containing NodeID/public key and bounded endpoint hints, never private key material.
+- Added runtime `connect` and diagnostics APIs for authenticated path method (`DIRECT`, `UDP HOLE PUNCH`, `RELAY`), NAT mapping/filtering evidence, endpoint evidence, peer counts, DHT state, and pending punch state.
+- Added authenticated delivery RTT and loss sampling with a large `CONNECTED` / `FAILED` result and collapsible technical log.
+- Added an original embedded application icon and retained the console probe only as a diagnostic binary in the Windows package.
+- Updated Windows release automation to publish the GUI EXE, diagnostic probe, and a combined ZIP as a prerelease.
+
 Development log for KonoNexus.
 
 ## Unreleased

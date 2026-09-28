@@ -1,5 +1,6 @@
 pub mod dht;
 pub mod identity;
+pub mod invite;
 pub mod konofix_sdk;
 pub mod konomind;
 pub mod nat;
@@ -19,12 +20,16 @@ pub use dht::{
     DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
 };
 pub use identity::NodeIdentity;
+pub use invite::InviteCode;
 pub use konofix_sdk::{KonofixSdkConfig, KonofixTransport};
 pub use konomind::{
     KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
 };
 pub use nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
-pub use node::{KonoNode, PeerInfo, RelayAppHandle};
+pub use node::{
+    KonoNode, NetworkDiagnostics, NetworkDiagnosticsHandle, PathDiagnostic, PathMethod, PeerInfo,
+    RelayAppHandle,
+};
 pub use protocol::{MessageBody, WireEnvelope, KNP_VERSION};
 pub use punch::{PunchSchedule, PUNCH_AUTH_TTL, PUNCH_MAX_ATTEMPTS, PUNCH_START_DELAY};
 pub use relay::{

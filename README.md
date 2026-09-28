@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.15 — first external testing candidate**. The core now includes direct and relay-inner E2E rekey, live RelayApp direct↔relay migration, the initial Konofix SDK transport wrapper, and a green three-node runtime harness that verifies discovery and B→C application delivery through the live mesh on localhost. This is ready for controlled multi-PC testing. The local harness is not proof of real-world NAT/CGNAT success; that validation starts with external machines/networks.
+> Status: **0.1.0-alpha.16 — Windows Network Tester candidate**. The core now includes direct and relay-inner E2E rekey, live RelayApp direct↔relay migration, a signed one-code invite, runtime path/NAT diagnostics, and a Windows GUI for controlled two-PC Internet tests. A local or CI result is not proof of universal NAT/CGNAT success; the tester reports the real selected path and evidence.
 
 ## Principles
 
@@ -107,7 +107,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Relay-inner E2E session key rotation
 - [x] Three-node live runtime mesh harness
 - [ ] Real multi-network/NAT test matrix
-- [ ] KonoNexus Network Tester GUI
+- [x] KonoNexus Network Tester GUI
 - [x] Konofix SDK transport wrapper
 - [ ] Konofix Windows application integration
 - [ ] Android transport integration
