@@ -9,7 +9,10 @@ pub mod rendezvous;
 pub mod security;
 pub mod session;
 
-pub use dht::{endpoint_publishable, DhtTable, PeerRecord, DHT_RESPONSE_LIMIT};
+pub use dht::{
+    endpoint_publishable, DhtTable, PeerRecord, RoutingPeer, RoutingTable, DHT_MAX_HOPS,
+    DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
+};
 pub use identity::NodeIdentity;
 pub use konomind::{
     KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
