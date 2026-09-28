@@ -761,10 +761,7 @@ impl KonoNode {
                     self.last_dht_forward.insert(source, now);
                     let mut forwarded = 0_usize;
 
-                    for candidate in self
-                        .routing
-                        .nearest(&target_node_id, DHT_QUERY_FANOUT + 2)
-                    {
+                    for candidate in self.routing.nearest(&target_node_id, DHT_QUERY_FANOUT + 2) {
                         if candidate.endpoint == source
                             || candidate.node_id == origin_node_id
                             || !self.sessions.contains_key(&candidate.endpoint)
@@ -1662,8 +1659,7 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.sessions
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
-        let active_session_endpoints: HashSet<SocketAddr> =
-            self.sessions.keys().copied().collect();
+        let active_session_endpoints: HashSet<SocketAddr> = self.sessions.keys().copied().collect();
         self.routing.retain_endpoints(&active_session_endpoints);
         self.pending_filter_probes
             .retain(|_, pending| pending.expires_at > Instant::now());
