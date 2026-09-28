@@ -54,7 +54,9 @@ async fn main() -> Result<()> {
         ));
     }
 
-    let identity_path = args.identity.unwrap_or_else(|| default_identity_path(args.bind));
+    let identity_path = args
+        .identity
+        .unwrap_or_else(|| default_identity_path(args.bind));
     let mut config = KonofixSdkConfig::new(identity_path)
         .with_bind(args.bind)
         .with_seed_peers(args.peers)
@@ -84,9 +86,13 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let timeout_seconds = args
-        .timeout
-        .unwrap_or_else(|| if sent.is_some() || args.expect_text.is_some() { 60 } else { 0 });
+    let timeout_seconds = args.timeout.unwrap_or_else(|| {
+        if sent.is_some() || args.expect_text.is_some() {
+            60
+        } else {
+            0
+        }
+    });
 
     let deadline = async {
         if timeout_seconds == 0 {
