@@ -35,6 +35,19 @@ pub struct RelayAppMessage {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAppFailureReason {
+    RetriesExhausted,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAppDeliveryFailure {
+    pub peer_node_id: String,
+    pub message_id: u64,
+    pub reason: RelayAppFailureReason,
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayAppOutboundFragment {
     pub peer_node_id: String,
@@ -85,6 +98,7 @@ pub struct RelayAppManager {
     delivered: HashMap<(String, u64), DeliveredRecord>,
     completed: VecDeque<RelayAppMessage>,
     completed_bytes: usize,
+    failures: VecDeque<RelayAppDeliveryFailure>,
 }
 
 impl RelayAppManager {
@@ -188,7 +202,7 @@ impl RelayAppManager {
         Ok(())
     }
 
-    pub fn prepare_retransmissions(&mut self, now: Instant) -> (usize, usize) {
+    pub fn prepare_retransmissions(&mut self, now: Instant) -> usize {
         let mut restarted = 0_usize;
         let mut drop_indices = Vec::new();
 
@@ -212,10 +226,15 @@ impl RelayAppManager {
         for index in drop_indices.iter().rev().copied() {
             if let Some(message) = self.outbound.remove(index) {
                 self.outbound_bytes = self.outbound_bytes.saturating_sub(message.data.len());
+                self.push_failure(RelayAppDeliveryFailure {
+                    peer_node_id: message.peer_node_id,
+                    message_id: message.message_id,
+                    reason: RelayAppFailureReason::RetriesExhausted,
+                });
             }
         }
 
-        (restarted, drop_indices.len())
+        restarted
     }
 
     pub fn acknowledge(&mut self, peer_node_id: &str, message_id: u64) -> bool {
@@ -355,6 +374,14 @@ impl RelayAppManager {
         Some(message)
     }
 
+    pub fn peek_failure(&self) -> Option<RelayAppDeliveryFailure> {
+        self.failures.front().cloned()
+    }
+
+    pub fn pop_failure(&mut self) -> Option<RelayAppDeliveryFailure> {
+        self.failures.pop_front()
+    }
+
     pub fn expire(&mut self, now: Instant) -> (usize, usize) {
         self.expire_delivered(now);
 
@@ -384,6 +411,11 @@ impl RelayAppManager {
         for index in expired_outbound.iter().rev().copied() {
             if let Some(message) = self.outbound.remove(index) {
                 self.outbound_bytes = self.outbound_bytes.saturating_sub(message.data.len());
+                self.push_failure(RelayAppDeliveryFailure {
+                    peer_node_id: message.peer_node_id,
+                    message_id: message.message_id,
+                    reason: RelayAppFailureReason::Expired,
+                });
             }
         }
 
@@ -417,6 +449,13 @@ impl RelayAppManager {
     fn expire_delivered(&mut self, now: Instant) {
         self.delivered
             .retain(|_, delivered| delivered.expires_at > now);
+    }
+
+    fn push_failure(&mut self, failure: RelayAppDeliveryFailure) {
+        while self.failures.len() >= MAX_RELAY_APP_COMPLETED_MESSAGES {
+            self.failures.pop_front();
+        }
+        self.failures.push_back(failure);
     }
 
     fn push_completed(&mut self, message: RelayAppMessage) {
@@ -547,7 +586,7 @@ mod tests {
         assert!(receiver.take_completed().is_empty());
 
         let retry_at = now + RELAY_APP_ACK_TIMEOUT;
-        assert_eq!(sender.prepare_retransmissions(retry_at), (1, 0));
+        assert_eq!(sender.prepare_retransmissions(retry_at), 1);
         assert_eq!(
             drain_one_pass(&mut sender, &mut receiver, &ready, retry_at, None),
             Some(message_id)
@@ -574,7 +613,7 @@ mod tests {
         assert_eq!(receiver.take_completed().len(), 1);
 
         let retry_at = now + RELAY_APP_ACK_TIMEOUT;
-        assert_eq!(sender.prepare_retransmissions(retry_at), (1, 0));
+        assert_eq!(sender.prepare_retransmissions(retry_at), 1);
 
         let outbound = sender.peek_next(&ready).unwrap();
         assert_eq!(
@@ -612,12 +651,17 @@ mod tests {
             }
 
             current += RELAY_APP_ACK_TIMEOUT;
-            let (_, dropped) = sender.prepare_retransmissions(current);
+            let restarted = sender.prepare_retransmissions(current);
 
             if retry < MAX_RELAY_APP_RETRANSMISSIONS {
-                assert_eq!(dropped, 0);
+                assert_eq!(restarted, 1);
+                assert!(sender.peek_failure().is_none());
             } else {
-                assert_eq!(dropped, 1);
+                assert_eq!(restarted, 0);
+                assert_eq!(
+                    sender.peek_failure().map(|failure| failure.reason),
+                    Some(RelayAppFailureReason::RetriesExhausted)
+                );
             }
         }
 
@@ -647,6 +691,24 @@ mod tests {
         };
 
         assert!(receiver.accept_fragment("peer", fragment, now).is_err());
+    }
+
+    #[test]
+    fn expired_outbound_message_reports_delivery_failure() {
+        let now = Instant::now();
+        let mut manager = RelayAppManager::default();
+        let message_id = manager.queue("peer".into(), vec![9_u8; 8], now).unwrap();
+
+        manager.expire(now + RELAY_APP_OUTBOUND_TTL + Duration::from_secs(1));
+
+        assert_eq!(
+            manager.pop_failure(),
+            Some(RelayAppDeliveryFailure {
+                peer_node_id: "peer".into(),
+                message_id,
+                reason: RelayAppFailureReason::Expired,
+            })
+        );
     }
 
     #[test]
