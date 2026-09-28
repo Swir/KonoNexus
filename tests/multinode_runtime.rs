@@ -72,7 +72,8 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
     let config_a = KonofixSdkConfig::new(state_dir.join("a.key"))
         .with_bind("127.0.0.1:0".parse().unwrap())
         .with_routing_cache(state_dir.join("a-routing.json"))
-        .with_hello_interval(Duration::from_millis(250));
+        .with_hello_interval(Duration::from_millis(250))
+        .with_local_test_mode(true);
     let mut a = KonofixTransport::spawn(config_a).await.unwrap();
     let a_node_id = a.node_id().to_owned();
     let a_addr = a.local_addr();
@@ -81,7 +82,8 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
         .with_bind("127.0.0.1:0".parse().unwrap())
         .with_seed_peer(a_addr)
         .with_routing_cache(state_dir.join("b-routing.json"))
-        .with_hello_interval(Duration::from_millis(250));
+        .with_hello_interval(Duration::from_millis(250))
+        .with_local_test_mode(true);
     let mut b = KonofixTransport::spawn(config_b).await.unwrap();
     let b_node_id = b.node_id().to_owned();
 
@@ -89,7 +91,8 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
         .with_bind("127.0.0.1:0".parse().unwrap())
         .with_seed_peer(a_addr)
         .with_routing_cache(state_dir.join("c-routing.json"))
-        .with_hello_interval(Duration::from_millis(250));
+        .with_hello_interval(Duration::from_millis(250))
+        .with_local_test_mode(true);
     let mut c = KonofixTransport::spawn(config_c).await.unwrap();
     let c_node_id = c.node_id().to_owned();
 
