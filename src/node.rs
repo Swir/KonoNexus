@@ -2302,9 +2302,7 @@ impl KonoNode {
                 data,
                 response,
             } => {
-                let needs_path = self
-                    .direct_app_endpoint_for_peer(&peer_node_id)
-                    .is_none()
+                let needs_path = self.direct_app_endpoint_for_peer(&peer_node_id).is_none()
                     && self.relay_e2e_path_for_peer(&peer_node_id).is_none();
                 let result = self
                     .queue_relay_app_message(peer_node_id.clone(), data)
