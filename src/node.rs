@@ -7,7 +7,7 @@ use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehav
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
-use crate::relay_app::{RelayAppManager, RelayAppMessage};
+use crate::relay_app::{RelayAppManager, RelayAppMessage, RelayAppReceiveStatus};
 use crate::relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
 };
@@ -1663,13 +1663,17 @@ impl KonoNode {
                     }
                     SecurePayload::RelayAppFragment { fragment } => {
                         let message_id = fragment.message_id;
-                        let completed = self.relay_app.accept_fragment(
+                        let status = self.relay_app.accept_fragment(
                             peer_node_id,
                             fragment,
                             Instant::now(),
                         )?;
 
-                        if completed {
+                        if matches!(
+                            status,
+                            RelayAppReceiveStatus::Completed
+                                | RelayAppReceiveStatus::DuplicateCompleted
+                        ) {
                             let ack = {
                                 let session = self
                                     .relay_e2e_sessions
@@ -1682,6 +1686,9 @@ impl KonoNode {
                             };
                             self.send_relay_inner(relay_endpoint, circuit_id, ack)
                                 .await?;
+                        }
+
+                        if status == RelayAppReceiveStatus::Completed {
                             self.flush_relay_app_events();
                         }
                     }
@@ -1749,6 +1756,15 @@ impl KonoNode {
 
     async fn drive_relay_app(&mut self) {
         let now = Instant::now();
+        let (restarted, retry_dropped) = self.relay_app.prepare_retransmissions(now);
+        if restarted > 0 || retry_dropped > 0 {
+            debug!(
+                restarted,
+                retry_dropped,
+                "processed RelayApp ACK-timeout retransmissions"
+            );
+        }
+
         let (expired_inbound, expired_outbound) = self.relay_app.expire(now);
         if expired_inbound > 0 || expired_outbound > 0 {
             debug!(
@@ -1823,6 +1839,7 @@ impl KonoNode {
             if let Err(error) = self.relay_app.mark_fragment_sent(
                 outbound.fragment.message_id,
                 outbound.fragment.fragment_index,
+                now,
             ) {
                 debug!(%error, "relay application queue state update failed");
                 break;
