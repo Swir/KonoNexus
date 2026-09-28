@@ -33,12 +33,15 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - inner relay handshake authenticated by Ed25519 and bound to circuit ID plus both endpoint NodeIDs,
 - fresh inner X25519/HKDF/ChaCha20-Poly1305 session keys that are never disclosed to the forwarding relay,
 - deterministic single-side punch-to-relay fallback to avoid duplicate circuit storms,
+- alternate relay fallback limited to three distinct already-authenticated encrypted peers in a short-lived selection state,
 - 128-sequence sliding anti-replay windows for encrypted sessions and relay transport, allowing bounded authenticated reordering while rejecting duplicates and stale sequences,
 - inner secure-session replay/tamper checks in addition to outer relay transport sequencing,
 - RelayApp message size, queue-byte, queue-count, reassembly-count, reassembly-byte, completed-queue, and expiry limits,
 - strict fragment metadata/length validation, duplicate-content consistency checks, and encrypted application ACKs,
 - bounded async application command/event channels so slow application consumers cannot create unbounded network-loop queues,
-- one-second RelayApp ACK timeout with at most four retransmissions and bounded delivered-message deduplication,
+- one-second RelayApp ACK timeout with at most four retransmissions, bounded delivered-message deduplication, and explicit application-visible delivery-failure events,
+- one-second direct-session INIT retransmission with at most four total attempts plus bounded ten-second responder ACK caching,
+- responder application/control traffic deferred until an authenticated encrypted frame confirms the initiator completed the session,
 - relay per-NodeID circuit cap (16) plus per-direction rate quotas (128 cells/s and 256 KiB/s),
 - session keys zeroized when sessions are dropped.
 
@@ -68,18 +71,18 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - routing-cache files expose peer metadata on local disk even though they contain no private keys,
 - relay control metadata remains visible to the forwarding node, including endpoint identities, circuit IDs, timing, and cell sizes,
 - application payload APIs are now exposed only through the inner E2E RelayApp layer; raw relay cells are not the application API,
-- whole-message RelayApp retransmission is implemented, but selective fragment retransmission and explicit application delivery-failure callbacks are not yet implemented,
+- whole-message RelayApp retransmission and explicit application delivery-failure callbacks are implemented, but selective fragment retransmission is not yet implemented,
 - relay quotas are implemented, but long-window abuse accounting, adaptive quotas, and reputation/Sybil controls are not yet implemented,
-- broader relay selection and path migration policy are not yet implemented,
+- bounded alternate relay selection is implemented, but direct↔relay path migration and multi-relay policy are not yet implemented,
 - no independent security audit has been completed.
 
 ## Required before production
 
 - stronger long-window per-peer rendezvous/filter-test rate limits,
 - wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
-- handshake retransmission and session key rotation,
+- session key rotation,
 - independent endpoint attestations for DHT records, persistent bucket storage, stronger query rate limits, and Sybil mitigation,
-- selective RelayApp recovery/delivery-failure reporting, longer-window relay abuse accounting, adaptive per-peer quotas, and multi-path failover hardening,
+- selective RelayApp recovery, longer-window relay abuse accounting, adaptive per-peer quotas, session key rotation, and multi-path/direct↔relay failover hardening,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
 - load testing,
