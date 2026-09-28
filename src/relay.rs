@@ -5,13 +5,52 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 pub const MAX_RELAY_CIRCUITS: usize = 256;
+pub const MAX_RELAY_CIRCUITS_PER_NODE: usize = 16;
 pub const MAX_RELAY_CELL_BYTES: usize = 3 * 1024;
+pub const MAX_RELAY_CELLS_PER_SECOND: usize = 128;
+pub const MAX_RELAY_BYTES_PER_SECOND: usize = 256 * 1024;
 pub const RELAY_CIRCUIT_TTL: Duration = Duration::from_secs(120);
+pub const RELAY_RATE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayCircuitState {
     PendingTargetConsent,
     Active,
+}
+
+#[derive(Debug, Clone)]
+struct RelayRateWindow {
+    started_at: Instant,
+    cells: usize,
+    bytes: usize,
+}
+
+impl RelayRateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            cells: 0,
+            bytes: 0,
+        }
+    }
+
+    fn consume(&mut self, bytes: usize, now: Instant) -> Result<()> {
+        if now.duration_since(self.started_at) >= RELAY_RATE_WINDOW {
+            self.started_at = now;
+            self.cells = 0;
+            self.bytes = 0;
+        }
+
+        if self.cells >= MAX_RELAY_CELLS_PER_SECOND
+            || self.bytes.saturating_add(bytes) > MAX_RELAY_BYTES_PER_SECOND
+        {
+            bail!("relay circuit rate quota exceeded");
+        }
+
+        self.cells += 1;
+        self.bytes += bytes;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +64,8 @@ pub struct RelayCircuit {
     pub expires_at: Instant,
     origin_window: SequenceWindow,
     target_window: SequenceWindow,
+    origin_rate: RelayRateWindow,
+    target_rate: RelayRateWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +98,28 @@ impl RelayManager {
         if self.circuits.len() >= MAX_RELAY_CIRCUITS {
             bail!("relay circuit limit reached");
         }
+
+        let origin_circuits = self
+            .circuits
+            .values()
+            .filter(|circuit| {
+                circuit.origin_node_id == origin_node_id || circuit.target_node_id == origin_node_id
+            })
+            .count();
+        let target_circuits = self
+            .circuits
+            .values()
+            .filter(|circuit| {
+                circuit.origin_node_id == target_node_id || circuit.target_node_id == target_node_id
+            })
+            .count();
+
+        if origin_circuits >= MAX_RELAY_CIRCUITS_PER_NODE
+            || target_circuits >= MAX_RELAY_CIRCUITS_PER_NODE
+        {
+            bail!("per-node relay circuit limit reached");
+        }
+
         if origin_endpoint == target_endpoint || origin_node_id == target_node_id {
             bail!("relay circuit endpoints must be distinct");
         }
@@ -73,6 +136,8 @@ impl RelayManager {
                 expires_at: now + RELAY_CIRCUIT_TTL,
                 origin_window: SequenceWindow::default(),
                 target_window: SequenceWindow::default(),
+                origin_rate: RelayRateWindow::new(now),
+                target_rate: RelayRateWindow::new(now),
             },
         );
         Ok(())
@@ -129,7 +194,7 @@ impl RelayManager {
             bail!("relay circuit is not active");
         }
 
-        let (destination, peer_node_id, receive_window) = if source_endpoint
+        let (destination, peer_node_id, receive_window, rate_window) = if source_endpoint
             == circuit.origin_endpoint
             && source_node_id == circuit.origin_node_id
         {
@@ -137,6 +202,7 @@ impl RelayManager {
                 circuit.target_endpoint,
                 circuit.target_node_id.clone(),
                 &mut circuit.origin_window,
+                &mut circuit.origin_rate,
             )
         } else if source_endpoint == circuit.target_endpoint
             && source_node_id == circuit.target_node_id
@@ -145,11 +211,13 @@ impl RelayManager {
                 circuit.origin_endpoint,
                 circuit.origin_node_id.clone(),
                 &mut circuit.target_window,
+                &mut circuit.target_rate,
             )
         } else {
             bail!("relay cell source does not match circuit");
         };
 
+        rate_window.consume(raw.len(), now)?;
         receive_window.check_and_record(sequence)?;
         circuit.expires_at = now + RELAY_CIRCUIT_TTL;
 
@@ -285,6 +353,82 @@ mod tests {
         let oversized = hex::encode(vec![0_u8; MAX_RELAY_CELL_BYTES + 1]);
         assert!(relay
             .forward(id, target, "knp1target", 0, oversized, Instant::now())
+            .is_err());
+    }
+
+    #[test]
+    fn relay_enforces_per_circuit_rate_quota() {
+        let (mut relay, id, origin, target) = setup();
+        let now = Instant::now();
+        relay
+            .accept(id, target, "knp1target", now)
+            .unwrap();
+
+        for sequence in 0..MAX_RELAY_CELLS_PER_SECOND as u64 {
+            relay
+                .forward(
+                    id,
+                    origin,
+                    "knp1origin",
+                    sequence,
+                    "aa".into(),
+                    now,
+                )
+                .unwrap();
+        }
+
+        assert!(relay
+            .forward(
+                id,
+                origin,
+                "knp1origin",
+                MAX_RELAY_CELLS_PER_SECOND as u64,
+                "aa".into(),
+                now,
+            )
+            .is_err());
+
+        relay
+            .forward(
+                id,
+                origin,
+                "knp1origin",
+                MAX_RELAY_CELLS_PER_SECOND as u64,
+                "aa".into(),
+                now + RELAY_RATE_WINDOW,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn relay_enforces_per_node_circuit_limit() {
+        let mut relay = RelayManager::default();
+        let now = Instant::now();
+
+        for index in 0..MAX_RELAY_CIRCUITS_PER_NODE {
+            relay
+                .open(
+                    index as u64,
+                    "203.0.113.10:47000".parse().unwrap(),
+                    "knp1origin".into(),
+                    format!("198.51.100.{}:47000", index + 1)
+                        .parse()
+                        .unwrap(),
+                    format!("knp1target{index}"),
+                    now,
+                )
+                .unwrap();
+        }
+
+        assert!(relay
+            .open(
+                999,
+                "203.0.113.10:47000".parse().unwrap(),
+                "knp1origin".into(),
+                "198.51.100.250:47000".parse().unwrap(),
+                "knp1overflow".into(),
+                now,
+            )
             .is_err());
     }
 
