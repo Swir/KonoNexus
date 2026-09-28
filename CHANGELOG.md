@@ -4,6 +4,16 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added `RelayAppHandle`, a bounded async runtime API that remains usable while `KonoNode::run()` owns the network loop.
+- Added application command responses through Tokio mpsc/oneshot channels and bounded receive-event delivery without blocking the network loop.
+- Added end-to-end relay application fragmentation at 512-byte payload chunks with a 256 KiB message ceiling.
+- Added bounded outbound backpressure: max 64 queued messages / 2 MiB, with messages retained until encrypted `RelayAppAck`.
+- Added bounded inbound reassembly: max 64 assemblies / 4 MiB reserved memory, 30-second expiry, duplicate validation, metadata consistency checks, and bounded completed-message storage.
+- Added four-fragment-per-tick application pacing and 120-second outbound queue expiry.
+- Added MTU coverage proving a maximum application fragment fits the 3 KiB relay-cell budget after inner E2E encryption/framing.
+- Removed the raw application-facing relay-cell receive path in favor of the authenticated E2E RelayApp layer.
+- Bumped the implementation package to 0.1.0-alpha.11.
+
 - Added a separate Ed25519-authenticated relay inner handshake bound to circuit ID and both endpoint NodeIDs.
 - Added fresh X25519/HKDF/ChaCha20-Poly1305 end-to-end sessions inside cooperative relay circuits; the relay never receives the derived keys.
 - Added inner encrypted relay PING/PONG validation, ciphertext tamper tests, circuit-binding tests, and expected-peer identity tests.
