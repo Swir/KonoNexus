@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Iterative global DHT routing, persistent routing buckets, robust NAT/filtering classification, and cooperative relay are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Persistent routing buckets, endpoint attestations, broad convergence testing, robust NAT/filtering classification, and cooperative relay are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -127,15 +127,27 @@ Nearest records may be cached for future answers, but the current implementation
 
 This deliberately avoids turning untrusted nearest-record gossip into automatic outbound connection scanning.
 
-## 14. Remaining DHT work
+## 14. Bounded multi-hop lookup and routing buckets
 
-- iterative multi-hop lookup across newly learned routing peers,
-- persistent k-bucket-like routing state,
+Each node maintains an in-memory routing table with 256 XOR-distance buckets derived from SHA-256(NodeID). A bucket stores at most 8 peers and contains only nodes that already have an established encrypted KNP session. Existing entries refresh their endpoint/last-seen time; a full bucket evicts its least-recently-seen entry.
+
+For a pending NodeID lookup, the origin selects up to 2 nearest active routing peers and sends an encrypted `DhtFind` containing a random query ID, origin NodeID, target NodeID, and hop budget. The initial hop budget is 3.
+
+An intermediate node validates NodeID shape and hop bounds, suppresses duplicate `(origin, query_id)` pairs, returns its current exact/nearest signed records, stores a short-lived reverse route toward the requester, and forwards the query to at most 2 other established encrypted peers when no exact record is known and hops remain.
+
+`DhtNodes` responses are cached after signature/TTL verification. If the node is not the origin, the response is forwarded along the encrypted reverse path. At the origin, only an exact current record for the requested NodeID can activate temporary discovery endpoints.
+
+To constrain amplification and loops, query state expires after 8 seconds, forwarding from the same immediate peer is throttled, and the seen-query cache is capped. The design intentionally favors bounded reachability over aggressive flooding.
+
+## 15. Remaining DHT work
+
+- persistence of routing buckets across restarts,
 - endpoint ownership/observation attestations,
 - replication/refresh strategy,
+- stronger long-window query rate limiting,
 - Sybil-resistant routing diversity,
 - large-mesh convergence and churn testing.
 
-## 15. Versioning
+## 16. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
