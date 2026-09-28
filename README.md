@@ -68,7 +68,8 @@ Set `RUST_LOG=debug` for verbose diagnostics.
 - [x] Peer table and health timestamps
 - [x] Signed PING / PONG
 - [x] CI: formatting, Clippy, tests
-- [ ] Replay window and anti-amplification cookies
+- [x] Replay window / bounded replay protection
+- [ ] Anti-amplification cookies
 - [ ] Encrypted session handshake
 - [ ] Automatic NAT type detection
 - [ ] UDP hole punching
@@ -76,11 +77,17 @@ Set `RUST_LOG=debug` for verbose diagnostics.
 - [ ] Distributed peer discovery / DHT
 - [ ] Multi-hop onion-style relay envelopes
 - [ ] Path scoring and self-healing routing
+- [x] KonoMind advisory scaffold (deterministic baseline + metrics interface)
+- [ ] KonoMind local learning model trained from NAT/relay outcomes
 - [ ] Distributed offline mailbox / store-and-forward
 - [ ] Konofix SDK and Windows integration
 - [ ] Android transport integration
 
 See [docs/KNP-SPEC.md](docs/KNP-SPEC.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
+
+## KonoMind
+
+KonoMind is an optional adaptive routing layer. Its current scaffold can collect connection observations and score candidate paths from latency, packet loss, stability, and relay load. It is intentionally advisory only: KNP Core remains authoritative for cryptography, authentication, replay checks, and packet validation. A learned model will only be introduced after NAT traversal and cooperative relay produce enough real test data.
 
 ## Why a seed is still needed
 
