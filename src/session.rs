@@ -54,9 +54,14 @@ pub enum SecurePayload {
         record: PeerRecord,
     },
     DhtFind {
+        query_id: u64,
+        origin_node_id: String,
         target_node_id: String,
+        hops_remaining: u8,
     },
     DhtNodes {
+        query_id: u64,
+        origin_node_id: String,
         target_node_id: String,
         records: Vec<PeerRecord>,
     },
