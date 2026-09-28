@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 pub const MAX_RELAY_CIRCUITS: usize = 256;
-pub const MAX_RELAY_CELL_BYTES: usize = 8 * 1024;
+pub const MAX_RELAY_CELL_BYTES: usize = 3 * 1024;
 pub const RELAY_CIRCUIT_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
