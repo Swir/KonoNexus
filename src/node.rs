@@ -7,11 +7,14 @@ use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehav
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
+use crate::relay_e2e::{
+    accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
+};
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
 use crate::security::{CookieGuard, ReplayGuard};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -74,6 +77,8 @@ struct ReverseDhtRoute {
 struct RelayPath {
     peer_node_id: String,
     expires_at: Instant,
+    next_send_sequence: u64,
+    highest_receive_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +130,9 @@ pub struct KonoNode {
     pending_relay_requests: HashMap<u64, (SocketAddr, String)>,
     pending_relay_accepts: HashMap<(SocketAddr, u64), PendingRelayAccept>,
     relay_paths: HashMap<(SocketAddr, u64), RelayPath>,
+    relay_e2e_pending: HashMap<(SocketAddr, u64), RelayE2eInitiator>,
+    relay_e2e_sessions: HashMap<(SocketAddr, u64), SecureSession>,
+    punch_relay_candidates: HashMap<u64, SocketAddr>,
     relay_inbox: VecDeque<RelayDeliveredCell>,
     hello_interval: Duration,
 }
@@ -175,6 +183,9 @@ impl KonoNode {
             pending_relay_requests: HashMap::new(),
             pending_relay_accepts: HashMap::new(),
             relay_paths: HashMap::new(),
+            relay_e2e_pending: HashMap::new(),
+            relay_e2e_sessions: HashMap::new(),
+            punch_relay_candidates: HashMap::new(),
             relay_inbox: VecDeque::new(),
             hello_interval,
         })
