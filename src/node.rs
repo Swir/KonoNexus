@@ -1082,8 +1082,7 @@ impl KonoNode {
                 if local_node_id.as_str() < peer_node_id.as_str() {
                     let (pending, init) =
                         RelayE2eInitiator::begin(&self.identity, circuit_id, peer_node_id.clone())?;
-                    self.relay_e2e_pending
-                        .insert((source, circuit_id), pending);
+                    self.relay_e2e_pending.insert((source, circuit_id), pending);
                     self.send_relay_inner(source, circuit_id, init).await?;
                 }
 
@@ -1427,9 +1426,11 @@ impl KonoNode {
             *endpoint == relay_endpoint
                 && path.peer_node_id == target_node_id
                 && path.expires_at > Instant::now()
-        }) || self.pending_relay_requests.values().any(|(endpoint, peer)| {
-            *endpoint == relay_endpoint && peer == target_node_id
-        }) {
+        }) || self
+            .pending_relay_requests
+            .values()
+            .any(|(endpoint, peer)| *endpoint == relay_endpoint && peer == target_node_id)
+        {
             return Ok(None);
         }
 
@@ -1523,7 +1524,8 @@ impl KonoNode {
                     accept_relay_init(&self.identity, circuit_id, peer_node_id, encoded)?;
                 let session_id = session.session_id().to_owned();
                 self.relay_e2e_sessions.insert(key, session);
-                self.send_relay_inner(relay_endpoint, circuit_id, ack).await?;
+                self.send_relay_inner(relay_endpoint, circuit_id, ack)
+                    .await?;
 
                 info!(
                     %relay_endpoint,
