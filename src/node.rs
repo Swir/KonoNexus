@@ -1,12 +1,15 @@
 use crate::identity::NodeIdentity;
-use crate::nat::{NatMappingBehavior, NatProfile};
+use crate::nat::{
+    FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile,
+};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
-use crate::punch::PunchSchedule;
+use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
+use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::security::{CookieGuard, ReplayGuard};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{Context, Result};
 use rand::random;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +19,10 @@ use tracing::{debug, info, warn};
 
 const MAX_ACTIVE_PEERS: usize = 2_048;
 const MAX_PENDING_PUNCHES: usize = 128;
+const MAX_PENDING_FILTER_PROBES: usize = 64;
+const RENDEZVOUS_REQUEST_COOLDOWN: Duration = Duration::from_secs(1);
+const FILTER_TEST_REQUEST_COOLDOWN: Duration = Duration::from_secs(10);
+const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -25,6 +32,21 @@ pub struct PeerInfo {
     pub first_seen: Instant,
     pub last_seen: Instant,
     pub observed_external_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFilterProbe {
+    expected_helper_node_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFilterConsent {
+    requester_endpoint: SocketAddr,
+    requester_node_id: String,
+    helper_endpoint: SocketAddr,
+    helper_node_id: String,
+    expires_at: Instant,
 }
 
 pub struct KonoNode {
@@ -40,6 +62,12 @@ pub struct KonoNode {
     nat_profile: NatProfile,
     pending_punches: HashMap<u64, PunchSchedule>,
     queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
+    auto_rendezvous: HashMap<String, AutoRendezvousState>,
+    queued_filter_tests: HashSet<SocketAddr>,
+    pending_filter_probes: HashMap<u64, PendingFilterProbe>,
+    pending_filter_consents: HashMap<u64, PendingFilterConsent>,
+    last_rendezvous_request: HashMap<SocketAddr, Instant>,
+    last_filter_test_request: HashMap<SocketAddr, Instant>,
     hello_interval: Duration,
 }
 
@@ -67,6 +95,12 @@ impl KonoNode {
             nat_profile: NatProfile::default(),
             pending_punches: HashMap::new(),
             queued_rendezvous: HashMap::new(),
+            auto_rendezvous: HashMap::new(),
+            queued_filter_tests: HashSet::new(),
+            pending_filter_probes: HashMap::new(),
+            pending_filter_consents: HashMap::new(),
+            last_rendezvous_request: HashMap::new(),
+            last_filter_test_request: HashMap::new(),
             hello_interval,
         })
     }
@@ -76,6 +110,16 @@ impl KonoNode {
             .entry(coordinator)
             .or_default()
             .push(target_node_id);
+    }
+
+    pub fn queue_auto_rendezvous(&mut self, target_node_id: String) {
+        self.auto_rendezvous
+            .entry(target_node_id.clone())
+            .or_insert_with(|| AutoRendezvousState::new(target_node_id, Instant::now()));
+    }
+
+    pub fn queue_filter_test(&mut self, coordinator: SocketAddr) {
+        self.queued_filter_tests.insert(coordinator);
     }
 
     pub fn node_id(&self) -> String {
@@ -96,6 +140,10 @@ impl KonoNode {
         self.nat_profile.preferred_endpoint()
     }
 
+    pub fn nat_filtering_evidence(&self) -> NatFilteringEvidence {
+        self.nat_profile.filtering_evidence()
+    }
+
     pub async fn run(mut self) -> Result<()> {
         let local_addr = self.local_addr()?;
         info!(node_id = %self.node_id(), bind = %local_addr, "KonoNexus node started");
@@ -108,6 +156,8 @@ impl KonoNode {
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut punch_ticker = time::interval(Duration::from_millis(50));
         punch_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut rendezvous_ticker = time::interval(Duration::from_millis(500));
+        rendezvous_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -134,6 +184,9 @@ impl KonoNode {
                 }
                 _ = punch_ticker.tick() => {
                     self.drive_punch_attempts().await;
+                }
+                _ = rendezvous_ticker.tick() => {
+                    self.drive_auto_rendezvous().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("shutdown requested");
@@ -281,6 +334,7 @@ impl KonoNode {
                 );
 
                 self.flush_rendezvous_requests(source).await?;
+                self.flush_filter_test_request(source).await?;
             }
             MessageBody::SessionAck {
                 handshake_id,
@@ -322,6 +376,7 @@ impl KonoNode {
                 );
 
                 self.flush_rendezvous_requests(source).await?;
+                self.flush_filter_test_request(source).await?;
             }
             MessageBody::Encrypted {
                 session_id,
@@ -372,6 +427,7 @@ impl KonoNode {
                     .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
                 self.pending_punches.remove(&punch_token);
+                self.auto_rendezvous.remove(&sender_node_id);
 
                 self.send(
                     source,
@@ -435,6 +491,47 @@ impl KonoNode {
 
                 self.maybe_start_session(source, &sender_node_id).await?;
             }
+            MessageBody::FilterProbe { probe_token } => {
+                let authorized = self
+                    .pending_filter_probes
+                    .get(&probe_token)
+                    .is_some_and(|pending| {
+                        pending.expected_helper_node_id == sender_node_id
+                            && pending.expires_at > Instant::now()
+                    });
+                if !authorized {
+                    debug!(
+                        peer = %sender_node_id,
+                        %source,
+                        probe_token,
+                        "ignoring unauthorized filter probe"
+                    );
+                    return Ok(());
+                }
+
+                self.pending_filter_probes.remove(&probe_token);
+                self.nat_profile
+                    .record_endpoint_independent_probe(sender_node_id.clone());
+
+                self.send(source, MessageBody::FilterProbeAck { probe_token })
+                    .await?;
+
+                info!(
+                    helper = %sender_node_id,
+                    %source,
+                    probe_token,
+                    filtering = ?self.nat_profile.filtering_evidence(),
+                    "received authorized independent-endpoint filter probe"
+                );
+            }
+            MessageBody::FilterProbeAck { probe_token } => {
+                debug!(
+                    peer = %sender_node_id,
+                    %source,
+                    probe_token,
+                    "filter probe acknowledged"
+                );
+            }
             MessageBody::Ping { token } => {
                 if self.peers.contains_key(&source) && !self.sessions.contains_key(&source) {
                     self.record_peer(&envelope, source);
@@ -473,11 +570,51 @@ impl KonoNode {
                 self.handle_rendezvous_request(source, sender_node_id, &target_node_id)
                     .await?;
             }
+            SecurePayload::RendezvousMiss { target_node_id } => {
+                if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
+                    state.hurry(Instant::now());
+                }
+            }
+            SecurePayload::FilteringTestRequest => {
+                self.handle_filtering_test_request(source, sender_node_id)
+                    .await?;
+            }
+            SecurePayload::FilteringTestProposal {
+                helper_node_id,
+                target_endpoint,
+                probe_token,
+            } => {
+                self.handle_filtering_test_proposal(
+                    source,
+                    sender_node_id,
+                    &helper_node_id,
+                    &target_endpoint,
+                    probe_token,
+                )
+                .await?;
+            }
+            SecurePayload::FilteringTestConsent { authorization } => {
+                self.handle_filtering_test_consent(source, sender_node_id, authorization)
+                    .await?;
+            }
+            SecurePayload::FilteringTestSend { authorization } => {
+                self.handle_filtering_test_send(source, sender_node_id, authorization)
+                    .await?;
+            }
+            SecurePayload::FilteringTestUnavailable => {
+                debug!(
+                    coordinator = %sender_node_id,
+                    "filtering test unavailable from this coordinator"
+                );
+            }
             SecurePayload::RendezvousOffer {
                 peer_node_id,
                 candidate_endpoint,
                 punch_token,
             } => {
+                if let Some(state) = self.auto_rendezvous.get_mut(&peer_node_id) {
+                    state.defer(Instant::now(), PUNCH_AUTH_TTL);
+                }
                 let candidate = match candidate_endpoint.parse::<SocketAddr>() {
                     Ok(candidate) => candidate,
                     Err(error) => {
@@ -529,12 +666,29 @@ impl KonoNode {
         requester_node_id: &str,
         target_node_id: &str,
     ) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .last_rendezvous_request
+            .get(&requester_endpoint)
+            .is_some_and(|last| now.duration_since(*last) < RENDEZVOUS_REQUEST_COOLDOWN)
+        {
+            return Ok(());
+        }
+        self.last_rendezvous_request.insert(requester_endpoint, now);
+
         let Some(target_endpoint) = self.peer_endpoint_by_node_id(target_node_id) else {
             debug!(
                 requester = %requester_node_id,
                 target = %target_node_id,
                 "rendezvous target is not known to coordinator"
             );
+            self.send_secure_payload(
+                requester_endpoint,
+                SecurePayload::RendezvousMiss {
+                    target_node_id: target_node_id.to_owned(),
+                },
+            )
+            .await?;
             return Ok(());
         };
 
@@ -544,6 +698,13 @@ impl KonoNode {
                 target = %target_node_id,
                 "rendezvous target has no encrypted coordinator session"
             );
+            self.send_secure_payload(
+                requester_endpoint,
+                SecurePayload::RendezvousMiss {
+                    target_node_id: target_node_id.to_owned(),
+                },
+            )
+            .await?;
             return Ok(());
         }
 
@@ -595,6 +756,261 @@ impl KonoNode {
             }
         }
 
+        Ok(())
+    }
+
+    async fn drive_auto_rendezvous(&mut self) {
+        let now = Instant::now();
+        let targets: Vec<String> = self.auto_rendezvous.keys().cloned().collect();
+
+        for target_node_id in targets {
+            if self.peer_endpoint_by_node_id(&target_node_id).is_some() {
+                self.auto_rendezvous.remove(&target_node_id);
+                continue;
+            }
+
+            let candidates: Vec<CoordinatorCandidate> = self
+                .sessions
+                .keys()
+                .filter_map(|endpoint| {
+                    let peer = self.peers.get(endpoint)?;
+                    if peer.node_id == target_node_id {
+                        return None;
+                    }
+                    Some(CoordinatorCandidate {
+                        endpoint: *endpoint,
+                        first_seen: peer.first_seen,
+                    })
+                })
+                .collect();
+
+            if candidates.is_empty() {
+                if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
+                    state.defer(now, Duration::from_secs(2));
+                }
+                continue;
+            }
+
+            let selected = self
+                .auto_rendezvous
+                .get_mut(&target_node_id)
+                .and_then(|state| state.next_candidate(&candidates, now));
+            let Some(coordinator) = selected else {
+                continue;
+            };
+
+            if let Err(error) = self
+                .send_secure_payload(
+                    coordinator,
+                    SecurePayload::RendezvousRequest {
+                        target_node_id: target_node_id.clone(),
+                    },
+                )
+                .await
+            {
+                debug!(%coordinator, target = %target_node_id, %error, "automatic rendezvous send failed");
+                if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
+                    state.hurry(Instant::now());
+                }
+            }
+        }
+    }
+
+    async fn flush_filter_test_request(&mut self, coordinator: SocketAddr) -> Result<()> {
+        if self.queued_filter_tests.remove(&coordinator) {
+            self.send_secure_payload(coordinator, SecurePayload::FilteringTestRequest)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_filtering_test_request(
+        &mut self,
+        requester_endpoint: SocketAddr,
+        requester_node_id: &str,
+    ) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .last_filter_test_request
+            .get(&requester_endpoint)
+            .is_some_and(|last| now.duration_since(*last) < FILTER_TEST_REQUEST_COOLDOWN)
+        {
+            return Ok(());
+        }
+        self.last_filter_test_request.insert(requester_endpoint, now);
+
+        if self.pending_filter_consents.len() >= MAX_PENDING_FILTER_PROBES {
+            self.send_secure_payload(requester_endpoint, SecurePayload::FilteringTestUnavailable)
+                .await?;
+            return Ok(());
+        }
+
+        let helper = self
+            .sessions
+            .keys()
+            .filter(|endpoint| **endpoint != requester_endpoint)
+            .filter_map(|endpoint| {
+                let peer = self.peers.get(endpoint)?;
+                if peer.node_id == requester_node_id || endpoint.ip() == requester_endpoint.ip() {
+                    return None;
+                }
+                Some((*endpoint, peer.node_id.clone()))
+            })
+            .min_by_key(|(endpoint, _)| *endpoint);
+
+        let Some((helper_endpoint, helper_node_id)) = helper else {
+            self.send_secure_payload(requester_endpoint, SecurePayload::FilteringTestUnavailable)
+                .await?;
+            return Ok(());
+        };
+
+        let probe_token = random();
+        self.pending_filter_consents.insert(
+            probe_token,
+            PendingFilterConsent {
+                requester_endpoint,
+                requester_node_id: requester_node_id.to_owned(),
+                helper_endpoint,
+                helper_node_id: helper_node_id.clone(),
+                expires_at: Instant::now() + FILTER_PROBE_STATE_TTL,
+            },
+        );
+
+        self.send_secure_payload(
+            requester_endpoint,
+            SecurePayload::FilteringTestProposal {
+                helper_node_id,
+                target_endpoint: requester_endpoint.to_string(),
+                probe_token,
+            },
+        )
+        .await
+    }
+
+    async fn handle_filtering_test_proposal(
+        &mut self,
+        coordinator: SocketAddr,
+        coordinator_node_id: &str,
+        helper_node_id: &str,
+        target_endpoint: &str,
+        probe_token: u64,
+    ) -> Result<()> {
+        if self.pending_filter_probes.len() >= MAX_PENDING_FILTER_PROBES {
+            return Ok(());
+        }
+
+        let Ok(target_endpoint) = target_endpoint.parse::<SocketAddr>() else {
+            return Ok(());
+        };
+
+        if self.nat_profile.endpoint_seen_by(coordinator_node_id) != Some(target_endpoint)
+            || self.peer_endpoint_by_node_id(helper_node_id).is_some()
+        {
+            return Ok(());
+        }
+
+        let authorization = FilterProbeAuthorization::signed(
+            &self.identity,
+            target_endpoint,
+            helper_node_id.to_owned(),
+            probe_token,
+        )?;
+        self.pending_filter_probes.insert(
+            probe_token,
+            PendingFilterProbe {
+                expected_helper_node_id: helper_node_id.to_owned(),
+                expires_at: Instant::now() + FILTER_PROBE_STATE_TTL,
+            },
+        );
+
+        self.send_secure_payload(
+            coordinator,
+            SecurePayload::FilteringTestConsent { authorization },
+        )
+        .await
+    }
+
+    async fn handle_filtering_test_consent(
+        &mut self,
+        requester_endpoint: SocketAddr,
+        sender_node_id: &str,
+        authorization: FilterProbeAuthorization,
+    ) -> Result<()> {
+        authorization.verify()?;
+        let Some(pending) = self
+            .pending_filter_consents
+            .get(&authorization.probe_token)
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        if pending.expires_at <= Instant::now()
+            || pending.requester_endpoint != requester_endpoint
+            || pending.requester_node_id != sender_node_id
+            || pending.helper_node_id != authorization.helper_node_id
+            || authorization.target_node_id != sender_node_id
+            || authorization.target_endpoint != pending.requester_endpoint.to_string()
+        {
+            return Ok(());
+        }
+
+        self.pending_filter_consents
+            .remove(&authorization.probe_token);
+        self.send_secure_payload(
+            pending.helper_endpoint,
+            SecurePayload::FilteringTestSend { authorization },
+        )
+        .await
+    }
+
+    async fn handle_filtering_test_send(
+        &mut self,
+        coordinator: SocketAddr,
+        coordinator_node_id: &str,
+        authorization: FilterProbeAuthorization,
+    ) -> Result<()> {
+        authorization.verify()?;
+        if authorization.helper_node_id != self.node_id()
+            || self
+                .peer_endpoint_by_node_id(&authorization.target_node_id)
+                .is_some()
+        {
+            return Ok(());
+        }
+
+        let target = authorization.target_endpoint.parse::<SocketAddr>()?;
+        if !PunchSchedule::candidate_allowed(target) {
+            return Ok(());
+        }
+
+        self.send(
+            target,
+            MessageBody::FilterProbe {
+                probe_token: authorization.probe_token,
+            },
+        )
+        .await?;
+
+        info!(
+            coordinator = %coordinator_node_id,
+            %coordinator,
+            target = %authorization.target_node_id,
+            %target,
+            probe_token = authorization.probe_token,
+            "sent consent-authorized independent filter probe"
+        );
+        Ok(())
+    }
+
+    async fn send_secure_payload(
+        &mut self,
+        target: SocketAddr,
+        payload: SecurePayload,
+    ) -> Result<()> {
+        if let Some(message) = self.secure_message(target, payload)? {
+            self.send(target, message).await?;
+        }
         Ok(())
     }
 
@@ -653,6 +1069,9 @@ impl KonoNode {
 
         for token in expired {
             if let Some(schedule) = self.pending_punches.remove(&token) {
+                if let Some(state) = self.auto_rendezvous.get_mut(schedule.expected_node_id()) {
+                    state.hurry(Instant::now());
+                }
                 info!(
                     peer = %schedule.expected_node_id(),
                     candidate = %schedule.candidate_endpoint(),
@@ -835,6 +1254,14 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.sessions
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
+        self.pending_filter_probes
+            .retain(|_, pending| pending.expires_at > Instant::now());
+        self.pending_filter_consents
+            .retain(|_, pending| pending.expires_at > Instant::now());
+        self.last_rendezvous_request
+            .retain(|_, last| last.elapsed() < Duration::from_secs(60));
+        self.last_filter_test_request
+            .retain(|_, last| last.elapsed() < Duration::from_secs(60));
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
             debug!(removed, "expired stale peers");
@@ -862,6 +1289,8 @@ fn local_features() -> Vec<String> {
         "chacha20poly1305-aead".to_owned(),
         "nat-observation".to_owned(),
         "decentralized-rendezvous".to_owned(),
+        "auto-rendezvous-selection".to_owned(),
+        "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
         "secure-ping-pong".to_owned(),
