@@ -213,10 +213,7 @@ pub fn accept_relay_init(
     Ok((session, encode_packet(&ack)?))
 }
 
-pub fn encode_relay_payload(
-    session: &mut SessionSlot,
-    payload: &SecurePayload,
-) -> Result<Vec<u8>> {
+pub fn encode_relay_payload(session: &mut SessionSlot, payload: &SecurePayload) -> Result<Vec<u8>> {
     let frame = session.encrypt(payload)?;
     encode_packet(&RelayInnerPacket::Data {
         session_id: frame.session_id,
