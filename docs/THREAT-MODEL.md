@@ -21,6 +21,10 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - bounded automatic rendezvous coordinator attempts and per-requester coordinator cooldown,
 - consent-based third-peer filtering probes with Ed25519 authorization bound to endpoint, helper and token,
 - target-side verification that a coordinator proposal matches that coordinator's previously observed endpoint,
+- signed short-lived DHT peer records with NodeID/public-key binding,
+- bounded DHT table (4,096) and response size (8), TTL limits, and rollback rejection,
+- DHT endpoints restricted to publishable public addresses,
+- automatic dialing only for exact records matching a locally pending NodeID lookup, never arbitrary nearest-record gossip,
 - session keys zeroized when sessions are dropped.
 
 ## NAT/rendezvous threats considered
@@ -44,6 +48,8 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - positive endpoint-independent filtering evidence is supported, but negative results remain intentionally inconclusive,
 - session receive ordering remains strict,
 - session key rotation is not implemented,
+- DHT endpoint records are self-asserted by their owning NodeID and are not yet independently endpoint-attested,
+- iterative DHT routing and Sybil resistance are not yet implemented,
 - no independent security audit has been completed.
 
 ## Required before production
@@ -52,7 +58,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
 - bounded sliding anti-replay windows for UDP reordering,
 - handshake retransmission and session key rotation,
-- DHT signature/expiry rules and Sybil mitigation,
+- independent endpoint attestations for DHT records, persistent bucket rules, and Sybil mitigation,
 - relay abuse controls,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
