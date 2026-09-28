@@ -1,3 +1,4 @@
+use crate::dht::{endpoint_publishable, DhtTable, PeerRecord, DHT_RESPONSE_LIMIT};
 use crate::identity::NodeIdentity;
 use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
@@ -21,6 +22,7 @@ const MAX_PENDING_FILTER_PROBES: usize = 64;
 const RENDEZVOUS_REQUEST_COOLDOWN: Duration = Duration::from_secs(1);
 const FILTER_TEST_REQUEST_COOLDOWN: Duration = Duration::from_secs(10);
 const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
+const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -66,6 +68,9 @@ pub struct KonoNode {
     pending_filter_consents: HashMap<u64, PendingFilterConsent>,
     last_rendezvous_request: HashMap<SocketAddr, Instant>,
     last_filter_test_request: HashMap<SocketAddr, Instant>,
+    dht: DhtTable,
+    pending_dht_queries: HashSet<String>,
+    discovery_candidates: HashMap<SocketAddr, Instant>,
     hello_interval: Duration,
 }
 
@@ -99,6 +104,9 @@ impl KonoNode {
             pending_filter_consents: HashMap::new(),
             last_rendezvous_request: HashMap::new(),
             last_filter_test_request: HashMap::new(),
+            dht: DhtTable::default(),
+            pending_dht_queries: HashSet::new(),
+            discovery_candidates: HashMap::new(),
             hello_interval,
         })
     }
@@ -111,6 +119,7 @@ impl KonoNode {
     }
 
     pub fn queue_auto_rendezvous(&mut self, target_node_id: String) {
+        self.pending_dht_queries.insert(target_node_id.clone());
         self.auto_rendezvous
             .entry(target_node_id.clone())
             .or_insert_with(|| AutoRendezvousState::new(target_node_id, Instant::now()));
@@ -140,6 +149,10 @@ impl KonoNode {
 
     pub fn nat_filtering_evidence(&self) -> NatFilteringEvidence {
         self.nat_profile.filtering_evidence()
+    }
+
+    pub fn dht_record_count(&self) -> usize {
+        self.dht.len()
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -333,6 +346,7 @@ impl KonoNode {
 
                 self.flush_rendezvous_requests(source).await?;
                 self.flush_filter_test_request(source).await?;
+                self.sync_dht_peer(source).await?;
             }
             MessageBody::SessionAck {
                 handshake_id,
@@ -375,6 +389,7 @@ impl KonoNode {
 
                 self.flush_rendezvous_requests(source).await?;
                 self.flush_filter_test_request(source).await?;
+                self.sync_dht_peer(source).await?;
             }
             MessageBody::Encrypted {
                 session_id,
@@ -604,6 +619,81 @@ impl KonoNode {
                     coordinator = %sender_node_id,
                     "filtering test unavailable from this coordinator"
                 );
+            }
+            SecurePayload::DhtStore { record } => {
+                let record_node_id = record.node_id.clone();
+                match self.dht.upsert(record.clone()) {
+                    Ok(true) => {
+                        debug!(
+                            peer = %record_node_id,
+                            records = self.dht.len(),
+                            "stored signed DHT peer record"
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        debug!(%error, peer = %record_node_id, "rejected DHT peer record");
+                        return Ok(());
+                    }
+                }
+
+                if self.pending_dht_queries.contains(&record_node_id) {
+                    self.activate_dht_record(&record).await?;
+                }
+            }
+            SecurePayload::DhtFind { target_node_id } => {
+                let mut records = Vec::new();
+
+                if target_node_id == self.node_id() {
+                    if let Some(record) = self.build_own_dht_record()? {
+                        records.push(record);
+                    }
+                } else if let Some(record) = self.dht.get(&target_node_id) {
+                    records.push(record.clone());
+                }
+
+                for record in self.dht.nearest(&target_node_id, DHT_RESPONSE_LIMIT) {
+                    if records.iter().any(|known| known.node_id == record.node_id) {
+                        continue;
+                    }
+                    records.push(record);
+                    if records.len() >= DHT_RESPONSE_LIMIT {
+                        break;
+                    }
+                }
+
+                self.send_secure_payload(
+                    source,
+                    SecurePayload::DhtNodes {
+                        target_node_id,
+                        records,
+                    },
+                )
+                .await?;
+            }
+            SecurePayload::DhtNodes {
+                target_node_id,
+                records,
+            } => {
+                if records.len() > DHT_RESPONSE_LIMIT {
+                    debug!(
+                        peer = %sender_node_id,
+                        count = records.len(),
+                        "rejected oversized DHT response"
+                    );
+                    return Ok(());
+                }
+
+                for record in records {
+                    let exact = record.node_id == target_node_id;
+                    if self.dht.upsert(record.clone()).is_err() {
+                        continue;
+                    }
+
+                    if exact && self.pending_dht_queries.contains(&target_node_id) {
+                        self.activate_dht_record(&record).await?;
+                    }
+                }
             }
             SecurePayload::RendezvousOffer {
                 peer_node_id,
@@ -1002,6 +1092,66 @@ impl KonoNode {
         Ok(())
     }
 
+    fn build_own_dht_record(&self) -> Result<Option<PeerRecord>> {
+        let Some(endpoint) = self.nat_profile.preferred_endpoint() else {
+            return Ok(None);
+        };
+        if !endpoint_publishable(endpoint) {
+            return Ok(None);
+        }
+
+        Ok(Some(PeerRecord::signed(&self.identity, vec![endpoint])?))
+    }
+
+    async fn sync_dht_peer(&mut self, peer: SocketAddr) -> Result<()> {
+        if let Some(record) = self.build_own_dht_record()? {
+            self.send_secure_payload(peer, SecurePayload::DhtStore { record })
+                .await?;
+        }
+
+        let targets: Vec<String> = self.pending_dht_queries.iter().cloned().collect();
+        for target_node_id in targets {
+            self.send_secure_payload(
+                peer,
+                SecurePayload::DhtFind {
+                    target_node_id: target_node_id.clone(),
+                },
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn activate_dht_record(&mut self, record: &PeerRecord) -> Result<()> {
+        if !self.pending_dht_queries.contains(&record.node_id) {
+            return Ok(());
+        }
+
+        for endpoint in record.socket_endpoints().into_iter().take(2) {
+            self.discovery_candidates
+                .insert(endpoint, Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL);
+
+            let cookie = self.cookie_cache.get(&endpoint).cloned();
+            self.send(
+                endpoint,
+                MessageBody::Hello {
+                    features: local_features(),
+                    cookie,
+                },
+            )
+            .await?;
+
+            info!(
+                target = %record.node_id,
+                %endpoint,
+                "started exact-match DHT discovery attempt"
+            );
+        }
+
+        Ok(())
+    }
+
     async fn send_secure_payload(
         &mut self,
         target: SocketAddr,
@@ -1136,6 +1286,7 @@ impl KonoNode {
         self.bootstrap_peers.contains(&source)
             || self.peers.contains_key(&source)
             || self.cookie_cache.contains_key(&source)
+            || self.discovery_candidates.contains_key(&source)
     }
 
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
@@ -1164,6 +1315,10 @@ impl KonoNode {
         if !self.peers.contains_key(&source) && self.peers.len() >= MAX_ACTIVE_PEERS {
             self.evict_oldest_peer();
         }
+
+        self.discovery_candidates.remove(&source);
+        self.pending_dht_queries.remove(&envelope.sender_node_id);
+        self.auto_rendezvous.remove(&envelope.sender_node_id);
 
         let now = Instant::now();
         self.peers
@@ -1200,6 +1355,7 @@ impl KonoNode {
     async fn refresh_discovery(&self) {
         let mut endpoints = self.bootstrap_peers.clone();
         endpoints.extend(self.peers.keys().copied());
+        endpoints.extend(self.discovery_candidates.keys().copied());
         endpoints.sort_unstable();
         endpoints.dedup();
 
@@ -1261,6 +1417,12 @@ impl KonoNode {
             .retain(|_, last| last.elapsed() < Duration::from_secs(60));
         self.last_filter_test_request
             .retain(|_, last| last.elapsed() < Duration::from_secs(60));
+        self.discovery_candidates
+            .retain(|_, expires_at| *expires_at > Instant::now());
+        let expired_dht = self.dht.expire();
+        if expired_dht > 0 {
+            debug!(expired_dht, "expired stale DHT peer records");
+        }
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
             debug!(removed, "expired stale peers");
@@ -1289,6 +1451,8 @@ fn local_features() -> Vec<String> {
         "nat-observation".to_owned(),
         "decentralized-rendezvous".to_owned(),
         "auto-rendezvous-selection".to_owned(),
+        "signed-dht-records".to_owned(),
+        "encrypted-dht-lookup".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
