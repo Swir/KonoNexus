@@ -4,6 +4,15 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added a reusable 128-sequence sliding replay window and applied it to encrypted KNP sessions, relay forwarding, and endpoint relay paths.
+- Authenticated encrypted UDP frames may now arrive out of order within the replay window while duplicates and frames older than the window remain rejected.
+- Added RelayApp ACK-timeout retransmission: one-second timeout, up to four bounded retries, and automatic queue release after retry exhaustion.
+- Added bounded delivered-message deduplication so retransmission after a lost ACK re-sends the ACK without delivering the same application message twice.
+- Added tests for missing-fragment recovery, lost-ACK recovery, retry exhaustion, reordered secure frames, reordered relay cells, and replay rejection.
+- Added relay abuse controls: max 16 circuits per NodeID, 128 cells/second per circuit direction, and 256 KiB/second per circuit direction.
+- Added rate-window reset and per-node circuit-limit tests.
+- Bumped the implementation package to 0.1.0-alpha.12.
+
 - Added `RelayAppHandle`, a bounded async runtime API that remains usable while `KonoNode::run()` owns the network loop.
 - Added application command responses through Tokio mpsc/oneshot channels and bounded receive-event delivery without blocking the network loop.
 - Added end-to-end relay application fragmentation at 512-byte payload chunks with a 256 KiB message ceiling.
