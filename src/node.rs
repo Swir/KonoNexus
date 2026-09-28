@@ -1,7 +1,5 @@
 use crate::identity::NodeIdentity;
-use crate::nat::{
-    FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile,
-};
+use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
@@ -492,13 +490,13 @@ impl KonoNode {
                 self.maybe_start_session(source, &sender_node_id).await?;
             }
             MessageBody::FilterProbe { probe_token } => {
-                let authorized = self
-                    .pending_filter_probes
-                    .get(&probe_token)
-                    .is_some_and(|pending| {
-                        pending.expected_helper_node_id == sender_node_id
-                            && pending.expires_at > Instant::now()
-                    });
+                let authorized =
+                    self.pending_filter_probes
+                        .get(&probe_token)
+                        .is_some_and(|pending| {
+                            pending.expected_helper_node_id == sender_node_id
+                                && pending.expires_at > Instant::now()
+                        });
                 if !authorized {
                     debug!(
                         peer = %sender_node_id,
@@ -837,7 +835,8 @@ impl KonoNode {
         {
             return Ok(());
         }
-        self.last_filter_test_request.insert(requester_endpoint, now);
+        self.last_filter_test_request
+            .insert(requester_endpoint, now);
 
         if self.pending_filter_consents.len() >= MAX_PENDING_FILTER_PROBES {
             self.send_secure_payload(requester_endpoint, SecurePayload::FilteringTestUnavailable)
