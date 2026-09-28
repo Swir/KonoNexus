@@ -8,8 +8,8 @@ use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
 use crate::relay_app::{
-    RelayAppDeliveryFailure, RelayAppDeliveryReceipt, RelayAppManager, RelayAppMessage,
-    RelayAppReceiveStatus,
+    RelayAppDeliveryFailure, RelayAppDeliveryReceipt, RelayAppEvent, RelayAppManager,
+    RelayAppMessage, RelayAppReceiveStatus,
 };
 use crate::relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, encode_relay_payload_on_session,
@@ -115,6 +115,14 @@ impl RelayAppHandle {
 
     pub async fn recv_failure(&mut self) -> Option<RelayAppDeliveryFailure> {
         self.failure_rx.recv().await
+    }
+
+    pub async fn next_event(&mut self) -> Option<RelayAppEvent> {
+        tokio::select! {
+            message = self.message_rx.recv() => message.map(RelayAppEvent::Message),
+            receipt = self.receipt_rx.recv() => receipt.map(RelayAppEvent::Delivered),
+            failure = self.failure_rx.recv() => failure.map(RelayAppEvent::Failed),
+        }
     }
 }
 
