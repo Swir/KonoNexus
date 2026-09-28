@@ -1,6 +1,4 @@
-use crate::identity::{
-    node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-};
+use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::relay::MAX_RELAY_CELL_BYTES;
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{anyhow, bail, Context, Result};
@@ -98,11 +96,7 @@ impl RelayE2eInitiator {
         ))
     }
 
-    pub fn complete(
-        self,
-        identity: &NodeIdentity,
-        encoded_ack: &[u8],
-    ) -> Result<SecureSession> {
+    pub fn complete(self, identity: &NodeIdentity, encoded_ack: &[u8]) -> Result<SecureSession> {
         let packet = decode_packet(encoded_ack)?;
         let RelayInnerPacket::SessionAck {
             circuit_id,
@@ -224,10 +218,7 @@ pub fn encode_relay_payload(
     })
 }
 
-pub fn decode_relay_payload(
-    session: &mut SecureSession,
-    encoded: &[u8],
-) -> Result<SecurePayload> {
+pub fn decode_relay_payload(session: &mut SecureSession, encoded: &[u8]) -> Result<SecurePayload> {
     let packet = decode_packet(encoded)?;
     let RelayInnerPacket::Data {
         session_id,
@@ -291,8 +282,7 @@ fn verify_handshake(
         bail!("relay inner NodeID/public-key mismatch");
     }
 
-    let raw_signature =
-        hex::decode(signature).context("relay inner signature is not valid hex")?;
+    let raw_signature = hex::decode(signature).context("relay inner signature is not valid hex")?;
     let signature: [u8; SIGNATURE_LEN] = raw_signature
         .try_into()
         .map_err(|_| anyhow!("relay inner signature must be 64 bytes"))?;
@@ -357,7 +347,9 @@ mod tests {
             RelayE2eInitiator::begin(&a, 77, b.node_id()).expect("init should build");
         let (responder, ack) =
             accept_relay_init(&b, 77, &a.node_id(), &init).expect("target should accept");
-        let origin = initiator.complete(&a, &ack).expect("origin should complete");
+        let origin = initiator
+            .complete(&a, &ack)
+            .expect("origin should complete");
         (origin, responder)
     }
 
@@ -366,8 +358,7 @@ mod tests {
         let (mut a, mut b) = establish();
         assert_eq!(a.session_id(), b.session_id());
 
-        let encoded =
-            encode_relay_payload(&mut a, &SecurePayload::Ping { token: 9 }).unwrap();
+        let encoded = encode_relay_payload(&mut a, &SecurePayload::Ping { token: 9 }).unwrap();
         let decoded = decode_relay_payload(&mut b, &encoded).unwrap();
         assert_eq!(decoded, SecurePayload::Ping { token: 9 });
     }
@@ -394,8 +385,7 @@ mod tests {
     #[test]
     fn tampered_inner_data_is_rejected() {
         let (mut a, mut b) = establish();
-        let mut encoded =
-            encode_relay_payload(&mut a, &SecurePayload::Ping { token: 12 }).unwrap();
+        let mut encoded = encode_relay_payload(&mut a, &SecurePayload::Ping { token: 12 }).unwrap();
         let last = encoded.len() - 2;
         encoded[last] ^= 1;
 
