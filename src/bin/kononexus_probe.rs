@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time;
@@ -62,17 +62,68 @@ async fn run() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let interactive = std::env::args_os().len() == 1;
     let identity_path = args.identity.unwrap_or(default_identity_path()?);
 
     println!("===============================================");
-    println!(" KonoNexus 0.1.0-alpha.15.1 TEST PROBE");
+    println!(" KonoNexus 0.1.0-alpha.15.2 TEST PROBE");
     println!(" Windows / multi-PC network test");
     println!("===============================================");
     println!("IDENTITY={}", identity_path.display());
+    if let Some(ip) = local_ip_hint() {
+        println!("LAN_IP_HINT={ip}");
+    }
+
+    let mut peers = args.peers;
+    let mut target = args.target;
+    let mut message = args.message;
+    let mut run_seconds = args.run_seconds;
+
+    if interactive {
+        println!();
+        println!("Wybierz tryb:");
+        println!("  1 = Pierwszy PC / nasluch");
+        println!("  2 = Drugi PC / polacz i wyslij test");
+        println!();
+        print!("Wybor [1]: ");
+        flush_stdout();
+        let choice = read_line_trimmed().unwrap_or_default();
+
+        if choice == "2" {
+            println!();
+            print!("IP pierwszego PC: ");
+            flush_stdout();
+            let ip = read_line_trimmed().context("nie podano IP pierwszego PC")?;
+            let peer: SocketAddr = format!("{ip}:47000")
+                .parse()
+                .context("nieprawidlowy adres IP pierwszego PC")?;
+            peers.push(peer);
+
+            print!("NODE_ID pierwszego PC: ");
+            flush_stdout();
+            let node_id = read_line_trimmed().context("nie podano NODE_ID")?;
+            if node_id.trim().is_empty() {
+                anyhow::bail!("NODE_ID nie moze byc pusty");
+            }
+            target = Some(node_id);
+
+            print!("Wiadomosc testowa [HELLO KONONEXUS]: ");
+            flush_stdout();
+            let entered = read_line_trimmed().unwrap_or_default();
+            message = Some(if entered.is_empty() {
+                "HELLO KONONEXUS".to_owned()
+            } else {
+                entered
+            });
+            run_seconds = 600;
+        } else {
+            run_seconds = 3600;
+        }
+    }
 
     let mut config = KonofixSdkConfig::new(identity_path.clone())
         .with_bind(args.bind)
-        .with_seed_peers(args.peers)
+        .with_seed_peers(peers)
         .with_hello_interval(Duration::from_secs(args.hello_interval.max(1)))
         .with_event_capacity(128);
 
@@ -94,7 +145,7 @@ async fn run() -> Result<()> {
     println!("Aby zakonczyc: Ctrl+C albo zamknij okno.");
     println!();
 
-    if let (Some(target), Some(message)) = (args.target, args.message) {
+    if let (Some(target), Some(message)) = (target, message) {
         let message_id = transport
             .send(target.clone(), message.into_bytes())
             .await
@@ -102,7 +153,7 @@ async fn run() -> Result<()> {
         println!("QUEUED message_id={message_id} target={target}");
     }
 
-    let deadline = time::Instant::now() + Duration::from_secs(args.run_seconds.max(1));
+    let deadline = time::Instant::now() + Duration::from_secs(run_seconds.max(1));
 
     loop {
         tokio::select! {
@@ -151,6 +202,23 @@ async fn run() -> Result<()> {
 
     transport.shutdown().await;
     Ok(())
+}
+
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = io::stdout().flush();
+}
+
+fn read_line_trimmed() -> Option<String> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).ok()?;
+    Some(line.trim().to_owned())
+}
+
+fn local_ip_hint() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip())
 }
 
 fn default_identity_path() -> Result<PathBuf> {
