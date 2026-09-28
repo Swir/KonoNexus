@@ -4,6 +4,15 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added persistent routing hints saved only from currently authenticated encrypted peers.
+- Added routing-cache age/bounds validation, restart loading, configurable cache path, periodic refresh, and shutdown persistence.
+- Cached peers remain untrusted bootstrap hints and must repeat the full KNP admission and encrypted handshake after restart.
+- Added bounded cooperative relay circuit management with OPEN/OFFER/ACCEPT/READY/CLOSE control flow.
+- Added explicit target-side relay acceptance tracking so unsolicited READY messages cannot create a local relay path.
+- Added opaque relay cells capped at 8 KiB, per-direction sequence replay/rollback protection, 256-circuit limit, and 120-second idle expiry.
+- Added `--relay-via` and `--routing-cache` CLI controls plus relay/cache unit tests.
+- Bumped the implementation package to 0.1.0-alpha.9.
+
 - Added an in-memory 256-bucket XOR-distance routing table populated only by established encrypted peers.
 - Added bounded recursive multi-hop DHT queries with fanout 2 and a maximum of 3 hops.
 - Added random query IDs, origin binding, duplicate-query suppression, short-lived reverse routes, forwarding cooldowns, and 8-second query state.
