@@ -256,8 +256,7 @@ fn normalize_bucket_entries(
         if !cache_endpoint_allowed(endpoint) || !plausible_node_id(&entry.node_id) {
             return false;
         }
-        routing_bucket_index(local_node_id, &entry.node_id)
-            == Some(usize::from(entry.bucket_index))
+        routing_bucket_index(local_node_id, &entry.node_id) == Some(usize::from(entry.bucket_index))
     });
 
     entries.sort_by_key(|entry| {
