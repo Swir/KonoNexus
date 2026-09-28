@@ -128,24 +128,26 @@ impl RelayManager {
             bail!("relay circuit is not active");
         }
 
-        let (destination, peer_node_id, last_sequence) =
-            if source_endpoint == circuit.origin_endpoint && source_node_id == circuit.origin_node_id {
-                (
-                    circuit.target_endpoint,
-                    circuit.target_node_id.clone(),
-                    &mut circuit.origin_sequence,
-                )
-            } else if source_endpoint == circuit.target_endpoint
-                && source_node_id == circuit.target_node_id
-            {
-                (
-                    circuit.origin_endpoint,
-                    circuit.origin_node_id.clone(),
-                    &mut circuit.target_sequence,
-                )
-            } else {
-                bail!("relay cell source does not match circuit");
-            };
+        let (destination, peer_node_id, last_sequence) = if source_endpoint
+            == circuit.origin_endpoint
+            && source_node_id == circuit.origin_node_id
+        {
+            (
+                circuit.target_endpoint,
+                circuit.target_node_id.clone(),
+                &mut circuit.origin_sequence,
+            )
+        } else if source_endpoint == circuit.target_endpoint
+            && source_node_id == circuit.target_node_id
+        {
+            (
+                circuit.origin_endpoint,
+                circuit.origin_node_id.clone(),
+                &mut circuit.target_sequence,
+            )
+        } else {
+            bail!("relay cell source does not match circuit");
+        };
 
         if last_sequence.is_some_and(|last| sequence <= last) {
             bail!("relay cell sequence replay or rollback");
@@ -269,7 +271,10 @@ mod tests {
     #[test]
     fn relay_expires_idle_circuits() {
         let (mut relay, _, _, _) = setup();
-        assert_eq!(relay.expire(Instant::now() + RELAY_CIRCUIT_TTL + Duration::from_secs(1)), 1);
+        assert_eq!(
+            relay.expire(Instant::now() + RELAY_CIRCUIT_TTL + Duration::from_secs(1)),
+            1
+        );
         assert!(relay.is_empty());
     }
 }
