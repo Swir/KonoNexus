@@ -31,10 +31,10 @@ pub use relay::{
     MAX_RELAY_CIRCUITS_PER_NODE, RELAY_CIRCUIT_TTL, RELAY_RATE_WINDOW,
 };
 pub use relay_app::{
-    RelayAppFragment, RelayAppManager, RelayAppMessage, RelayAppOutboundFragment,
-    RelayAppReceiveStatus, MAX_RELAY_APP_MESSAGE_BYTES, MAX_RELAY_APP_OUTBOUND_BYTES,
-    MAX_RELAY_APP_OUTBOUND_MESSAGES, MAX_RELAY_APP_RETRANSMISSIONS, RELAY_APP_ACK_TIMEOUT,
-    RELAY_APP_FRAGMENT_BYTES,
+    RelayAppDeliveryFailure, RelayAppFailureReason, RelayAppFragment, RelayAppManager,
+    RelayAppMessage, RelayAppOutboundFragment, RelayAppReceiveStatus, MAX_RELAY_APP_MESSAGE_BYTES,
+    MAX_RELAY_APP_OUTBOUND_BYTES, MAX_RELAY_APP_OUTBOUND_MESSAGES,
+    MAX_RELAY_APP_RETRANSMISSIONS, RELAY_APP_ACK_TIMEOUT, RELAY_APP_FRAGMENT_BYTES,
 };
 pub use relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
