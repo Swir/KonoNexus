@@ -44,6 +44,9 @@ const SESSION_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SESSION_HANDSHAKE_MAX_ATTEMPTS: u8 = 4;
 const SESSION_RESPONDER_ACK_TTL: Duration = Duration::from_secs(10);
 const MAX_SESSION_RESPONDER_ACKS: usize = 256;
+const AUTO_RELAY_MAX_CANDIDATES: usize = 3;
+const AUTO_RELAY_RETRY_DELAY: Duration = Duration::from_secs(2);
+const AUTO_RELAY_STATE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -154,6 +157,14 @@ struct PendingRelayAccept {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct AutoRelayFallback {
+    preferred: Option<SocketAddr>,
+    tried: HashSet<SocketAddr>,
+    next_attempt_at: Instant,
+    expires_at: Instant,
+}
+
 pub struct KonoNode {
     identity: NodeIdentity,
     socket: Arc<UdpSocket>,
@@ -188,6 +199,7 @@ pub struct KonoNode {
     queued_relays: HashMap<SocketAddr, Vec<String>>,
     pending_relay_requests: HashMap<u64, (SocketAddr, String)>,
     pending_relay_accepts: HashMap<(SocketAddr, u64), PendingRelayAccept>,
+    auto_relay_fallbacks: HashMap<String, AutoRelayFallback>,
     relay_paths: HashMap<(SocketAddr, u64), RelayPath>,
     relay_e2e_pending: HashMap<(SocketAddr, u64), RelayE2eInitiator>,
     relay_e2e_sessions: HashMap<(SocketAddr, u64), SecureSession>,
@@ -245,6 +257,7 @@ impl KonoNode {
             queued_relays: HashMap::new(),
             pending_relay_requests: HashMap::new(),
             pending_relay_accepts: HashMap::new(),
+            auto_relay_fallbacks: HashMap::new(),
             relay_paths: HashMap::new(),
             relay_e2e_pending: HashMap::new(),
             relay_e2e_sessions: HashMap::new(),
@@ -412,6 +425,7 @@ impl KonoNode {
                 _ = rendezvous_ticker.tick() => {
                     self.drive_session_handshakes().await;
                     self.drive_auto_rendezvous().await;
+                    self.drive_auto_relay_fallbacks().await;
                     self.drive_dht_queries().await;
                     self.flush_relay_app_events();
                     self.flush_relay_app_failures();
@@ -1235,6 +1249,8 @@ impl KonoNode {
                     return Ok(());
                 }
 
+                self.auto_relay_fallbacks.remove(&peer_node_id);
+
                 self.relay_paths.insert(
                     (source, circuit_id),
                     RelayPath {
@@ -1343,11 +1359,20 @@ impl KonoNode {
                 }
             }
             SecurePayload::RelayReject { circuit_id } => {
-                self.pending_relay_requests.remove(&circuit_id);
+                let rejected = self.pending_relay_requests.remove(&circuit_id);
                 self.pending_relay_accepts.remove(&(source, circuit_id));
                 self.relay_paths.remove(&(source, circuit_id));
                 self.relay_e2e_pending.remove(&(source, circuit_id));
                 self.relay_e2e_sessions.remove(&(source, circuit_id));
+
+                if let Some((relay_endpoint, target_node_id)) = rejected {
+                    if relay_endpoint == source {
+                        if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
+                            state.next_attempt_at = Instant::now();
+                        }
+                    }
+                }
+
                 debug!(relay = %sender_node_id, circuit_id, "relay request rejected");
             }
             SecurePayload::RendezvousOffer {
@@ -2392,42 +2417,21 @@ impl KonoNode {
                 let target_node_id = schedule.expected_node_id().to_owned();
                 let relay_candidate = self.punch_relay_candidates.remove(&token);
                 let local_node_id = self.node_id();
-                let mut relay_started = false;
+                let mut relay_scheduled = false;
 
                 if local_node_id.as_str() < target_node_id.as_str()
                     && self.peer_endpoint_by_node_id(&target_node_id).is_none()
                 {
-                    if let Some(relay_endpoint) = relay_candidate {
-                        if self.sessions.contains_key(&relay_endpoint) {
-                            match self
-                                .start_relay_request(relay_endpoint, &target_node_id)
-                                .await
-                            {
-                                Ok(Some(circuit_id)) => {
-                                    relay_started = true;
-                                    info!(
-                                        %relay_endpoint,
-                                        target = %target_node_id,
-                                        circuit_id,
-                                        "hole punch failed; automatic relay fallback started"
-                                    );
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    debug!(
-                                        %relay_endpoint,
-                                        target = %target_node_id,
-                                        %error,
-                                        "automatic relay fallback failed to start"
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    self.schedule_auto_relay_fallback(
+                        target_node_id.clone(),
+                        relay_candidate,
+                        Instant::now(),
+                    );
+                    relay_scheduled = true;
                 }
 
                 if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
-                    if relay_started {
+                    if relay_scheduled {
                         state.defer(Instant::now(), Duration::from_secs(10));
                     } else {
                         state.hurry(Instant::now());
@@ -2439,9 +2443,170 @@ impl KonoNode {
                     candidate = %schedule.candidate_endpoint(),
                     punch_token = token,
                     attempts = schedule.attempts_sent(),
-                    relay_started,
+                    relay_scheduled,
                     "UDP punch burst expired without direct-path confirmation"
                 );
+            }
+        }
+    }
+
+    fn schedule_auto_relay_fallback(
+        &mut self,
+        target_node_id: String,
+        preferred: Option<SocketAddr>,
+        now: Instant,
+    ) {
+        self.auto_relay_fallbacks
+            .entry(target_node_id)
+            .and_modify(|state| {
+                if state.preferred.is_none() {
+                    state.preferred = preferred;
+                }
+                state.next_attempt_at = now;
+                state.expires_at = now + AUTO_RELAY_STATE_TTL;
+            })
+            .or_insert_with(|| AutoRelayFallback {
+                preferred,
+                tried: HashSet::new(),
+                next_attempt_at: now,
+                expires_at: now + AUTO_RELAY_STATE_TTL,
+            });
+    }
+
+    async fn drive_auto_relay_fallbacks(&mut self) {
+        let now = Instant::now();
+        let targets: Vec<String> = self.auto_relay_fallbacks.keys().cloned().collect();
+
+        for target_node_id in targets {
+            if self.peer_endpoint_by_node_id(&target_node_id).is_some()
+                || self.relay_paths.values().any(|path| {
+                    path.peer_node_id == target_node_id && path.expires_at > now
+                })
+            {
+                self.auto_relay_fallbacks.remove(&target_node_id);
+                continue;
+            }
+
+            if self
+                .pending_relay_requests
+                .values()
+                .any(|(_, target)| target == &target_node_id)
+            {
+                continue;
+            }
+
+            let candidate = {
+                let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) else {
+                    continue;
+                };
+
+                if state.expires_at <= now || state.tried.len() >= AUTO_RELAY_MAX_CANDIDATES {
+                    None
+                } else if state.next_attempt_at > now {
+                    continue;
+                } else if let Some(preferred) = state.preferred {
+                    if !state.tried.contains(&preferred)
+                        && self.sessions.contains_key(&preferred)
+                    {
+                        Some(preferred)
+                    } else {
+                        let mut candidates: Vec<(SocketAddr, Instant)> = self
+                            .sessions
+                            .keys()
+                            .filter_map(|endpoint| {
+                                if state.tried.contains(endpoint) {
+                                    return None;
+                                }
+                                let peer = self.peers.get(endpoint)?;
+                                if peer.node_id == target_node_id {
+                                    return None;
+                                }
+                                Some((*endpoint, peer.first_seen))
+                            })
+                            .collect();
+                        candidates.sort_by_key(|(endpoint, first_seen)| {
+                            (
+                                if endpoint.is_ipv6() { 0_u8 } else { 1_u8 },
+                                *first_seen,
+                                *endpoint,
+                            )
+                        });
+                        candidates.first().map(|(endpoint, _)| *endpoint)
+                    }
+                } else {
+                    let mut candidates: Vec<(SocketAddr, Instant)> = self
+                        .sessions
+                        .keys()
+                        .filter_map(|endpoint| {
+                            if state.tried.contains(endpoint) {
+                                return None;
+                            }
+                            let peer = self.peers.get(endpoint)?;
+                            if peer.node_id == target_node_id {
+                                return None;
+                            }
+                            Some((*endpoint, peer.first_seen))
+                        })
+                        .collect();
+                    candidates.sort_by_key(|(endpoint, first_seen)| {
+                        (
+                            if endpoint.is_ipv6() { 0_u8 } else { 1_u8 },
+                            *first_seen,
+                            *endpoint,
+                        )
+                    });
+                    candidates.first().map(|(endpoint, _)| *endpoint)
+                }
+            };
+
+            let Some(candidate) = candidate else {
+                let exhausted = self
+                    .auto_relay_fallbacks
+                    .get(&target_node_id)
+                    .is_some_and(|state| {
+                        state.expires_at <= now
+                            || state.tried.len() >= AUTO_RELAY_MAX_CANDIDATES
+                    });
+                if exhausted {
+                    self.auto_relay_fallbacks.remove(&target_node_id);
+                    debug!(
+                        target = %target_node_id,
+                        "automatic relay candidates exhausted"
+                    );
+                }
+                continue;
+            };
+
+            if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
+                state.tried.insert(candidate);
+                state.next_attempt_at = now + AUTO_RELAY_RETRY_DELAY;
+            }
+
+            match self.start_relay_request(candidate, &target_node_id).await {
+                Ok(Some(circuit_id)) => {
+                    info!(
+                        %candidate,
+                        target = %target_node_id,
+                        circuit_id,
+                        "automatic relay candidate selected"
+                    );
+                }
+                Ok(None) => {
+                    if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
+                        state.next_attempt_at = now;
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        %candidate,
+                        target = %target_node_id,
+                        %error,
+                        "automatic relay candidate failed"
+                    );
+                    if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
+                        state.next_attempt_at = now;
+                    }
+                }
             }
         }
     }
@@ -2616,6 +2781,8 @@ impl KonoNode {
             .retain(|_, query| query.target_node_id != envelope.sender_node_id);
         self.last_dht_query_start.remove(&envelope.sender_node_id);
         self.auto_rendezvous.remove(&envelope.sender_node_id);
+        self.auto_relay_fallbacks
+            .remove(&envelope.sender_node_id);
 
         let now = Instant::now();
         self.peers
@@ -2783,6 +2950,7 @@ fn local_features() -> Vec<String> {
         "relay-app-fragmentation".to_owned(),
         "relay-app-backpressure".to_owned(),
         "punch-to-relay-fallback".to_owned(),
+        "multi-candidate-relay-fallback".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
