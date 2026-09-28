@@ -728,12 +728,9 @@ impl KonoNode {
                 }
 
                 let payload = match self.sessions.get_mut(&source) {
-                    Some(session) => session.decrypt(
-                        &session_id,
-                        sequence,
-                        &ciphertext,
-                        Instant::now(),
-                    )?,
+                    Some(session) => {
+                        session.decrypt(&session_id, sequence, &ciphertext, Instant::now())?
+                    }
                     None => {
                         debug!(%source, "ignoring secure frame without established session");
                         return Ok(());
@@ -754,13 +751,8 @@ impl KonoNode {
                     );
                 }
 
-                self.handle_secure_payload(
-                    source,
-                    &sender_node_id,
-                    &session_id,
-                    payload,
-                )
-                .await?;
+                self.handle_secure_payload(source, &sender_node_id, &session_id, payload)
+                    .await?;
             }
             MessageBody::PunchProbe { punch_token } => {
                 if !self.authorize_punch(punch_token, &sender_node_id) {
@@ -987,11 +979,7 @@ impl KonoNode {
                 let Some(slot) = self.sessions.get_mut(&source) else {
                     return Ok(());
                 };
-                slot.rotate(
-                    new_session,
-                    Instant::now(),
-                    SESSION_REKEY_GRACE,
-                )?;
+                slot.rotate(new_session, Instant::now(), SESSION_REKEY_GRACE)?;
 
                 if self.responder_rekey_acks.len() >= MAX_SESSION_REKEY_ACKS {
                     if let Some(oldest) = self
@@ -3075,8 +3063,7 @@ impl KonoNode {
         let Some(session) = self.sessions.get_mut(&target) else {
             return Ok(None);
         };
-        let frame =
-            session.encrypt_with_session_id(session_id, &payload, Instant::now())?;
+        let frame = session.encrypt_with_session_id(session_id, &payload, Instant::now())?;
         Ok(Some(MessageBody::Encrypted {
             session_id: frame.session_id,
             sequence: frame.sequence,
