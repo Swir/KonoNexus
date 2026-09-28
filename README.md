@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.11 — live RelayApp API + bounded fragmentation/backpressure**. KNP now exposes a live async application handle that can send and receive end-to-end encrypted messages while the node event loop is running. Relay application messages are fragmented into bounded 512-byte chunks, reassembled only after the relay E2E session authenticates them, retained under explicit memory/count limits, and released from the sender queue only after an encrypted application ACK. Automatic retransmission after packet/ACK loss and UDP reordering tolerance are not yet claimed complete.
+> Status: **0.1.0-alpha.12 — RelayApp retransmission + reordered UDP tolerance + relay quotas**. KNP now retransmits unacknowledged RelayApp messages after a 1-second ACK timeout, retries at most four times, suppresses duplicate application delivery with a bounded delivered-message cache, and uses a 128-sequence sliding replay window so authenticated UDP frames may arrive out of order without being mistaken for replay. Relay circuits are additionally bounded per NodeID and by cells/bytes per second. Broad multi-network validation, route migration, and alternate relay selection are still not claimed complete.
 
 ## Principles
 
@@ -92,12 +92,14 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] 512-byte relay application fragmentation and bounded reassembly
 - [x] ACK-based bounded outbound backpressure
 - [x] Automatic hole-punch → single-relay fallback via rendezvous coordinator
-- [ ] Reliable fragment/ACK retransmission and UDP reordering tolerance
+- [x] Relay per-node and bandwidth abuse quotas
+- [x] Bounded fragment/ACK retransmission and duplicate-delivery suppression
+- [x] Sliding 128-sequence anti-replay windows with UDP reordering tolerance
 - [ ] Broader automatic relay selection and multi-relay/path migration
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
-- [ ] Session key rotation and sliding encrypted anti-replay window
+- [ ] Session key rotation
 - [ ] KonoNexus Network Tester GUI
 - [ ] Konofix SDK and Windows integration
 - [ ] Android transport integration
@@ -207,4 +209,9 @@ if let Some(message) = app.recv().await {
 
 The command/event channels are bounded; application send calls wait for command-channel capacity rather than creating an unbounded queue. The internal outbound queue accepts at most 64 messages / 2 MiB and keeps a sent message allocated until the remote E2E endpoint returns `RelayAppAck`. Incoming messages are limited to 256 KiB each, use 512-byte fragments, allow at most 64 concurrent reassemblies / 4 MiB reserved reassembly memory, and expire incomplete state after 30 seconds. Completed messages are also kept in a bounded queue if the application event channel is temporarily full.
 
-Alpha.11 does not yet retransmit lost fragments or lost ACKs. Outbound unacknowledged messages expire after 120 seconds. The current secure-session receive logic also rejects reordered UDP secure frames, so reliability/reordering hardening is the next transport step.
+Alpha.12 retransmits the complete fragment set after a 1-second ACK timeout, up to four times. The receiver keeps a bounded delivered-message ID cache so a lost ACK causes ACK replay without duplicate delivery to the application. All encrypted session and relay-transport receive paths use a 128-sequence sliding window: authenticated frames inside the window may arrive out of order, while duplicates and frames older than the window are rejected. Outbound messages still have a 120-second hard TTL.
+
+
+### Relay abuse controls
+
+Alpha.12 limits a relay to 256 circuits globally and at most 16 circuits involving any one NodeID. Each circuit direction is capped at 128 relay cells per second and 256 KiB per second. The counters reset on a one-second window and apply before forwarding. These limits are protocol safety defaults, not final production tuning.
