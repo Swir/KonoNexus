@@ -48,6 +48,12 @@ pub struct RelayAppDeliveryFailure {
     pub reason: RelayAppFailureReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAppDeliveryReceipt {
+    pub peer_node_id: String,
+    pub message_id: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayAppOutboundFragment {
     pub peer_node_id: String,
