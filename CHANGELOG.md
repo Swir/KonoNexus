@@ -4,6 +4,15 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added an in-memory 256-bucket XOR-distance routing table populated only by established encrypted peers.
+- Added bounded recursive multi-hop DHT queries with fanout 2 and a maximum of 3 hops.
+- Added random query IDs, origin binding, duplicate-query suppression, short-lived reverse routes, forwarding cooldowns, and 8-second query state.
+- Added encrypted reverse-path propagation for `DhtNodes` responses through intermediate KonoNexus peers.
+- Added query retry scheduling and routing-table cleanup when encrypted peer sessions disappear.
+- Preserved the rule that only an exact signed record for a locally requested NodeID may trigger a new outbound discovery connection.
+- Added routing-table unit coverage and kept nearest-record gossip non-dialable by default.
+- Bumped the implementation package to 0.1.0-alpha.8.
+
 - Added Ed25519-signed short-lived DHT peer records with NodeID/public-key binding.
 - Added a bounded 4,096-record DHT-style table with expiry and rollback rejection.
 - Added encrypted `DhtStore`, `DhtFind`, and `DhtNodes` control messages.
