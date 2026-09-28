@@ -396,8 +396,7 @@ mod tests {
         ));
         let local = format!("knp1{}", "0".repeat(40));
         let remote = format!("knp1{}", "2".repeat(40));
-        let legacy =
-            new_cache_entry(remote.clone(), "10.20.30.40:47000".parse().unwrap()).unwrap();
+        let legacy = new_cache_entry(remote.clone(), "10.20.30.40:47000".parse().unwrap()).unwrap();
         save_routing_hints(&path, std::slice::from_ref(&legacy)).unwrap();
 
         let loaded = load_routing_bucket_snapshot(&path, &local).unwrap();
