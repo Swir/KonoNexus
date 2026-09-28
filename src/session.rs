@@ -1,6 +1,7 @@
 use crate::dht::PeerRecord;
 use crate::nat::FilterProbeAuthorization;
 use crate::relay_app::RelayAppFragment;
+use crate::security::SequenceWindow;
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -192,7 +193,7 @@ pub struct SecureSession {
     send_key: [u8; 32],
     receive_key: [u8; 32],
     next_send_sequence: u64,
-    highest_receive_sequence: Option<u64>,
+    receive_window: SequenceWindow,
 }
 
 impl SecureSession {
@@ -243,12 +244,7 @@ impl SecureSession {
             bail!("KNP secure frame session id mismatch");
         }
 
-        if self
-            .highest_receive_sequence
-            .is_some_and(|highest| sequence <= highest)
-        {
-            bail!("KNP secure frame sequence replay or reordering rejected");
-        }
+        self.receive_window.check(sequence)?;
 
         let ciphertext =
             hex::decode(ciphertext_hex).context("secure frame ciphertext is not valid hex")?;
@@ -268,7 +264,7 @@ impl SecureSession {
         let payload = serde_json::from_slice(&plaintext)
             .context("failed to decode authenticated KNP secure payload")?;
 
-        self.highest_receive_sequence = Some(sequence);
+        self.receive_window.record(sequence)?;
         Ok(payload)
     }
 }
@@ -333,7 +329,7 @@ fn derive_session(
         send_key,
         receive_key,
         next_send_sequence: 0,
-        highest_receive_sequence: None,
+        receive_window: SequenceWindow::default(),
     })
 }
 
@@ -425,6 +421,39 @@ mod tests {
             .decrypt(&reply.session_id, reply.sequence, &reply.ciphertext)
             .unwrap();
         assert_eq!(payload, SecurePayload::Pong { token: 7 });
+    }
+
+    #[test]
+    fn secure_frames_accept_bounded_udp_reordering() {
+        let (mut initiator, mut responder) = session_pair();
+        let first = initiator
+            .encrypt(&SecurePayload::Ping { token: 1 })
+            .unwrap();
+        let second = initiator
+            .encrypt(&SecurePayload::Ping { token: 2 })
+            .unwrap();
+        let third = initiator
+            .encrypt(&SecurePayload::Ping { token: 3 })
+            .unwrap();
+
+        assert_eq!(
+            responder
+                .decrypt(&third.session_id, third.sequence, &third.ciphertext)
+                .unwrap(),
+            SecurePayload::Ping { token: 3 }
+        );
+        assert_eq!(
+            responder
+                .decrypt(&first.session_id, first.sequence, &first.ciphertext)
+                .unwrap(),
+            SecurePayload::Ping { token: 1 }
+        );
+        assert_eq!(
+            responder
+                .decrypt(&second.session_id, second.sequence, &second.ciphertext)
+                .unwrap(),
+            SecurePayload::Ping { token: 2 }
+        );
     }
 
     #[test]
