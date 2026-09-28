@@ -4,6 +4,14 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Promoted the current core to **0.1.0-alpha.15**, the first controlled external-testing candidate.
+- Added periodic relay-inner E2E rekey state with fresh X25519 material, bounded retries, cached ACKs, and previous-session grace handling.
+- Added the initial `KonofixTransport` / `KonofixSdkConfig` wrapper for application integration.
+- Added RelayApp delivery receipts and unified runtime events for message, delivered, and failed outcomes.
+- Added a live three-node runtime harness that verifies discovery and B→C application delivery through the running KonoNexus mesh.
+- Added an explicit loopback-only local test mode used solely by the harness; production rendezvous security remains unchanged by default.
+- Fixed the local harness blocker caused by the intentional production rejection of loopback punch candidates.
+
 - Added alpha.14 direct KNP session key rotation using fresh X25519/HKDF/ChaCha20-Poly1305 session material.
 - Added deterministic lower-NodeID rekey initiation, ten-minute rotation cadence, one-second retry cadence, and four-send rekey retry bound.
 - Added cached responder rekey ACKs so lost ACK retransmission returns the same responder ephemeral public key.
