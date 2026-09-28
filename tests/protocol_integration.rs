@@ -15,6 +15,7 @@ fn another_node_can_verify_a_signed_packet() {
         0xC0FFEE,
         MessageBody::Hello {
             features: vec!["knp/1".into()],
+            cookie: None,
         },
     )
     .expect("packet should sign");
