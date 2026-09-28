@@ -1732,11 +1732,7 @@ impl KonoNode {
     }
 
     fn flush_relay_app_events(&mut self) {
-        loop {
-            let Some(message) = self.relay_app.peek_completed() else {
-                break;
-            };
-
+        while let Some(message) = self.relay_app.peek_completed() {
             let result = match self.relay_app_event_tx.as_ref() {
                 Some(sender) => sender.try_send(message),
                 None => break,
