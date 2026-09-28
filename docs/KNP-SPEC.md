@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Full persistent k-bucket state, endpoint attestations, broad convergence testing, route migration, alternate relay selection, and robust NAT/filtering validation are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Alpha.13 adds explicit RelayApp delivery-failure events, bounded direct-session handshake retransmission with cached responder ACKs, responder-side confirmation before deferred encrypted control traffic is flushed, and bounded alternate relay selection across existing encrypted peers. Full persistent k-bucket state, endpoint attestations, broad convergence testing, route migration, session key rotation, and robust NAT/filtering validation are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -24,7 +24,7 @@ A new ordinary inbound peer must return a stateless HMAC-SHA256 endpoint cookie 
 
 ## 4. Secure sessions
 
-Admitted peers use ephemeral X25519 key agreement authenticated by the signed outer envelope. HKDF-SHA256 derives separate directional keys from a transcript containing both NodeIDs, the handshake ID, and both ephemeral public keys. Secure payloads use ChaCha20-Poly1305. Each receive direction maintains a 128-sequence sliding replay window: authenticated frames may arrive out of order while duplicate sequence numbers and frames older than the window are rejected.
+Admitted peers use ephemeral X25519 key agreement authenticated by the signed outer envelope. HKDF-SHA256 derives separate directional keys from a transcript containing both NodeIDs, the handshake ID, and both ephemeral public keys. Secure payloads use ChaCha20-Poly1305. Each receive direction maintains a 128-sequence sliding replay window: authenticated frames may arrive out of order while duplicate sequence numbers and frames older than the window are rejected. The initiator may retransmit the same `SESSION_INIT` after a one-second timeout, up to four total attempts. The responder caches the corresponding ACK for ten seconds and re-sends the same responder ephemeral public key for a matching duplicate. Responder-side queued encrypted work is released only after an authenticated encrypted frame confirms that the initiator completed the session.
 
 ## 5. External endpoint observation
 
@@ -198,7 +198,7 @@ The receiver permits at most 64 simultaneous reassemblies and reserves at most 4
 
 `RelayAppHandle` uses bounded Tokio channels. Application `send()` waits for command-channel capacity, the node validates/queues the message, and a oneshot response returns the assigned message ID or queue error. `recv()` yields only fully authenticated, decrypted, and reassembled messages. The node transmits at most four application fragments per 50 ms transport tick to bound work added to the event loop.
 
-After all fragments for a message are sent, the sender waits one second for encrypted `RelayAppAck`. On timeout it restarts the message from fragment zero; at most four retransmissions are permitted. The receiver keeps a bounded delivered-message cache for 120 seconds. If a retransmission arrives for an already delivered message with matching metadata, the receiver returns the ACK again without delivering a duplicate application event. After retry exhaustion the sender drops the message and releases its queued bytes. The sliding secure-session replay window allows authenticated out-of-order frames within 128 sequence numbers.
+After all fragments for a message are sent, the sender waits one second for encrypted `RelayAppAck`. On timeout it restarts the message from fragment zero; at most four retransmissions are permitted. The receiver keeps a bounded delivered-message cache for 120 seconds. If a retransmission arrives for an already delivered message with matching metadata, the receiver returns the ACK again without delivering a duplicate application event. After retry exhaustion the sender drops the message, releases its queued bytes, and enqueues a `RelayAppDeliveryFailure` event with the target NodeID, message ID, and `RetriesExhausted` reason. A separate `Expired` reason is reported when the hard outbound TTL removes a message. `RelayAppHandle::recv_failure()` exposes these failures to the application. The sliding secure-session replay window allows authenticated out-of-order frames within 128 sequence numbers.
 
 ## 21. Relay reliability and abuse limits
 
@@ -208,6 +208,14 @@ Replay protection is layered. Signed outer KNP control messages keep the timesta
 
 Relay abuse controls are applied per active circuit direction: 128 cells and 256 KiB per second. One NodeID may participate in at most 16 circuits on a relay, and the relay still has a 256-circuit global cap. These are conservative alpha defaults and require load testing before stable release.
 
-## 22. Versioning
+## 22. Handshake and alternate-relay reliability
+
+Direct session setup keeps one initiator attempt state per endpoint. `SESSION_INIT` is re-sent with the same handshake ID and X25519 ephemeral public key after one second, for at most four total sends. A responder caches at most 256 recent ACK descriptors for ten seconds. A duplicate init is accepted only when endpoint, peer NodeID, handshake ID, and initiator ephemeral key all match the cached state; the same responder public key is then returned. This prevents duplicate retransmission from silently switching the session key agreement.
+
+The responder may derive and store the session immediately, but it does not treat the path as application-ready until one authenticated encrypted frame decrypts successfully. That first secure frame confirms the initiator received the ACK. Only then are queued rendezvous, filter-test, relay, and DHT control operations flushed.
+
+Automatic relay fallback is bounded to three distinct currently encrypted peers. The last rendezvous coordinator is preferred when available. A rejection or failed candidate advances the fallback state to another encrypted peer without retrying the same endpoint. The fallback state expires after 30 seconds and is removed immediately when either a direct peer session or a relay path to the target becomes active.
+
+## 23. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
