@@ -1,6 +1,4 @@
-use crate::{
-    KonoNode, NodeIdentity, RelayAppEvent, RelayAppHandle,
-};
+use crate::{KonoNode, NodeIdentity, RelayAppEvent, RelayAppHandle};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
