@@ -31,7 +31,8 @@ pub use relay::{
 };
 pub use relay_app::{
     RelayAppFragment, RelayAppManager, RelayAppMessage, RelayAppOutboundFragment,
-    MAX_RELAY_APP_MESSAGE_BYTES, MAX_RELAY_APP_OUTBOUND_BYTES, MAX_RELAY_APP_OUTBOUND_MESSAGES,
+    RelayAppReceiveStatus, MAX_RELAY_APP_MESSAGE_BYTES, MAX_RELAY_APP_OUTBOUND_BYTES,
+    MAX_RELAY_APP_OUTBOUND_MESSAGES, MAX_RELAY_APP_RETRANSMISSIONS, RELAY_APP_ACK_TIMEOUT,
     RELAY_APP_FRAGMENT_BYTES,
 };
 pub use relay_e2e::{
@@ -43,6 +44,7 @@ pub use routing_cache::{
     load_routing_hints, new_cache_entry, save_routing_hints, RoutingCacheEntry,
     MAX_ROUTING_CACHE_ENTRIES,
 };
+pub use security::SequenceWindow;
 pub use session::{
     respond_handshake, EncryptedFrame, PendingHandshake, SecurePayload, SecureSession,
 };
