@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 also persists authenticated-peer routing hints across restarts and adds a bounded single-hop cooperative relay circuit foundation. Full persistent k-bucket state, endpoint attestations, broad convergence testing, robust NAT/filtering classification, and an end-to-end application session over relay are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Full persistent k-bucket state, endpoint attestations, broad convergence testing, robust NAT/filtering classification, and application-facing relay payload APIs are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -168,19 +168,28 @@ Control flow:
 6. endpoints may exchange bounded `RelayCell` messages through the relay,
 7. either side may send `RelayClose`.
 
-The relay manager allows at most 256 circuits. Idle circuits expire after 120 seconds. A relay cell contains circuit ID, monotonic per-direction sequence, and at most 8 KiB of hex-encoded opaque payload. Sequence rollback/replay is rejected. `RelayReady` is accepted only if it matches either a locally requested relay circuit or a specific pending target-side offer.
+The relay manager allows at most 256 circuits. Idle circuits expire after 120 seconds. A relay cell contains circuit ID, monotonic per-direction sequence, and at most 3 KiB of opaque payload before hex encoding. The lower limit leaves room for nested secure framing inside the 16 KiB outer KNP datagram. Sequence rollback/replay is rejected. `RelayReady` is accepted only if it matches either a locally requested relay circuit or a specific pending target-side offer.
 
-The relay layer does not parse the opaque payload. The current core therefore provides a relay transport/control plane, not yet the final end-to-end application security layer. A future inner KNP session or equivalent end-to-end framing must run inside the opaque cells before Konofix application payloads are considered relay-private from the forwarding node.
+The relay layer does not parse the opaque payload. Alpha.10 runs a separate endpoint-to-endpoint session protocol inside those cells. The inner INIT/ACK handshake is signed with Ed25519 and binds the circuit ID, sender NodeID/public key, recipient NodeID, handshake ID, and ephemeral X25519 key. Both endpoints derive fresh directional session keys with the existing X25519/HKDF schedule and protect inner DATA with ChaCha20-Poly1305. The relay never receives the inner private keys or derived session keys.
 
-## 18. Remaining relay work
+## 18. Relay E2E session and automatic fallback
 
-- establish an authenticated inner end-to-end session through the relay circuit,
-- expose application send/receive APIs and backpressure,
+After a valid `RelayReady`, the endpoint with the lexicographically lower NodeID initiates the inner E2E handshake. This deterministic rule prevents both endpoints from starting competing inner sessions. Relay transport sequence numbers are checked on the receiving endpoint in addition to the inner secure-session sequence checks.
+
+When a rendezvous offer creates a punch schedule, the endpoint remembers that encrypted coordinator as a possible relay. If the punch expires, only the endpoint with the lower NodeID attempts `RelayOpen` through that coordinator. The normal target-side `RelayOffer` / `RelayAccept` consent path still applies. A successful relay setup pauses immediate repeat rendezvous attempts.
+
+The core sends an encrypted inner PING after the initiator completes the handshake and returns an encrypted PONG from the responder. This verifies the complete E2E path in protocol logic without treating relay transport confidentiality as endpoint-to-endpoint confidentiality.
+
+## 19. Remaining relay work
+
+- expose application send/receive APIs and backpressure on top of the inner session,
 - per-peer bandwidth/rate quotas and abuse accounting,
-- automatic relay selection after direct/hole-punch failure,
+- broader automatic relay selection when the latest rendezvous coordinator is unavailable,
 - route migration between direct and relay paths,
 - optional multi-relay paths and privacy analysis.
 
-## 19. Versioning
+## 20. Versioning
+
+## 20. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
