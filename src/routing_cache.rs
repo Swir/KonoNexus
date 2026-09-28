@@ -155,7 +155,10 @@ pub fn load_routing_bucket_snapshot(
         ROUTING_BUCKET_CACHE_VERSION => {
             let cache: RoutingBucketCacheFile =
                 serde_json::from_value(value).context("failed to decode routing bucket cache")?;
-            if cache.local_node_id != local_node_id {
+            if cache.local_node_id != local_node_id
+                || cache.saved_unix_ms > now
+                || now.saturating_sub(cache.saved_unix_ms) > ROUTING_CACHE_MAX_AGE_MS
+            {
                 return Ok(Vec::new());
             }
             Ok(normalize_bucket_entries(
