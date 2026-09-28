@@ -13,7 +13,7 @@ The protocol separates four concerns:
 3. **Session security** — peers establish authenticated encrypted sessions.
 4. **Routing** — packets may later traverse cooperative relays when direct connectivity is impossible.
 
-The current implementation covers the first discovery foundation only.
+The current implementation covers identity, signed discovery, replay filtering, endpoint reachability cookies, and basic liveness. Encrypted application sessions and global routing are not complete.
 
 ## 2. Node identity
 
@@ -39,23 +39,43 @@ Fields:
 - `body` — typed KNP control message
 - `signature` — Ed25519 signature over every field except `signature`
 
-A receiver MUST verify that the NodeID matches the included public key and MUST verify the signature before accepting the sender into its peer table.
+A receiver MUST verify that the NodeID matches the included public key and MUST verify the signature before processing the message.
+
+After signature verification, a receiver applies a bounded replay window. Packets outside the accepted timestamp skew or packets reusing a remembered nonce for the same NodeID are rejected.
 
 ## 4. Control messages
 
 ### HELLO
 
-Announces protocol capabilities to a known endpoint.
+Announces protocol capabilities to a known endpoint. A HELLO may carry a short-lived endpoint cookie.
+
+### COOKIE_CHALLENGE
+
+A stateless reachability challenge. The cookie is HMAC-SHA256 over protocol context, the observed source endpoint, and a rotating time bucket using a node-local random secret.
+
+The receiver does not admit a new inbound peer until the sender returns a valid cookie in HELLO. Current and immediately previous time buckets are accepted to tolerate boundary races.
 
 ### HELLO_ACK
 
-Acknowledges a valid HELLO and reports the sender endpoint observed by the receiver. This observation is groundwork for NAT classification and hole punching.
+Acknowledges a cookie-validated HELLO and reports the sender endpoint observed by the receiver. This observation is groundwork for NAT classification and hole punching.
 
 ### PING / PONG
 
-Provides a minimal liveness signal.
+Provides a minimal liveness signal. Unknown endpoints are not admitted merely by sending PING/PONG.
 
-## 5. Bootstrap
+## 5. Peer admission and resource bounds
+
+New inbound peers are admitted only after:
+
+1. envelope version and structure validation,
+2. NodeID/public-key binding verification,
+3. Ed25519 signature verification,
+4. timestamp/nonce replay validation,
+5. endpoint cookie validation.
+
+The alpha node bounds both replay tracking and its active peer table. Old peer entries are evicted when limits are reached.
+
+## 6. Bootstrap
 
 KNP deliberately does not require a central bootstrap server. A new node can start from one or more of:
 
@@ -67,7 +87,7 @@ KNP deliberately does not require a central bootstrap server. A new node can sta
 
 At least one reachable contact is required to join an already-running disconnected global mesh. No network protocol can discover an arbitrary remote mesh with zero prior information.
 
-## 6. Planned session handshake
+## 7. Planned session handshake
 
 The next security layer will add ephemeral key agreement and AEAD-protected frames. Long-term Ed25519 identities authenticate ephemeral session keys. KNP will use established cryptographic implementations rather than a new cipher.
 
@@ -80,7 +100,7 @@ Target properties:
 - authenticated transcript,
 - no plaintext application payload visible to relay nodes.
 
-## 7. Planned NAT traversal
+## 8. Planned NAT traversal
 
 Connection establishment will progressively attempt:
 
@@ -92,12 +112,12 @@ Connection establishment will progressively attempt:
 
 The relay path is part of the decentralized mesh; no fixed relay service is required by the protocol.
 
-## 8. Planned routing
+## 9. Planned routing
 
 Future routing records will be keyed by NodeID rather than address. The route selector will score paths using reachability, latency, stability, relay load, and privacy constraints.
 
 Relay nodes MUST NOT need application plaintext.
 
-## 9. Versioning
+## 10. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Before a stable specification, capability negotiation will allow compatible extensions without silently changing security semantics.

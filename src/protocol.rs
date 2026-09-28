@@ -11,6 +11,10 @@ pub const MAX_PACKET_SIZE: usize = 16 * 1024;
 pub enum MessageBody {
     Hello {
         features: Vec<String>,
+        cookie: Option<String>,
+    },
+    CookieChallenge {
+        cookie: String,
     },
     HelloAck {
         observed_endpoint: String,
@@ -161,6 +165,7 @@ mod tests {
             123,
             MessageBody::Hello {
                 features: vec!["signed-discovery".to_owned()],
+                cookie: None,
             },
         )
         .expect("signing should work");

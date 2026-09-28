@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha — protocol foundation**. The current implementation provides persistent cryptographic node identities, signed UDP discovery packets, peer tracking, ping/pong health checks, and bootstrap-by-peer-address. End-to-end application payload encryption, NAT traversal, DHT routing, multi-hop relay, and store-and-forward are intentionally not claimed as complete yet.
+> Status: **0.1.0-alpha.2 — protocol foundation**. The current implementation provides persistent cryptographic node identities, signed UDP discovery packets, bounded replay protection, stateless endpoint cookies before peer admission, peer tracking, ping/pong health checks, and bootstrap-by-peer-address. End-to-end application payload encryption, NAT traversal, DHT routing, multi-hop relay, and store-and-forward are intentionally not claimed as complete yet.
 
 ## Principles
 
@@ -21,17 +21,19 @@ The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applicat
 ```text
 Node A                        Node B
   |                             |
-  | signed HELLO over UDP       |
+  | signed HELLO                |
   |---------------------------->|
-  |                             |
+  | signed COOKIE_CHALLENGE     |
+  |<----------------------------|
+  | signed HELLO + cookie       |
+  |---------------------------->|
   | signed HELLO_ACK            |
   |<----------------------------|
-  |                             |
   | signed PING / PONG          |
   |<--------------------------->|
 ```
 
-Each installation creates and stores an Ed25519 identity key. KNP envelopes are signed and verified before a peer is accepted.
+Each installation creates and stores an Ed25519 identity key. KNP envelopes are signature-checked, timestamp/nonce replay-checked, and new inbound peers must prove endpoint reachability with a short-lived HMAC cookie before admission.
 
 ## Quick start
 
@@ -69,7 +71,8 @@ Set `RUST_LOG=debug` for verbose diagnostics.
 - [x] Signed PING / PONG
 - [x] CI: formatting, Clippy, tests
 - [x] Replay window / bounded replay protection
-- [ ] Anti-amplification cookies
+- [x] Stateless anti-amplification endpoint cookies
+- [x] Bounded active peer table
 - [ ] Encrypted session handshake
 - [ ] Automatic NAT type detection
 - [ ] UDP hole punching

@@ -1,5 +1,6 @@
 use crate::identity::NodeIdentity;
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
+use crate::security::{CookieGuard, ReplayGuard};
 use anyhow::{Context, Result};
 use rand::random;
 use std::collections::HashMap;
@@ -9,6 +10,8 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time;
 use tracing::{debug, info, warn};
+
+const MAX_ACTIVE_PEERS: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -25,6 +28,9 @@ pub struct KonoNode {
     socket: Arc<UdpSocket>,
     bootstrap_peers: Vec<SocketAddr>,
     peers: HashMap<SocketAddr, PeerInfo>,
+    cookie_cache: HashMap<SocketAddr, String>,
+    replay_guard: ReplayGuard,
+    cookie_guard: CookieGuard,
     hello_interval: Duration,
 }
 
@@ -44,6 +50,9 @@ impl KonoNode {
             socket: Arc::new(socket),
             bootstrap_peers,
             peers: HashMap::new(),
+            cookie_cache: HashMap::new(),
+            replay_guard: ReplayGuard::default(),
+            cookie_guard: CookieGuard::default(),
             hello_interval,
         })
     }
@@ -110,14 +119,28 @@ impl KonoNode {
             return Ok(());
         }
 
-        self.record_peer(&envelope, source);
+        self.replay_guard.check_and_record(&envelope)?;
+        let sender_node_id = envelope.sender_node_id.clone();
 
         match envelope.body {
-            MessageBody::Hello { .. } => {
+            MessageBody::Hello { cookie, .. } => {
+                let cookie_valid = match cookie {
+                    Some(cookie) => self.cookie_guard.validate(&source, &cookie)?,
+                    None => false,
+                };
+
+                if !cookie_valid {
+                    let cookie = self.cookie_guard.issue(&source)?;
+                    self.send(source, MessageBody::CookieChallenge { cookie })
+                        .await?;
+                    return Ok(());
+                }
+
+                self.record_peer(&envelope, source);
                 info!(
-                    peer = %envelope.sender_node_id,
+                    peer = %sender_node_id,
                     endpoint = %source,
-                    "peer discovered"
+                    "peer admitted after cookie validation"
                 );
 
                 self.send(
@@ -129,31 +152,68 @@ impl KonoNode {
                 )
                 .await?;
             }
+            MessageBody::CookieChallenge { cookie } => {
+                if self.is_expected_endpoint(source) {
+                    self.cookie_cache.insert(source, cookie.clone());
+                    self.send(
+                        source,
+                        MessageBody::Hello {
+                            features: local_features(),
+                            cookie: Some(cookie),
+                        },
+                    )
+                    .await?;
+                } else {
+                    debug!(%source, "ignoring unsolicited cookie challenge");
+                }
+            }
             MessageBody::HelloAck {
                 observed_endpoint, ..
             } => {
+                if !self.is_expected_endpoint(source) {
+                    debug!(%source, "ignoring unsolicited HELLO_ACK");
+                    return Ok(());
+                }
+
+                self.record_peer(&envelope, source);
                 if let Some(peer) = self.peers.get_mut(&source) {
                     peer.observed_external_endpoint = Some(observed_endpoint.clone());
                 }
                 info!(
-                    peer = %envelope.sender_node_id,
+                    peer = %sender_node_id,
                     endpoint = %source,
                     observed = %observed_endpoint,
                     "peer handshake acknowledged"
                 );
             }
             MessageBody::Ping { token } => {
-                self.send(source, MessageBody::Pong { token }).await?;
+                if self.peers.contains_key(&source) {
+                    self.record_peer(&envelope, source);
+                    self.send(source, MessageBody::Pong { token }).await?;
+                }
             }
             MessageBody::Pong { token } => {
-                debug!(peer = %envelope.sender_node_id, %source, token, "pong received");
+                if self.peers.contains_key(&source) {
+                    self.record_peer(&envelope, source);
+                    debug!(peer = %sender_node_id, %source, token, "pong received");
+                }
             }
         }
 
         Ok(())
     }
 
+    fn is_expected_endpoint(&self, source: SocketAddr) -> bool {
+        self.bootstrap_peers.contains(&source)
+            || self.peers.contains_key(&source)
+            || self.cookie_cache.contains_key(&source)
+    }
+
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
+        if !self.peers.contains_key(&source) && self.peers.len() >= MAX_ACTIVE_PEERS {
+            self.evict_oldest_peer();
+        }
+
         let now = Instant::now();
         self.peers
             .entry(source)
@@ -172,6 +232,18 @@ impl KonoNode {
             });
     }
 
+    fn evict_oldest_peer(&mut self) {
+        if let Some(endpoint) = self
+            .peers
+            .iter()
+            .min_by_key(|(_, peer)| peer.last_seen)
+            .map(|(endpoint, _)| *endpoint)
+        {
+            self.peers.remove(&endpoint);
+            self.cookie_cache.remove(&endpoint);
+        }
+    }
+
     async fn refresh_discovery(&self) {
         let mut endpoints = self.bootstrap_peers.clone();
         endpoints.extend(self.peers.keys().copied());
@@ -179,11 +251,13 @@ impl KonoNode {
         endpoints.dedup();
 
         for endpoint in endpoints {
+            let cookie = self.cookie_cache.get(&endpoint).cloned();
             if let Err(error) = self
                 .send(
                     endpoint,
                     MessageBody::Hello {
                         features: local_features(),
+                        cookie,
                     },
                 )
                 .await
@@ -210,6 +284,9 @@ impl KonoNode {
         let before = self.peers.len();
         self.peers
             .retain(|_, peer| peer.last_seen.elapsed() <= max_age);
+        self.cookie_cache
+            .retain(|endpoint, _| self.bootstrap_peers.contains(endpoint) || self.peers.contains_key(endpoint));
+
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
             debug!(removed, "expired stale peers");
@@ -231,6 +308,8 @@ fn local_features() -> Vec<String> {
     vec![
         "knp/1".to_owned(),
         "signed-discovery".to_owned(),
+        "replay-guard".to_owned(),
+        "cookie-challenge".to_owned(),
         "ping-pong".to_owned(),
     ]
 }

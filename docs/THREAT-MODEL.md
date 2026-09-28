@@ -20,7 +20,8 @@ KonoNexus should assume that the public Internet and arbitrary relay nodes are h
 - replay attackers,
 - identity impersonators,
 - Sybil participants,
-- peers attempting resource exhaustion.
+- peers attempting resource exhaustion,
+- attackers spoofing UDP source addresses to cause reflected traffic.
 
 ## Alpha protections already present
 
@@ -29,17 +30,19 @@ KonoNexus should assume that the public Internet and arbitrary relay nodes are h
 - signatures over KNP control envelopes,
 - explicit protocol version,
 - datagram size ceiling,
+- bounded timestamp/nonce replay filtering,
+- stateless HMAC endpoint cookies before new inbound peer admission,
+- unknown PING/PONG endpoints do not create peer entries,
+- bounded active peer table with oldest-peer eviction,
 - unverified packets rejected before peer acceptance.
 
 ## Required before production
 
-- bounded replay cache and timestamp policy,
-- anti-amplification challenge/cookie before expensive responses,
 - authenticated ephemeral key agreement,
 - AEAD framing with monotonically checked sequence numbers,
 - rate limits per endpoint and identity,
-- peer-table size limits and eviction rules,
 - secure key-file permissions on each supported OS,
+- load testing and audit of replay/cookie windows and peer eviction policy,
 - DHT record signatures and expiry,
 - Sybil resistance / routing diversity,
 - relay abuse controls,

@@ -1,11 +1,19 @@
 use crate::protocol::WireEnvelope;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use hmac::{Hmac, Mac};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use sha2::Sha256;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MAX_CLOCK_SKEW_MS: u64 = 120_000;
 pub const DEFAULT_MAX_REPLAY_PEERS: usize = 2_048;
 pub const DEFAULT_NONCES_PER_PEER: usize = 128;
+pub const DEFAULT_COOKIE_BUCKET_MS: u64 = 60_000;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug)]
 struct PeerWindow {
@@ -106,6 +114,78 @@ impl ReplayGuard {
     }
 }
 
+pub struct CookieGuard {
+    secret: [u8; 32],
+    bucket_ms: u64,
+}
+
+impl Default for CookieGuard {
+    fn default() -> Self {
+        let mut secret = [0_u8; 32];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut secret);
+        Self {
+            secret,
+            bucket_ms: DEFAULT_COOKIE_BUCKET_MS,
+        }
+    }
+}
+
+impl CookieGuard {
+    pub fn issue(&self, source: &SocketAddr) -> Result<String> {
+        self.issue_at(source, unix_time_ms()?)
+    }
+
+    pub fn validate(&self, source: &SocketAddr, cookie: &str) -> Result<bool> {
+        self.validate_at(source, cookie, unix_time_ms()?)
+    }
+
+    fn issue_at(&self, source: &SocketAddr, now_ms: u64) -> Result<String> {
+        let bucket = now_ms / self.bucket_ms.max(1);
+        Ok(hex::encode(self.cookie_bytes(source, bucket)?))
+    }
+
+    fn validate_at(&self, source: &SocketAddr, cookie: &str, now_ms: u64) -> Result<bool> {
+        let raw = match hex::decode(cookie) {
+            Ok(raw) if raw.len() == 32 => raw,
+            _ => return Ok(false),
+        };
+        let bucket = now_ms / self.bucket_ms.max(1);
+
+        if self.verify_bucket(source, bucket, &raw)? {
+            return Ok(true);
+        }
+
+        if let Some(previous) = bucket.checked_sub(1) {
+            return self.verify_bucket(source, previous, &raw);
+        }
+
+        Ok(false)
+    }
+
+    fn cookie_bytes(&self, source: &SocketAddr, bucket: u64) -> Result<[u8; 32]> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret)
+            .map_err(|_| anyhow!("failed to initialize cookie HMAC"))?;
+        mac.update(b"knp-cookie-v1");
+        mac.update(source.to_string().as_bytes());
+        mac.update(&bucket.to_be_bytes());
+
+        let bytes = mac.finalize().into_bytes();
+        let mut cookie = [0_u8; 32];
+        cookie.copy_from_slice(&bytes);
+        Ok(cookie)
+    }
+
+    fn verify_bucket(&self, source: &SocketAddr, bucket: u64, cookie: &[u8]) -> Result<bool> {
+        let mut mac = HmacSha256::new_from_slice(&self.secret)
+            .map_err(|_| anyhow!("failed to initialize cookie HMAC"))?;
+        mac.update(b"knp-cookie-v1");
+        mac.update(source.to_string().as_bytes());
+        mac.update(&bucket.to_be_bytes());
+        Ok(mac.verify_slice(cookie).is_ok())
+    }
+}
+
 fn unix_time_ms() -> Result<u64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -164,5 +244,43 @@ mod tests {
         guard.check_and_record_at(&pc, now + 2).unwrap();
 
         assert_eq!(guard.tracked_peers(), 2);
+    }
+
+    #[test]
+    fn cookie_is_bound_to_endpoint() {
+        let guard = CookieGuard {
+            secret: [7_u8; 32],
+            bucket_ms: 60_000,
+        };
+        let a: SocketAddr = "203.0.113.10:41000".parse().unwrap();
+        let b: SocketAddr = "203.0.113.11:41000".parse().unwrap();
+        let now = 180_000;
+
+        let cookie = guard.issue_at(&a, now).unwrap();
+        assert!(guard.validate_at(&a, &cookie, now).unwrap());
+        assert!(!guard.validate_at(&b, &cookie, now).unwrap());
+    }
+
+    #[test]
+    fn cookie_accepts_only_current_or_previous_bucket() {
+        let guard = CookieGuard {
+            secret: [9_u8; 32],
+            bucket_ms: 60_000,
+        };
+        let endpoint: SocketAddr = "198.51.100.20:47000".parse().unwrap();
+
+        let cookie = guard.issue_at(&endpoint, 120_000).unwrap();
+        assert!(guard.validate_at(&endpoint, &cookie, 179_999).unwrap());
+        assert!(guard.validate_at(&endpoint, &cookie, 180_000).unwrap());
+        assert!(!guard.validate_at(&endpoint, &cookie, 240_000).unwrap());
+    }
+
+    #[test]
+    fn malformed_cookie_is_rejected_without_error() {
+        let guard = CookieGuard::default();
+        let endpoint: SocketAddr = "192.0.2.5:47000".parse().unwrap();
+
+        assert!(!guard.validate_at(&endpoint, "not-hex", 60_000).unwrap());
+        assert!(!guard.validate_at(&endpoint, "aa", 60_000).unwrap());
     }
 }
