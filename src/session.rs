@@ -18,8 +18,12 @@ const FRAME_CONTEXT: &[u8] = b"knp-secure-frame-v1";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum SecurePayload {
-    Ping { token: u64 },
-    Pong { token: u64 },
+    Ping {
+        token: u64,
+    },
+    Pong {
+        token: u64,
+    },
     RendezvousRequest {
         target_node_id: String,
     },
