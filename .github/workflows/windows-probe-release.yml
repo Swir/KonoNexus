@@ -1,0 +1,72 @@
+name: Windows Probe Release
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - ".github/workflows/windows-probe-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-probe:
+    name: Build Windows x64 probe
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release EXE
+        run: cargo build --release --bin kononexus_probe
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\kononexus_probe.exe dist\kononexus_probe.exe
+          @"
+          KonoNexus 0.1.0-alpha.15 Windows x64 test probe
+
+          This package is for controlled external testing.
+          The executable is unsigned, so Windows may show a SmartScreen prompt.
+
+          Main file:
+          kononexus_probe.exe
+
+          Test procedure:
+          https://github.com/Swir/KonoNexus/blob/main/docs/TESTING.md
+          "@ | Set-Content -Encoding UTF8 dist\README-TEST.txt
+          Compress-Archive -Path dist\kononexus_probe.exe,dist\README-TEST.txt -DestinationPath KonoNexus-alpha.15-Windows-x64.zip -Force
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KonoNexus-alpha.15-Windows-x64
+          path: |
+            dist/kononexus_probe.exe
+            dist/README-TEST.txt
+            KonoNexus-alpha.15-Windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish prerelease assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.1.0-alpha.15-test"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --target "$env:GITHUB_SHA" --title "KonoNexus 0.1.0-alpha.15 Testing Candidate" --notes "Windows x64 probe build for controlled multi-PC testing. This is a prerelease/testing candidate, not a stable production release." --prerelease
+          }
+          gh release upload $tag dist\kononexus_probe.exe KonoNexus-alpha.15-Windows-x64.zip --clobber
