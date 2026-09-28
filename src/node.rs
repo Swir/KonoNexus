@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, info, warn};
 
@@ -36,6 +37,7 @@ const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
 const RELAY_APP_BURST_PER_TICK: usize = 4;
+const MAX_RELAY_APP_HANDLE_CAPACITY: usize = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -45,6 +47,42 @@ pub struct PeerInfo {
     pub first_seen: Instant,
     pub last_seen: Instant,
     pub observed_external_endpoint: Option<String>,
+}
+
+enum RelayAppCommand {
+    Send {
+        peer_node_id: String,
+        data: Vec<u8>,
+        response: oneshot::Sender<std::result::Result<u64, String>>,
+    },
+}
+
+pub struct RelayAppHandle {
+    command_tx: mpsc::Sender<RelayAppCommand>,
+    message_rx: mpsc::Receiver<RelayAppMessage>,
+}
+
+impl RelayAppHandle {
+    pub async fn send(&self, peer_node_id: String, data: Vec<u8>) -> Result<u64> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RelayAppCommand::Send {
+                peer_node_id,
+                data,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("KonoNexus relay application runtime is closed"))?;
+
+        response_rx
+            .await
+            .map_err(|_| anyhow!("KonoNexus relay application response channel closed"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub async fn recv(&mut self) -> Option<RelayAppMessage> {
+        self.message_rx.recv().await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +163,8 @@ pub struct KonoNode {
     relay_e2e_pending: HashMap<(SocketAddr, u64), RelayE2eInitiator>,
     relay_e2e_sessions: HashMap<(SocketAddr, u64), SecureSession>,
     relay_app: RelayAppManager,
+    relay_app_command_rx: Option<mpsc::Receiver<RelayAppCommand>>,
+    relay_app_event_tx: Option<mpsc::Sender<RelayAppMessage>>,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
     hello_interval: Duration,
 }
@@ -178,6 +218,8 @@ impl KonoNode {
             relay_e2e_pending: HashMap::new(),
             relay_e2e_sessions: HashMap::new(),
             relay_app: RelayAppManager::default(),
+            relay_app_command_rx: None,
+            relay_app_event_tx: None,
             punch_relay_candidates: HashMap::new(),
             hello_interval,
         })
@@ -224,6 +266,24 @@ impl KonoNode {
 
         self.routing_cache_path = Some(path);
         Ok(loaded)
+    }
+
+    pub fn configure_relay_app_handle(&mut self, capacity: usize) -> Result<RelayAppHandle> {
+        if self.relay_app_command_rx.is_some() || self.relay_app_event_tx.is_some() {
+            return Err(anyhow!("relay application handle is already configured"));
+        }
+
+        let capacity = capacity.clamp(1, MAX_RELAY_APP_HANDLE_CAPACITY);
+        let (command_tx, command_rx) = mpsc::channel(capacity);
+        let (event_tx, message_rx) = mpsc::channel(capacity);
+
+        self.relay_app_command_rx = Some(command_rx);
+        self.relay_app_event_tx = Some(event_tx);
+
+        Ok(RelayAppHandle {
+            command_tx,
+            message_rx,
+        })
     }
 
     pub fn queue_relay_app_message(&mut self, peer_node_id: String, data: Vec<u8>) -> Result<u64> {
@@ -277,6 +337,7 @@ impl KonoNode {
         punch_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut rendezvous_ticker = time::interval(Duration::from_millis(500));
         rendezvous_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut relay_app_command_rx = self.relay_app_command_rx.take();
 
         loop {
             tokio::select! {
@@ -307,10 +368,23 @@ impl KonoNode {
                 _ = punch_ticker.tick() => {
                     self.drive_punch_attempts().await;
                     self.drive_relay_app().await;
+                    self.flush_relay_app_events();
                 }
                 _ = rendezvous_ticker.tick() => {
                     self.drive_auto_rendezvous().await;
                     self.drive_dht_queries().await;
+                    self.flush_relay_app_events();
+                }
+                command = async {
+                    match relay_app_command_rx.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending::<Option<RelayAppCommand>>().await,
+                    }
+                } => {
+                    match command {
+                        Some(command) => self.handle_relay_app_command(command),
+                        None => relay_app_command_rx = None,
+                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     if let Err(error) = self.persist_routing_cache() {
@@ -1612,6 +1686,7 @@ impl KonoNode {
                             };
                             self.send_relay_inner(relay_endpoint, circuit_id, ack)
                                 .await?;
+                            self.flush_relay_app_events();
                         }
                     }
                     SecurePayload::RelayAppAck { message_id } => {
@@ -1639,6 +1714,45 @@ impl KonoNode {
         }
 
         Ok(())
+    }
+
+    fn handle_relay_app_command(&mut self, command: RelayAppCommand) {
+        match command {
+            RelayAppCommand::Send {
+                peer_node_id,
+                data,
+                response,
+            } => {
+                let result = self
+                    .queue_relay_app_message(peer_node_id, data)
+                    .map_err(|error| error.to_string());
+                let _ = response.send(result);
+            }
+        }
+    }
+
+    fn flush_relay_app_events(&mut self) {
+        loop {
+            let Some(message) = self.relay_app.peek_completed() else {
+                break;
+            };
+
+            let result = match self.relay_app_event_tx.as_ref() {
+                Some(sender) => sender.try_send(message),
+                None => break,
+            };
+
+            match result {
+                Ok(()) => {
+                    self.relay_app.pop_completed();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.relay_app_event_tx = None;
+                    break;
+                }
+            }
+        }
     }
 
     async fn drive_relay_app(&mut self) {
