@@ -1,3 +1,4 @@
+use crate::nat::FilterProbeAuthorization;
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -32,6 +33,22 @@ pub enum SecurePayload {
         candidate_endpoint: String,
         punch_token: u64,
     },
+    RendezvousMiss {
+        target_node_id: String,
+    },
+    FilteringTestRequest,
+    FilteringTestProposal {
+        helper_node_id: String,
+        target_endpoint: String,
+        probe_token: u64,
+    },
+    FilteringTestConsent {
+        authorization: FilterProbeAuthorization,
+    },
+    FilteringTestSend {
+        authorization: FilterProbeAuthorization,
+    },
+    FilteringTestUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
