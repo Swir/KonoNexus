@@ -61,11 +61,17 @@ async fn wait_for_receipt(transport: &mut KonofixTransport, peer_node_id: &str, 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_runtime_discovers_and_delivers_across_mesh() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("kononexus=debug")
+        .with_test_writer()
+        .try_init();
+
     let state_dir = unique_state_dir();
     std::fs::create_dir_all(&state_dir).unwrap();
 
     let config_a = KonofixSdkConfig::new(state_dir.join("a.key"))
         .with_bind("127.0.0.1:0".parse().unwrap())
+        .with_routing_cache(state_dir.join("a-routing.json"))
         .with_hello_interval(Duration::from_millis(250));
     let mut a = KonofixTransport::spawn(config_a).await.unwrap();
     let a_node_id = a.node_id().to_owned();
@@ -74,6 +80,7 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
     let config_b = KonofixSdkConfig::new(state_dir.join("b.key"))
         .with_bind("127.0.0.1:0".parse().unwrap())
         .with_seed_peer(a_addr)
+        .with_routing_cache(state_dir.join("b-routing.json"))
         .with_hello_interval(Duration::from_millis(250));
     let mut b = KonofixTransport::spawn(config_b).await.unwrap();
     let b_node_id = b.node_id().to_owned();
@@ -81,6 +88,7 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
     let config_c = KonofixSdkConfig::new(state_dir.join("c.key"))
         .with_bind("127.0.0.1:0".parse().unwrap())
         .with_seed_peer(a_addr)
+        .with_routing_cache(state_dir.join("c-routing.json"))
         .with_hello_interval(Duration::from_millis(250));
     let mut c = KonofixTransport::spawn(config_c).await.unwrap();
     let c_node_id = c.node_id().to_owned();
