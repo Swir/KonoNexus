@@ -11,7 +11,8 @@ use crate::relay_app::{
     RelayAppDeliveryFailure, RelayAppManager, RelayAppMessage, RelayAppReceiveStatus,
 };
 use crate::relay_e2e::{
-    accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
+    accept_relay_init, decode_relay_payload, encode_relay_payload,
+    encode_relay_payload_on_session, packet_kind, RelayE2eInitiator,
 };
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
@@ -55,6 +56,12 @@ const MAX_SESSION_REKEY_ACKS: usize = 256;
 const AUTO_RELAY_MAX_CANDIDATES: usize = 3;
 const AUTO_RELAY_RETRY_DELAY: Duration = Duration::from_secs(2);
 const AUTO_RELAY_STATE_TTL: Duration = Duration::from_secs(30);
+const RELAY_E2E_REKEY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const RELAY_E2E_REKEY_GRACE: Duration = Duration::from_secs(30);
+const RELAY_E2E_REKEY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const RELAY_E2E_REKEY_MAX_ATTEMPTS: u8 = 4;
+const RELAY_E2E_REKEY_ACK_TTL: Duration = Duration::from_secs(10);
+const MAX_RELAY_E2E_REKEY_ACKS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -182,6 +189,23 @@ struct PendingRelayAccept {
     expires_at: Instant,
 }
 
+struct PendingRelayE2eRekey {
+    pending: PendingHandshake,
+    rekey_id: u64,
+    peer_node_id: String,
+    ephemeral_public_key: String,
+    attempts: u8,
+    next_retry_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ResponderRelayE2eRekeyAck {
+    peer_node_id: String,
+    initiator_public_key: String,
+    responder_public_key: String,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct AutoRelayFallback {
     preferred: Option<SocketAddr>,
@@ -252,7 +276,11 @@ pub struct KonoNode {
     auto_relay_fallbacks: HashMap<String, AutoRelayFallback>,
     relay_paths: HashMap<(SocketAddr, u64), RelayPath>,
     relay_e2e_pending: HashMap<(SocketAddr, u64), RelayE2eInitiator>,
-    relay_e2e_sessions: HashMap<(SocketAddr, u64), SecureSession>,
+    relay_e2e_sessions: HashMap<(SocketAddr, u64), SessionSlot>,
+    pending_relay_e2e_rekeys: HashMap<(SocketAddr, u64), PendingRelayE2eRekey>,
+    responder_relay_e2e_rekey_acks:
+        HashMap<(SocketAddr, u64, u64), ResponderRelayE2eRekeyAck>,
+    last_relay_e2e_rekey: HashMap<(SocketAddr, u64), Instant>,
     relay_app: RelayAppManager,
     relay_app_command_rx: Option<mpsc::Receiver<RelayAppCommand>>,
     relay_app_event_tx: Option<mpsc::Sender<RelayAppMessage>>,
@@ -315,6 +343,9 @@ impl KonoNode {
             relay_paths: HashMap::new(),
             relay_e2e_pending: HashMap::new(),
             relay_e2e_sessions: HashMap::new(),
+            pending_relay_e2e_rekeys: HashMap::new(),
+            responder_relay_e2e_rekey_acks: HashMap::new(),
+            last_relay_e2e_rekey: HashMap::new(),
             relay_app: RelayAppManager::default(),
             relay_app_command_rx: None,
             relay_app_event_tx: None,
@@ -479,6 +510,7 @@ impl KonoNode {
                 _ = rendezvous_ticker.tick() => {
                     self.drive_session_handshakes().await;
                     self.drive_session_rekeys().await;
+                    self.drive_relay_e2e_rekeys().await;
                     self.drive_auto_rendezvous().await;
                     self.drive_auto_relay_fallbacks().await;
                     self.drive_dht_queries().await;
@@ -1559,6 +1591,12 @@ impl KonoNode {
                     self.relay_paths.remove(&(source, circuit_id));
                     self.relay_e2e_pending.remove(&(source, circuit_id));
                     self.relay_e2e_sessions.remove(&(source, circuit_id));
+                    self.pending_relay_e2e_rekeys.remove(&(source, circuit_id));
+                    self.responder_relay_e2e_rekey_acks
+                        .retain(|(endpoint, cid, _), _| {
+                            *endpoint != source || *cid != circuit_id
+                        });
+                    self.last_relay_e2e_rekey.remove(&(source, circuit_id));
                     self.pending_relay_requests.remove(&circuit_id);
                     self.pending_relay_accepts.remove(&(source, circuit_id));
                 }
@@ -1569,6 +1607,12 @@ impl KonoNode {
                 self.relay_paths.remove(&(source, circuit_id));
                 self.relay_e2e_pending.remove(&(source, circuit_id));
                 self.relay_e2e_sessions.remove(&(source, circuit_id));
+                self.pending_relay_e2e_rekeys.remove(&(source, circuit_id));
+                self.responder_relay_e2e_rekey_acks
+                    .retain(|(endpoint, cid, _), _| {
+                        *endpoint != source || *cid != circuit_id
+                    });
+                self.last_relay_e2e_rekey.remove(&(source, circuit_id));
 
                 if let Some((relay_endpoint, target_node_id)) = rejected {
                     if relay_endpoint == source {
@@ -3354,6 +3398,8 @@ fn local_features() -> Vec<String> {
         "cooperative-relay-control".to_owned(),
         "opaque-relay-cells".to_owned(),
         "relay-e2e-session".to_owned(),
+        "relay-e2e-rekey".to_owned(),
+        "relay-e2e-rekey-grace".to_owned(),
         "relay-app-fragmentation".to_owned(),
         "relay-app-backpressure".to_owned(),
         "direct-relay-app-migration".to_owned(),
