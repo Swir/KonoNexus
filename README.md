@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.14 — direct-session rekey + live direct↔relay application migration**. Confirmed direct KNP sessions now rotate to fresh X25519/HKDF/ChaCha20-Poly1305 keys on a bounded schedule, retry rekey safely, and keep the previous session ID for a short receive grace window so in-flight packets are not discarded. RelayApp traffic is now NodeID-centric rather than path-centric: confirmed direct transport is preferred, relay E2E is the fallback, and the same queued message/ACK can continue across a path change. Periodic rekey of relay-inner E2E sessions, real multi-network validation, and production hardening are still not claimed complete.
+> Status: **0.1.0-alpha.15 — first external testing candidate**. The core now includes direct and relay-inner E2E rekey, live RelayApp direct↔relay migration, the initial Konofix SDK transport wrapper, and a green three-node runtime harness that verifies discovery and B→C application delivery through the live mesh on localhost. This is ready for controlled multi-PC testing. The local harness is not proof of real-world NAT/CGNAT success; that validation starts with external machines/networks.
 
 ## Principles
 
@@ -104,9 +104,12 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
 - [x] Direct KNP session key rotation with 30-second grace window
-- [ ] Relay-inner E2E session key rotation
+- [x] Relay-inner E2E session key rotation
+- [x] Three-node live runtime mesh harness
+- [ ] Real multi-network/NAT test matrix
 - [ ] KonoNexus Network Tester GUI
-- [ ] Konofix SDK and Windows integration
+- [x] Konofix SDK transport wrapper
+- [ ] Konofix Windows application integration
 - [ ] Android transport integration
 
 See [docs/KNP-SPEC.md](docs/KNP-SPEC.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
@@ -251,3 +254,31 @@ RelayApp queues are keyed by peer NodeID, not by a socket or circuit. Alpha.14 t
 3. if neither exists, the message remains queued/backpressured until a path becomes available or its existing delivery timeout policy fires.
 
 Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-independent. A message may begin through relay and continue/retry through direct transport after a direct session appears, or fall back to relay if the direct session disappears. The relay circuit may remain available as a hot fallback until its normal idle expiry.
+
+
+## Testing candidate
+
+Alpha.15 is the first build state intended for controlled testing on separate computers.
+
+Automated CI now includes a live three-node runtime harness:
+
+- node B and node C bootstrap through node A,
+- all nodes perform real signed discovery/cookie/session setup,
+- B sends an application message addressed only by C's NodeID,
+- KonoNexus discovers/builds the path,
+- C receives the authenticated/decrypted RelayApp payload,
+- B receives the delivery receipt.
+
+The harness uses an explicit **local-test mode** only because loopback addresses are intentionally rejected by production rendezvous security. Local-test mode defaults to `false` and is enabled only by the test harness.
+
+The next validation phase must use separate machines/networks and will check:
+
+1. direct public/IPv6 path when available,
+2. ordinary NAT + UDP hole punching,
+3. different NATs / mobile hotspot,
+4. CGNAT or restrictive NAT causing cooperative relay fallback,
+5. direct↔relay migration while messages remain queued,
+6. reconnect/restart with persistent routing hints,
+7. delivery receipts/failures under temporary packet loss.
+
+See `docs/TESTING.md` for the controlled operator procedure.
