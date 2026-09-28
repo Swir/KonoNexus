@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Persistent routing buckets, endpoint attestations, broad convergence testing, robust NAT/filtering classification, and cooperative relay are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 also persists authenticated-peer routing hints across restarts and adds a bounded single-hop cooperative relay circuit foundation. Full persistent k-bucket state, endpoint attestations, broad convergence testing, robust NAT/filtering classification, and an end-to-end application session over relay are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -148,6 +148,39 @@ To constrain amplification and loops, query state expires after 8 seconds, forwa
 - Sybil-resistant routing diversity,
 - large-mesh convergence and churn testing.
 
-## 16. Versioning
+## 16. Persistent routing hints
+
+The runtime may persist a bounded JSON cache of peers that currently have an authenticated encrypted KNP session. Each entry stores NodeID, endpoint, and save time. Entries older than seven days or with invalid NodeID/endpoint syntax are discarded when loading, and the cache is capped at 256 entries.
+
+Loaded entries are only bootstrap hints. They are not inserted as authenticated peers or routing-table members until they complete the normal signed HELLO, anti-amplification cookie, identity verification, and encrypted-session handshake again. The cache is refreshed periodically and during clean shutdown from the currently active encrypted sessions.
+
+## 17. Cooperative relay circuit foundation
+
+A relay circuit is single-hop and exists only through a node that already has authenticated encrypted KNP sessions with both endpoints.
+
+Control flow:
+
+1. origin sends `RelayOpen(circuit_id, target_node_id)` to the relay,
+2. relay resolves the target only from its authenticated peer table and sends `RelayOffer` to that target,
+3. target returns `RelayAccept`,
+4. relay verifies the accepting endpoint/NodeID against the pending circuit,
+5. relay sends `RelayReady` to both sides,
+6. endpoints may exchange bounded `RelayCell` messages through the relay,
+7. either side may send `RelayClose`.
+
+The relay manager allows at most 256 circuits. Idle circuits expire after 120 seconds. A relay cell contains circuit ID, monotonic per-direction sequence, and at most 8 KiB of hex-encoded opaque payload. Sequence rollback/replay is rejected. `RelayReady` is accepted only if it matches either a locally requested relay circuit or a specific pending target-side offer.
+
+The relay layer does not parse the opaque payload. The current core therefore provides a relay transport/control plane, not yet the final end-to-end application security layer. A future inner KNP session or equivalent end-to-end framing must run inside the opaque cells before Konofix application payloads are considered relay-private from the forwarding node.
+
+## 18. Remaining relay work
+
+- establish an authenticated inner end-to-end session through the relay circuit,
+- expose application send/receive APIs and backpressure,
+- per-peer bandwidth/rate quotas and abuse accounting,
+- automatic relay selection after direct/hole-punch failure,
+- route migration between direct and relay paths,
+- optional multi-relay paths and privacy analysis.
+
+## 19. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
