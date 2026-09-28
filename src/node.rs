@@ -13,7 +13,7 @@ use crate::relay_e2e::{
 };
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
-use crate::security::{CookieGuard, ReplayGuard};
+use crate::security::{CookieGuard, ReplayGuard, SequenceWindow};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{anyhow, Context, Result};
 use rand::random;
@@ -117,7 +117,7 @@ struct RelayPath {
     peer_node_id: String,
     expires_at: Instant,
     next_send_sequence: u64,
-    highest_receive_sequence: Option<u64>,
+    receive_window: SequenceWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -1154,7 +1154,7 @@ impl KonoNode {
                         peer_node_id: peer_node_id.clone(),
                         expires_at: Instant::now() + RELAY_CIRCUIT_TTL,
                         next_send_sequence: 0,
-                        highest_receive_sequence: None,
+                        receive_window: SequenceWindow::default(),
                     },
                 );
 
@@ -1207,15 +1207,11 @@ impl KonoNode {
                         let Some(path) = self.relay_paths.get_mut(&(source, circuit_id)) else {
                             return Ok(());
                         };
-                        if path.expires_at <= Instant::now()
-                            || path
-                                .highest_receive_sequence
-                                .is_some_and(|highest| sequence <= highest)
-                        {
+                        if path.expires_at <= Instant::now() {
                             return Ok(());
                         }
 
-                        path.highest_receive_sequence = Some(sequence);
+                        path.receive_window.check_and_record(sequence)?;
                         path.expires_at = Instant::now() + RELAY_CIRCUIT_TTL;
                         path.peer_node_id.clone()
                     };
