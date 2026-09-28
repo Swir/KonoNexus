@@ -918,9 +918,154 @@ impl KonoNode {
         &mut self,
         source: SocketAddr,
         sender_node_id: &str,
+        incoming_session_id: &str,
         payload: SecurePayload,
     ) -> Result<()> {
         match payload {
+            SecurePayload::SessionRekeyInit {
+                rekey_id,
+                ephemeral_public_key,
+            } => {
+                let local_node_id = self.node_id();
+                if local_node_id.as_str() < sender_node_id {
+                    debug!(
+                        peer = %sender_node_id,
+                        %source,
+                        rekey_id,
+                        "ignored rekey init from non-designated initiator"
+                    );
+                    return Ok(());
+                }
+
+                let ack_key = (source, rekey_id);
+                if let Some(cached) = self.responder_rekey_acks.get(&ack_key).cloned() {
+                    if cached.expires_at > Instant::now()
+                        && cached.peer_node_id == sender_node_id
+                        && cached.initiator_public_key == ephemeral_public_key
+                    {
+                        if let Some(message) = self.secure_message_on_session(
+                            source,
+                            incoming_session_id,
+                            SecurePayload::SessionRekeyAck {
+                                rekey_id,
+                                ephemeral_public_key: cached.responder_public_key,
+                            },
+                        )? {
+                            self.send(source, message).await?;
+                        }
+
+                        debug!(
+                            peer = %sender_node_id,
+                            %source,
+                            rekey_id,
+                            "re-sent cached session rekey ack"
+                        );
+                        return Ok(());
+                    }
+                }
+
+                let (new_session, responder_public_key) = respond_handshake(
+                    &local_node_id,
+                    sender_node_id,
+                    rekey_id,
+                    &ephemeral_public_key,
+                )?;
+
+                if let Some(message) = self.secure_message_on_session(
+                    source,
+                    incoming_session_id,
+                    SecurePayload::SessionRekeyAck {
+                        rekey_id,
+                        ephemeral_public_key: responder_public_key.clone(),
+                    },
+                )? {
+                    self.send(source, message).await?;
+                } else {
+                    return Ok(());
+                }
+
+                let Some(slot) = self.sessions.get_mut(&source) else {
+                    return Ok(());
+                };
+                slot.rotate(
+                    new_session,
+                    Instant::now(),
+                    SESSION_REKEY_GRACE,
+                )?;
+
+                if self.responder_rekey_acks.len() >= MAX_SESSION_REKEY_ACKS {
+                    if let Some(oldest) = self
+                        .responder_rekey_acks
+                        .iter()
+                        .min_by_key(|(_, state)| state.expires_at)
+                        .map(|(key, _)| *key)
+                    {
+                        self.responder_rekey_acks.remove(&oldest);
+                    }
+                }
+
+                self.responder_rekey_acks.insert(
+                    ack_key,
+                    ResponderRekeyAck {
+                        peer_node_id: sender_node_id.to_owned(),
+                        initiator_public_key: ephemeral_public_key,
+                        responder_public_key,
+                        expires_at: Instant::now() + SESSION_REKEY_ACK_TTL,
+                    },
+                );
+                self.last_rekey.insert(source, Instant::now());
+
+                info!(
+                    peer = %sender_node_id,
+                    %source,
+                    rekey_id,
+                    session_id = %slot.current_session_id(),
+                    "rotated direct KNP session keys as responder"
+                );
+            }
+            SecurePayload::SessionRekeyAck {
+                rekey_id,
+                ephemeral_public_key,
+            } => {
+                let valid = self.pending_rekeys.get(&source).is_some_and(|attempt| {
+                    attempt.rekey_id == rekey_id && attempt.peer_node_id == sender_node_id
+                });
+                if !valid {
+                    debug!(
+                        peer = %sender_node_id,
+                        %source,
+                        rekey_id,
+                        "ignored unexpected session rekey ack"
+                    );
+                    return Ok(());
+                }
+
+                let attempt = self
+                    .pending_rekeys
+                    .remove(&source)
+                    .expect("pending rekey checked above");
+                let new_session = attempt
+                    .pending
+                    .complete(&self.node_id(), &ephemeral_public_key)?;
+
+                let Some(slot) = self.sessions.get_mut(&source) else {
+                    return Ok(());
+                };
+                slot.rotate(
+                    new_session,
+                    Instant::now(),
+                    SESSION_REKEY_GRACE,
+                )?;
+                self.last_rekey.insert(source, Instant::now());
+
+                info!(
+                    peer = %sender_node_id,
+                    %source,
+                    rekey_id,
+                    session_id = %slot.current_session_id(),
+                    "rotated direct KNP session keys as initiator"
+                );
+            }
             SecurePayload::Ping { token } => {
                 if let Some(response) =
                     self.secure_message(source, SecurePayload::Pong { token })?
@@ -2661,6 +2806,145 @@ impl KonoNode {
                         state.next_attempt_at = now;
                     }
                 }
+            }
+        }
+    }
+
+    async fn drive_session_rekeys(&mut self) {
+        let now = Instant::now();
+        self.responder_rekey_acks
+            .retain(|_, state| state.expires_at > now);
+
+        let due: Vec<SocketAddr> = self
+            .pending_rekeys
+            .iter()
+            .filter(|(_, attempt)| attempt.next_retry_at <= now)
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+
+        let mut retries = Vec::new();
+        for endpoint in due {
+            let Some(attempt) = self.pending_rekeys.get_mut(&endpoint) else {
+                continue;
+            };
+
+            if attempt.attempts >= SESSION_REKEY_MAX_ATTEMPTS {
+                let peer_node_id = attempt.peer_node_id.clone();
+                self.pending_rekeys.remove(&endpoint);
+                self.last_rekey.insert(endpoint, now);
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    "session rekey retries exhausted; keeping previous keys"
+                );
+                continue;
+            }
+
+            attempt.attempts += 1;
+            attempt.next_retry_at = now + SESSION_REKEY_RETRY_DELAY;
+            retries.push((
+                endpoint,
+                attempt.rekey_id,
+                attempt.ephemeral_public_key.clone(),
+                attempt.peer_node_id.clone(),
+                attempt.attempts,
+            ));
+        }
+
+        for (endpoint, rekey_id, ephemeral_public_key, peer_node_id, attempt) in retries {
+            if let Err(error) = self
+                .send_secure_payload(
+                    endpoint,
+                    SecurePayload::SessionRekeyInit {
+                        rekey_id,
+                        ephemeral_public_key,
+                    },
+                )
+                .await
+            {
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    rekey_id,
+                    attempt,
+                    %error,
+                    "session rekey retransmission failed"
+                );
+            } else {
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    rekey_id,
+                    attempt,
+                    "retransmitted session rekey init"
+                );
+            }
+        }
+
+        let local_node_id = self.node_id();
+        let candidates: Vec<(SocketAddr, String)> = self
+            .confirmed_sessions
+            .iter()
+            .filter_map(|endpoint| {
+                if self.pending_rekeys.contains_key(endpoint) {
+                    return None;
+                }
+
+                let last = self.last_rekey.get(endpoint)?;
+                if now.duration_since(*last) < SESSION_REKEY_INTERVAL {
+                    return None;
+                }
+
+                let peer = self.peers.get(endpoint)?;
+                if local_node_id.as_str() >= peer.node_id.as_str() {
+                    return None;
+                }
+
+                Some((*endpoint, peer.node_id.clone()))
+            })
+            .collect();
+
+        for (endpoint, peer_node_id) in candidates {
+            let pending = PendingHandshake::new(peer_node_id.clone());
+            let rekey_id = pending.handshake_id();
+            let ephemeral_public_key = pending.public_key_hex();
+
+            self.pending_rekeys.insert(
+                endpoint,
+                PendingRekeyAttempt {
+                    pending,
+                    rekey_id,
+                    peer_node_id: peer_node_id.clone(),
+                    ephemeral_public_key: ephemeral_public_key.clone(),
+                    attempts: 1,
+                    next_retry_at: now + SESSION_REKEY_RETRY_DELAY,
+                },
+            );
+
+            if let Err(error) = self
+                .send_secure_payload(
+                    endpoint,
+                    SecurePayload::SessionRekeyInit {
+                        rekey_id,
+                        ephemeral_public_key,
+                    },
+                )
+                .await
+            {
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    rekey_id,
+                    %error,
+                    "initial session rekey send failed"
+                );
+            } else {
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    rekey_id,
+                    "started direct session key rotation"
+                );
             }
         }
     }
