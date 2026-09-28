@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.12 — RelayApp retransmission + reordered UDP tolerance + relay quotas**. KNP now retransmits unacknowledged RelayApp messages after a 1-second ACK timeout, retries at most four times, suppresses duplicate application delivery with a bounded delivered-message cache, and uses a 128-sequence sliding replay window so authenticated UDP frames may arrive out of order without being mistaken for replay. Relay circuits are additionally bounded per NodeID and by cells/bytes per second. Broad multi-network validation, route migration, and alternate relay selection are still not claimed complete.
+> Status: **0.1.0-alpha.13 — delivery failures + handshake retry + alternate relay selection**. RelayApp now reports explicit delivery failures after retry exhaustion or message TTL expiry. Direct KNP session establishment retransmits `SESSION_INIT` with a bounded retry schedule and responders cache the matching ACK so duplicate handshakes cannot derive mismatched sessions. Responder-side application/control traffic is deferred until the first authenticated encrypted frame confirms the session. If punch-to-relay fallback loses its preferred coordinator, KNP can try up to three different existing encrypted peers as relay candidates. Session key rotation, direct↔relay migration, and broad multi-network validation are still not claimed complete.
 
 ## Principles
 
@@ -68,6 +68,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Signed discovery and bounded replay protection
 - [x] Stateless anti-amplification endpoint cookies
 - [x] Authenticated X25519 session handshake
+- [x] Bounded SessionInit retransmission + cached responder ACK
 - [x] HKDF-SHA256 directional session keys
 - [x] ChaCha20-Poly1305 encrypted secure frames
 - [x] Peer-reported external UDP endpoint observations
@@ -94,8 +95,10 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Automatic hole-punch → single-relay fallback via rendezvous coordinator
 - [x] Relay per-node and bandwidth abuse quotas
 - [x] Bounded fragment/ACK retransmission and duplicate-delivery suppression
+- [x] RelayApp delivery-failure callbacks
 - [x] Sliding 128-sequence anti-replay windows with UDP reordering tolerance
-- [ ] Broader automatic relay selection and multi-relay/path migration
+- [x] Bounded alternate relay selection across up to 3 encrypted peers
+- [ ] Multi-relay/path migration and direct↔relay handoff
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
@@ -205,6 +208,9 @@ let message_id = app.send(target_node_id, payload).await?;
 if let Some(message) = app.recv().await {
     // message.peer_node_id, message.message_id, message.data
 }
+if let Some(failure) = app.recv_failure().await {
+    // failure.peer_node_id, failure.message_id, failure.reason
+}
 ```
 
 The command/event channels are bounded; application send calls wait for command-channel capacity rather than creating an unbounded queue. The internal outbound queue accepts at most 64 messages / 2 MiB and keeps a sent message allocated until the remote E2E endpoint returns `RelayAppAck`. Incoming messages are limited to 256 KiB each, use 512-byte fragments, allow at most 64 concurrent reassemblies / 4 MiB reserved reassembly memory, and expire incomplete state after 30 seconds. Completed messages are also kept in a bounded queue if the application event channel is temporarily full.
@@ -215,3 +221,12 @@ Alpha.12 retransmits the complete fragment set after a 1-second ACK timeout, up 
 ### Relay abuse controls
 
 Alpha.12 limits a relay to 256 circuits globally and at most 16 circuits involving any one NodeID. Each circuit direction is capped at 128 relay cells per second and 256 KiB per second. The counters reset on a one-second window and apply before forwarding. These limits are protocol safety defaults, not final production tuning.
+
+
+### Session handshake reliability
+
+Alpha.13 retransmits the same `SESSION_INIT` after a one-second timeout, up to four total attempts. The initiator keeps the same handshake ID and ephemeral X25519 public key across retries. A responder caches the first matching `SESSION_ACK` for ten seconds and re-sends that exact ACK when the same `(endpoint, handshake_id, initiator key)` is seen again, avoiding key mismatch from duplicate initializers. The responder does not flush encrypted application/control work until it receives the first authenticated encrypted frame, which acts as confirmation that the initiator actually received the ACK and derived the same session.
+
+### Alternate relay selection
+
+When direct UDP punching fails, the preferred relay remains the rendezvous coordinator that helped produce the punch candidate. If that relay is gone, cannot open the target, or rejects the circuit, the lower-NodeID endpoint can try other already-authenticated encrypted peers. Alpha.13 tries at most three distinct relay candidates in a 30-second fallback state, never repeats the same candidate, and stops as soon as a direct or relay path to the target becomes active.
