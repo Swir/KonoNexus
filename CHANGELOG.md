@@ -13,6 +13,9 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added version-2 persistence for the full bounded 256×8 DHT k-bucket membership snapshot while keeping restart entries untrusted until normal KNP re-authentication.
+- Added local-NodeID binding, bucket-index validation, seven-day freshness checks, atomic replacement, legacy v1 migration, and a 256-endpoint restart bootstrap cap.
+
 - Promoted the current core to **0.1.0-alpha.15**, the first controlled external-testing candidate.
 - Added periodic relay-inner E2E rekey state with fresh X25519 material, bounded retries, cached ACKs, and previous-session grace handling.
 - Added the initial `KonofixTransport` / `KonofixSdkConfig` wrapper for application integration.
