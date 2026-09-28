@@ -62,7 +62,11 @@ impl AutoRendezvousState {
 
         available.sort_by_key(|candidate| {
             (
-                if candidate.endpoint.is_ipv6() { 0_u8 } else { 1_u8 },
+                if candidate.endpoint.is_ipv6() {
+                    0_u8
+                } else {
+                    1_u8
+                },
                 candidate.first_seen,
                 candidate.endpoint,
             )
