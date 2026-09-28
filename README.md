@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.9 — persistent routing hints + cooperative relay foundation**. KNP now persists bounded routing hints from previously authenticated encrypted peers and can restore them after restart as untrusted bootstrap hints that must pass the complete HELLO/cookie/identity/session flow again. It also has a bounded single-relay circuit protocol with explicit OPEN/OFFER/ACCEPT/READY control and opaque relay cells. A production end-to-end Konofix payload channel over relay is not yet claimed complete.
+> Status: **0.1.0-alpha.10 — authenticated E2E relay sessions + automatic punch fallback**. KNP now establishes a fresh end-to-end X25519/HKDF/ChaCha20-Poly1305 session inside an accepted cooperative relay circuit. The relay forwards only opaque inner packets and does not receive the end-to-end keys. When a coordinated hole-punch burst expires, one endpoint deterministically falls back to that same rendezvous coordinator as a relay when it is still available. Application-facing Konofix payload APIs, backpressure, and multi-relay routing are not yet claimed complete.
 
 ## Principles
 
@@ -87,8 +87,9 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [ ] Persistent full k-bucket state and large-mesh convergence
 - [x] Single-hop cooperative relay circuit/control foundation
 - [x] Bounded opaque relay cell forwarding
-- [ ] End-to-end inner session over relay
-- [ ] Multi-hop relay/path selection fallback
+- [x] Authenticated end-to-end inner session over relay
+- [x] Automatic hole-punch → single-relay fallback via rendezvous coordinator
+- [ ] Broader automatic relay selection and multi-relay/path migration
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
@@ -174,4 +175,11 @@ cargo run -- --peer RELAY_IP:47000 --relay-via RELAY_IP:47000=TARGET_KNP_NODE_ID
 
 The relay must already have encrypted KNP sessions with both endpoints. Circuit setup follows `OPEN → OFFER → ACCEPT → READY`. The relay stores at most 256 circuits, expires idle circuits after 120 seconds, validates endpoint identity on both sides, and rejects sequence rollback/replay.
 
-Relay data is carried as `RelayCell` with at most 8 KiB of **opaque bytes** per cell. The relay forwards those bytes without interpreting their application meaning. This is the transport foundation only: KonoNexus does not yet claim that arbitrary Konofix messages are end-to-end encrypted across the relay path until an inner end-to-end session is layered inside those opaque cells.
+Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per cell, sized to remain within the 16 KiB outer KNP datagram after nested encryption/hex framing. The relay forwards those bytes without interpreting their application meaning. Alpha.10 layers a separate authenticated inner session inside those opaque cells. The inner handshake is signed with each endpoint's Ed25519 identity, bound to the circuit ID and both NodeIDs, and derives fresh X25519/HKDF/ChaCha20-Poly1305 keys. The relay therefore cannot derive the endpoint-to-endpoint session keys. KNP currently validates that session with encrypted inner PING/PONG; a public Konofix application-data API is the next layer.
+
+
+### Automatic direct → punch → relay fallback
+
+For a requested NodeID, KNP still prefers a direct authenticated session. If rendezvous is required, it performs the bounded UDP punch burst first. When that punch schedule expires without confirmation, the two endpoints use NodeID ordering so only one side initiates fallback. If the rendezvous coordinator is still connected with an encrypted KNP session, that node requests a cooperative relay circuit through the same coordinator.
+
+After `RelayReady`, the lower NodeID starts the signed inner E2E handshake. Once the handshake completes, an encrypted inner PING/PONG confirms that the relay path carries data the forwarding node cannot decrypt. A failed relay request does not mark the target as authenticated or connected.
