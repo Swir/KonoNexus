@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent};
-use std::net::SocketAddr;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time;
