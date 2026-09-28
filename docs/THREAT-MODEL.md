@@ -34,6 +34,9 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - fresh inner X25519/HKDF/ChaCha20-Poly1305 session keys that are never disclosed to the forwarding relay,
 - deterministic single-side punch-to-relay fallback to avoid duplicate circuit storms,
 - inner secure-session replay/tamper checks in addition to outer relay transport sequencing,
+- RelayApp message size, queue-byte, queue-count, reassembly-count, reassembly-byte, completed-queue, and expiry limits,
+- strict fragment metadata/length validation, duplicate-content consistency checks, and encrypted application ACKs,
+- bounded async application command/event channels so slow application consumers cannot create unbounded network-loop queues,
 - session keys zeroized when sessions are dropped.
 
 ## NAT/rendezvous threats considered
@@ -61,7 +64,9 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - recursive DHT routing exists, but full bucket persistence, endpoint attestations, and Sybil resistance are not yet implemented,
 - routing-cache files expose peer metadata on local disk even though they contain no private keys,
 - relay control metadata remains visible to the forwarding node, including endpoint identities, circuit IDs, timing, and cell sizes,
-- application payload APIs are not yet exposed, so callers must not bypass the inner E2E layer and place plaintext application data directly in relay cells,
+- application payload APIs are now exposed only through the inner E2E RelayApp layer; raw relay cells are not the application API,
+- lost RelayApp fragments/ACKs are not yet retransmitted and unacknowledged outbound messages are dropped on TTL expiry,
+- strict secure-session sequencing still rejects reordered UDP frames, which can reduce delivery reliability on reordered paths,
 - relay bandwidth quotas, abuse accounting, broader relay selection, and path migration policy are not yet implemented,
 - no independent security audit has been completed.
 
@@ -72,7 +77,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - bounded sliding anti-replay windows for UDP reordering,
 - handshake retransmission and session key rotation,
 - independent endpoint attestations for DHT records, persistent bucket storage, stronger query rate limits, and Sybil mitigation,
-- relay bandwidth quotas, per-peer rate limiting, abuse accounting, application-level relay APIs, and multi-path failover hardening,
+- RelayApp retransmission/ACK timeout policy, sliding UDP anti-replay windows, relay bandwidth quotas, per-peer rate limiting, abuse accounting, and multi-path failover hardening,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
 - load testing,
