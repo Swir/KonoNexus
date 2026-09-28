@@ -1,6 +1,4 @@
-use crate::identity::{
-    node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-};
+use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
