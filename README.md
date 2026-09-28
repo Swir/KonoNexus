@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.6 — automatic rendezvous + filtering evidence**. KNP can now cycle through a bounded set of existing encrypted peers as rendezvous coordinators, and it has a consent-signed third-peer probe that can collect positive evidence for endpoint-independent inbound filtering. Negative probe results remain inconclusive. DHT discovery, cooperative relay, and broad real-world NAT validation are still not claimed complete.
+> Status: **0.1.0-alpha.7 — signed DHT discovery foundation**. KNP now exchanges short-lived Ed25519-signed peer records over encrypted sessions, keeps a bounded DHT-style record table, answers bounded nearest-record queries, and can use an exact signed record for a requested NodeID to begin normal HELLO/cookie/session establishment. Iterative multi-hop DHT walking, persistent routing buckets, cooperative relay, and broad real-world NAT validation are still not claimed complete.
 
 ## Principles
 
@@ -49,7 +49,7 @@ cargo run -- \
   --rendezvous COORDINATOR_IP:47000=TARGET_KNP_NODE_ID
 ```
 
-Automatic mode only needs the target NodeID:
+Automatic mode only needs the target NodeID. It now runs both bounded rendezvous selection and encrypted DHT lookup:
 
 ```bash
 cargo run -- --peer KNOWN_PEER:47000 --connect-node TARGET_KNP_NODE_ID
@@ -80,7 +80,8 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [ ] Multi-candidate/path prioritization without unsafe port spraying
 - [x] Bounded automatic selection of encrypted rendezvous peers
 - [ ] IPv6 direct-path preference
-- [ ] Distributed peer discovery / DHT
+- [x] Signed bounded DHT peer records and encrypted exact lookup
+- [ ] Iterative multi-hop DHT routing buckets and global convergence
 - [ ] Cooperative multi-hop relay fallback
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
@@ -118,3 +119,18 @@ cargo run -- --peer COORDINATOR_IP:47000 --filter-test COORDINATOR_IP:47000
 ```
 
 The coordinator proposes an independent helper and the exact endpoint it already observes for the tested node. The tested node signs a short-lived Ed25519 authorization binding its NodeID/public key, that endpoint, the helper NodeID, and a random token. Only then may the helper send one signed direct probe. Receiving it is positive evidence that an independent endpoint can reach the mapping. Failure to receive it remains **inconclusive**, not proof of restrictive filtering.
+
+
+### Signed DHT discovery foundation
+
+Each node may publish a short-lived `PeerRecord` containing its NodeID, Ed25519 public key, a small set of public UDP endpoints, issue/expiry times, and a signature. Records are accepted only when the NodeID matches the public key, the signature verifies, the TTL is bounded, and every endpoint passes publishability checks.
+
+DHT control messages travel inside the existing encrypted KNP session:
+
+- `DHT_STORE` — share a signed peer record,
+- `DHT_FIND` — ask for a target NodeID,
+- `DHT_NODES` — return the exact record when known plus a bounded nearest-record set.
+
+The local table is bounded to 4,096 records and responses to at most 8 records. Records expire automatically. KNP may cache nearest records, but it **does not automatically dial arbitrary nearest nodes**. A new network connection is attempted only from an exact valid record for a NodeID that the local user/application is already trying to reach.
+
+This is the DHT foundation, not yet a complete Kademlia implementation. Multi-hop iterative lookups, persistent k-buckets, endpoint attestations, and convergence testing across a large mesh remain future work.
