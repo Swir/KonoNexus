@@ -1,3 +1,4 @@
+use crate::dht::PeerRecord;
 use crate::nat::FilterProbeAuthorization;
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{
@@ -49,6 +50,16 @@ pub enum SecurePayload {
         authorization: FilterProbeAuthorization,
     },
     FilteringTestUnavailable,
+    DhtStore {
+        record: PeerRecord,
+    },
+    DhtFind {
+        target_node_id: String,
+    },
+    DhtNodes {
+        target_node_id: String,
+        records: Vec<PeerRecord>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
