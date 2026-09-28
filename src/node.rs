@@ -637,7 +637,6 @@ impl KonoNode {
                     %session_id,
                     "encrypted KNP session established as responder"
                 );
-
             }
             MessageBody::SessionAck {
                 handshake_id,
@@ -855,9 +854,7 @@ impl KonoNode {
                 );
             }
             MessageBody::Ping { token } => {
-                if self.peers.contains_key(&source)
-                    && !self.confirmed_sessions.contains(&source)
-                {
+                if self.peers.contains_key(&source) && !self.confirmed_sessions.contains(&source) {
                     self.record_peer(&envelope, source);
                     self.send(source, MessageBody::Pong { token }).await?;
                 }
