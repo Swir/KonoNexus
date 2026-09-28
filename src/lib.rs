@@ -5,8 +5,8 @@ pub mod nat;
 pub mod node;
 pub mod protocol;
 pub mod punch;
-pub mod rendezvous;
 pub mod relay;
+pub mod rendezvous;
 pub mod routing_cache;
 pub mod security;
 pub mod session;
@@ -23,11 +23,11 @@ pub use nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior
 pub use node::{KonoNode, PeerInfo};
 pub use protocol::{MessageBody, WireEnvelope, KNP_VERSION};
 pub use punch::{PunchSchedule, PUNCH_AUTH_TTL, PUNCH_MAX_ATTEMPTS, PUNCH_START_DELAY};
-pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 pub use relay::{
     RelayCircuit, RelayCircuitState, RelayForward, RelayManager, MAX_RELAY_CELL_BYTES,
     MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL,
 };
+pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 pub use routing_cache::{
     load_routing_hints, new_cache_entry, save_routing_hints, RoutingCacheEntry,
     MAX_ROUTING_CACHE_ENTRIES,
