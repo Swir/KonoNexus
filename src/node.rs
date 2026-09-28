@@ -3801,9 +3801,7 @@ mod tests {
 
         node.set_local_test_mode(true);
         assert!(node.rendezvous_candidate_allowed(loopback));
-        assert!(!node.rendezvous_candidate_allowed(
-            "0.0.0.0:47000".parse().unwrap()
-        ));
+        assert!(!node.rendezvous_candidate_allowed("0.0.0.0:47000".parse().unwrap()));
     }
 
     #[test]
