@@ -1760,8 +1760,7 @@ impl KonoNode {
         if restarted > 0 || retry_dropped > 0 {
             debug!(
                 restarted,
-                retry_dropped,
-                "processed RelayApp ACK-timeout retransmissions"
+                retry_dropped, "processed RelayApp ACK-timeout retransmissions"
             );
         }
 
