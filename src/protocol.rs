@@ -40,6 +40,12 @@ pub enum MessageBody {
         punch_token: u64,
         observed_endpoint: String,
     },
+    FilterProbe {
+        probe_token: u64,
+    },
+    FilterProbeAck {
+        probe_token: u64,
+    },
     Ping {
         token: u64,
     },
