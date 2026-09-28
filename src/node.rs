@@ -34,7 +34,6 @@ const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
-const MAX_RELAY_INBOX_CELLS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
