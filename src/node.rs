@@ -226,11 +226,7 @@ impl KonoNode {
         Ok(loaded)
     }
 
-    pub fn queue_relay_app_message(
-        &mut self,
-        peer_node_id: String,
-        data: Vec<u8>,
-    ) -> Result<u64> {
+    pub fn queue_relay_app_message(&mut self, peer_node_id: String, data: Vec<u8>) -> Result<u64> {
         if !plausible_node_id(&peer_node_id) || peer_node_id == self.node_id() {
             return Err(anyhow!("invalid relay application peer NodeID"));
         }
@@ -1597,9 +1593,11 @@ impl KonoNode {
                     }
                     SecurePayload::RelayAppFragment { fragment } => {
                         let message_id = fragment.message_id;
-                        let completed = self
-                            .relay_app
-                            .accept_fragment(peer_node_id, fragment, Instant::now())?;
+                        let completed = self.relay_app.accept_fragment(
+                            peer_node_id,
+                            fragment,
+                            Instant::now(),
+                        )?;
 
                         if completed {
                             let ack = {
@@ -1649,8 +1647,7 @@ impl KonoNode {
         if expired_inbound > 0 || expired_outbound > 0 {
             debug!(
                 expired_inbound,
-                expired_outbound,
-                "expired stale relay application queue state"
+                expired_outbound, "expired stale relay application queue state"
             );
         }
 
