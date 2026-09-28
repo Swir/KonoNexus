@@ -326,10 +326,7 @@ impl RoutingTable {
             .iter()
             .enumerate()
             .flat_map(|(bucket_index, peers)| {
-                peers
-                    .iter()
-                    .cloned()
-                    .map(move |peer| (bucket_index, peer))
+                peers.iter().cloned().map(move |peer| (bucket_index, peer))
             })
             .collect()
     }
