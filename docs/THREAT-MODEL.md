@@ -29,7 +29,11 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - recursive DHT lookup limited to fanout 2 and 3 hops with duplicate-query suppression, short-lived reverse routes, forwarding cooldown, and bounded query state,
 - persistent routing hints saved only from authenticated encrypted sessions and revalidated through the full handshake after restart,
 - relay circuit setup bound to existing encrypted sessions, explicit target acceptance, and READY validation against pending local state,
-- relay state limited to 256 circuits with 120-second idle expiry, 8 KiB opaque cells, and per-direction sequence rollback/replay rejection,
+- relay state limited to 256 circuits with 120-second idle expiry, 3 KiB opaque cells, and per-direction transport sequence rollback/replay rejection,
+- inner relay handshake authenticated by Ed25519 and bound to circuit ID plus both endpoint NodeIDs,
+- fresh inner X25519/HKDF/ChaCha20-Poly1305 session keys that are never disclosed to the forwarding relay,
+- deterministic single-side punch-to-relay fallback to avoid duplicate circuit storms,
+- inner secure-session replay/tamper checks in addition to outer relay transport sequencing,
 - session keys zeroized when sessions are dropped.
 
 ## NAT/rendezvous threats considered
@@ -56,8 +60,9 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - DHT endpoint records are self-asserted by their owning NodeID and are not yet independently endpoint-attested,
 - recursive DHT routing exists, but full bucket persistence, endpoint attestations, and Sybil resistance are not yet implemented,
 - routing-cache files expose peer metadata on local disk even though they contain no private keys,
-- relay opaque cells are not automatically end-to-end encrypted by the relay layer itself; callers must not place plaintext application data in them,
-- relay bandwidth quotas, abuse accounting, and automatic failover policy are not yet implemented,
+- relay control metadata remains visible to the forwarding node, including endpoint identities, circuit IDs, timing, and cell sizes,
+- application payload APIs are not yet exposed, so callers must not bypass the inner E2E layer and place plaintext application data directly in relay cells,
+- relay bandwidth quotas, abuse accounting, broader relay selection, and path migration policy are not yet implemented,
 - no independent security audit has been completed.
 
 ## Required before production
@@ -67,7 +72,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - bounded sliding anti-replay windows for UDP reordering,
 - handshake retransmission and session key rotation,
 - independent endpoint attestations for DHT records, persistent bucket storage, stronger query rate limits, and Sybil mitigation,
-- relay bandwidth quotas, per-peer rate limiting, abuse accounting, and inner end-to-end session establishment,
+- relay bandwidth quotas, per-peer rate limiting, abuse accounting, application-level relay APIs, and multi-path failover hardening,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
 - load testing,
