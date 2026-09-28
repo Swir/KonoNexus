@@ -7,7 +7,9 @@ use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehav
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
-use crate::relay_app::{RelayAppManager, RelayAppMessage, RelayAppReceiveStatus};
+use crate::relay_app::{
+    RelayAppDeliveryFailure, RelayAppManager, RelayAppMessage, RelayAppReceiveStatus,
+};
 use crate::relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
 };
@@ -60,6 +62,7 @@ enum RelayAppCommand {
 pub struct RelayAppHandle {
     command_tx: mpsc::Sender<RelayAppCommand>,
     message_rx: mpsc::Receiver<RelayAppMessage>,
+    failure_rx: mpsc::Receiver<RelayAppDeliveryFailure>,
 }
 
 impl RelayAppHandle {
@@ -82,6 +85,10 @@ impl RelayAppHandle {
 
     pub async fn recv(&mut self) -> Option<RelayAppMessage> {
         self.message_rx.recv().await
+    }
+
+    pub async fn recv_failure(&mut self) -> Option<RelayAppDeliveryFailure> {
+        self.failure_rx.recv().await
     }
 }
 
@@ -165,6 +172,7 @@ pub struct KonoNode {
     relay_app: RelayAppManager,
     relay_app_command_rx: Option<mpsc::Receiver<RelayAppCommand>>,
     relay_app_event_tx: Option<mpsc::Sender<RelayAppMessage>>,
+    relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
     hello_interval: Duration,
 }
@@ -220,6 +228,7 @@ impl KonoNode {
             relay_app: RelayAppManager::default(),
             relay_app_command_rx: None,
             relay_app_event_tx: None,
+            relay_app_failure_tx: None,
             punch_relay_candidates: HashMap::new(),
             hello_interval,
         })
@@ -269,20 +278,26 @@ impl KonoNode {
     }
 
     pub fn configure_relay_app_handle(&mut self, capacity: usize) -> Result<RelayAppHandle> {
-        if self.relay_app_command_rx.is_some() || self.relay_app_event_tx.is_some() {
+        if self.relay_app_command_rx.is_some()
+            || self.relay_app_event_tx.is_some()
+            || self.relay_app_failure_tx.is_some()
+        {
             return Err(anyhow!("relay application handle is already configured"));
         }
 
         let capacity = capacity.clamp(1, MAX_RELAY_APP_HANDLE_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(capacity);
         let (event_tx, message_rx) = mpsc::channel(capacity);
+        let (failure_tx, failure_rx) = mpsc::channel(capacity);
 
         self.relay_app_command_rx = Some(command_rx);
         self.relay_app_event_tx = Some(event_tx);
+        self.relay_app_failure_tx = Some(failure_tx);
 
         Ok(RelayAppHandle {
             command_tx,
             message_rx,
+            failure_rx,
         })
     }
 
@@ -369,11 +384,13 @@ impl KonoNode {
                     self.drive_punch_attempts().await;
                     self.drive_relay_app().await;
                     self.flush_relay_app_events();
+                    self.flush_relay_app_failures();
                 }
                 _ = rendezvous_ticker.tick() => {
                     self.drive_auto_rendezvous().await;
                     self.drive_dht_queries().await;
                     self.flush_relay_app_events();
+                    self.flush_relay_app_failures();
                 }
                 command = async {
                     match relay_app_command_rx.as_mut() {
@@ -1690,6 +1707,7 @@ impl KonoNode {
 
                         if status == RelayAppReceiveStatus::Completed {
                             self.flush_relay_app_events();
+                    self.flush_relay_app_failures();
                         }
                     }
                     SecurePayload::RelayAppAck { message_id } => {
@@ -1734,6 +1752,26 @@ impl KonoNode {
         }
     }
 
+    fn flush_relay_app_failures(&mut self) {
+        while let Some(failure) = self.relay_app.peek_failure() {
+            let result = match self.relay_app_failure_tx.as_ref() {
+                Some(sender) => sender.try_send(failure),
+                None => break,
+            };
+
+            match result {
+                Ok(()) => {
+                    self.relay_app.pop_failure();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.relay_app_failure_tx = None;
+                    break;
+                }
+            }
+        }
+    }
+
     fn flush_relay_app_events(&mut self) {
         while let Some(message) = self.relay_app.peek_completed() {
             let result = match self.relay_app_event_tx.as_ref() {
@@ -1756,15 +1794,13 @@ impl KonoNode {
 
     async fn drive_relay_app(&mut self) {
         let now = Instant::now();
-        let (restarted, retry_dropped) = self.relay_app.prepare_retransmissions(now);
-        if restarted > 0 || retry_dropped > 0 {
-            debug!(
-                restarted,
-                retry_dropped, "processed RelayApp ACK-timeout retransmissions"
-            );
+        let restarted = self.relay_app.prepare_retransmissions(now);
+        if restarted > 0 {
+            debug!(restarted, "processed RelayApp ACK-timeout retransmissions");
         }
 
         let (expired_inbound, expired_outbound) = self.relay_app.expire(now);
+        self.flush_relay_app_failures();
         if expired_inbound > 0 || expired_outbound > 0 {
             debug!(
                 expired_inbound,
