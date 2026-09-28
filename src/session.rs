@@ -100,6 +100,14 @@ pub enum SecurePayload {
     RelayAppAck {
         message_id: u64,
     },
+    SessionRekeyInit {
+        rekey_id: u64,
+        ephemeral_public_key: String,
+    },
+    SessionRekeyAck {
+        rekey_id: u64,
+        ephemeral_public_key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +281,104 @@ impl Drop for SecureSession {
     fn drop(&mut self) {
         self.send_key.zeroize();
         self.receive_key.zeroize();
+    }
+}
+
+pub struct SessionSlot {
+    current: SecureSession,
+    previous: Option<(SecureSession, Instant)>,
+}
+
+impl SessionSlot {
+    pub fn new(current: SecureSession) -> Self {
+        Self {
+            current,
+            previous: None,
+        }
+    }
+
+    pub fn current_session_id(&self) -> &str {
+        self.current.session_id()
+    }
+
+    pub fn peer_node_id(&self) -> &str {
+        self.current.peer_node_id()
+    }
+
+    pub fn encrypt(&mut self, payload: &SecurePayload) -> Result<EncryptedFrame> {
+        self.current.encrypt(payload)
+    }
+
+    pub fn encrypt_with_session_id(
+        &mut self,
+        session_id: &str,
+        payload: &SecurePayload,
+        now: Instant,
+    ) -> Result<EncryptedFrame> {
+        self.expire_previous(now);
+
+        if self.current.session_id() == session_id {
+            return self.current.encrypt(payload);
+        }
+
+        if let Some((previous, expires_at)) = self.previous.as_mut() {
+            if *expires_at > now && previous.session_id() == session_id {
+                return previous.encrypt(payload);
+            }
+        }
+
+        bail!("requested KNP session id is not active");
+    }
+
+    pub fn decrypt(
+        &mut self,
+        session_id: &str,
+        sequence: u64,
+        ciphertext_hex: &str,
+        now: Instant,
+    ) -> Result<SecurePayload> {
+        self.expire_previous(now);
+
+        if self.current.session_id() == session_id {
+            return self.current.decrypt(session_id, sequence, ciphertext_hex);
+        }
+
+        if let Some((previous, expires_at)) = self.previous.as_mut() {
+            if *expires_at > now && previous.session_id() == session_id {
+                return previous.decrypt(session_id, sequence, ciphertext_hex);
+            }
+        }
+
+        bail!("KNP secure frame session id is not active");
+    }
+
+    pub fn rotate(
+        &mut self,
+        new_session: SecureSession,
+        now: Instant,
+        grace: Duration,
+    ) -> Result<()> {
+        if self.current.peer_node_id() != new_session.peer_node_id() {
+            bail!("cannot rotate KNP session to a different peer identity");
+        }
+
+        let old = std::mem::replace(&mut self.current, new_session);
+        self.previous = Some((old, now + grace));
+        Ok(())
+    }
+
+    pub fn expire_previous(&mut self, now: Instant) {
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|(_, expires_at)| *expires_at <= now)
+        {
+            self.previous = None;
+        }
+    }
+
+    pub fn has_previous(&self) -> bool {
+        self.previous.is_some()
     }
 }
 
@@ -487,6 +593,62 @@ mod tests {
         assert!(responder
             .decrypt(&frame.session_id, frame.sequence, &frame.ciphertext)
             .is_err());
+    }
+
+    #[test]
+    fn session_slot_accepts_old_inflight_frames_during_rekey_grace() {
+        let (mut old_a, old_b) = session_pair();
+        let inflight = old_a
+            .encrypt(&SecurePayload::Ping { token: 77 })
+            .unwrap();
+
+        let pending = PendingHandshake::new("node-b".to_owned());
+        let rekey_id = pending.handshake_id();
+        let initiator_public = pending.public_key_hex();
+        let (new_b, responder_public) =
+            respond_handshake("node-b", "node-a", rekey_id, &initiator_public).unwrap();
+        let new_a = pending.complete("node-a", &responder_public).unwrap();
+
+        let now = Instant::now();
+        let mut slot_a = SessionSlot::new(old_a);
+        let mut slot_b = SessionSlot::new(old_b);
+        slot_a
+            .rotate(new_a, now, Duration::from_secs(30))
+            .unwrap();
+        slot_b
+            .rotate(new_b, now, Duration::from_secs(30))
+            .unwrap();
+
+        assert_eq!(
+            slot_b
+                .decrypt(
+                    &inflight.session_id,
+                    inflight.sequence,
+                    &inflight.ciphertext,
+                    now
+                )
+                .unwrap(),
+            SecurePayload::Ping { token: 77 }
+        );
+
+        let new_frame = slot_a
+            .encrypt(&SecurePayload::Ping { token: 88 })
+            .unwrap();
+        assert_eq!(
+            slot_b
+                .decrypt(
+                    &new_frame.session_id,
+                    new_frame.sequence,
+                    &new_frame.ciphertext,
+                    now
+                )
+                .unwrap(),
+            SecurePayload::Ping { token: 88 }
+        );
+
+        assert!(slot_b.has_previous());
+        slot_b.expire_previous(now + Duration::from_secs(31));
+        assert!(!slot_b.has_previous());
     }
 
     #[test]
