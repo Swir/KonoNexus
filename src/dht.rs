@@ -2,15 +2,21 @@ use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIG
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_DHT_MAX_RECORDS: usize = 4_096;
 pub const DHT_RESPONSE_LIMIT: usize = 8;
 pub const MAX_RECORD_ENDPOINTS: usize = 4;
 pub const DEFAULT_RECORD_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_RECORD_TTL_MS: u64 = 30 * 60 * 1_000;
+pub const DHT_BUCKET_COUNT: usize = 256;
+pub const DHT_BUCKET_SIZE: usize = 8;
+pub const DHT_QUERY_FANOUT: usize = 3;
+pub const DHT_MAX_HOPS: u8 = 4;
+pub const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
+pub const DHT_QUERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 const RECORD_CLOCK_SKEW_MS: u64 = 120_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +236,110 @@ impl DhtTable {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RoutingPeer {
+    pub node_id: String,
+    pub endpoint: SocketAddr,
+    pub last_seen: Instant,
+}
+
+#[derive(Debug)]
+pub struct RoutingTable {
+    local_key: [u8; 32],
+    buckets: Vec<Vec<RoutingPeer>>,
+}
+
+impl RoutingTable {
+    pub fn new(local_node_id: &str) -> Self {
+        Self {
+            local_key: key_hash(local_node_id),
+            buckets: vec![Vec::new(); DHT_BUCKET_COUNT],
+        }
+    }
+
+    pub fn observe(&mut self, node_id: String, endpoint: SocketAddr, now: Instant) {
+        let remote_key = key_hash(&node_id);
+        let Some(bucket_index) = bucket_index(self.local_key, remote_key) else {
+            return;
+        };
+        let bucket = &mut self.buckets[bucket_index];
+
+        if let Some(existing) = bucket
+            .iter_mut()
+            .find(|peer| peer.node_id == node_id || peer.endpoint == endpoint)
+        {
+            existing.node_id = node_id;
+            existing.endpoint = endpoint;
+            existing.last_seen = now;
+            return;
+        }
+
+        if bucket.len() >= DHT_BUCKET_SIZE {
+            if let Some(oldest_index) = bucket
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, peer)| peer.last_seen)
+                .map(|(index, _)| index)
+            {
+                bucket.remove(oldest_index);
+            }
+        }
+
+        bucket.push(RoutingPeer {
+            node_id,
+            endpoint,
+            last_seen: now,
+        });
+    }
+
+    pub fn nearest(&self, target_node_id: &str, limit: usize) -> Vec<RoutingPeer> {
+        let target = key_hash(target_node_id);
+        let mut peers: Vec<RoutingPeer> = self
+            .buckets
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+
+        peers.sort_by_key(|peer| xor_distance(key_hash(&peer.node_id), target));
+        peers.truncate(limit);
+        peers
+    }
+
+    pub fn remove_endpoint(&mut self, endpoint: SocketAddr) {
+        for bucket in &mut self.buckets {
+            bucket.retain(|peer| peer.endpoint != endpoint);
+        }
+    }
+
+    pub fn retain_endpoints(&mut self, endpoints: &HashSet<SocketAddr>) {
+        for bucket in &mut self.buckets {
+            bucket.retain(|peer| endpoints.contains(&peer.endpoint));
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buckets.iter().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+fn bucket_index(local: [u8; 32], remote: [u8; 32]) -> Option<usize> {
+    let distance = xor_distance(local, remote);
+    let leading_zero_bits: usize = distance
+        .iter()
+        .take_while(|byte| **byte == 0)
+        .count()
+        .saturating_mul(8);
+
+    let first_nonzero = distance.iter().find(|byte| **byte != 0)?;
+    let leading_zero_bits = leading_zero_bits + first_nonzero.leading_zeros() as usize;
+    Some(255_usize.saturating_sub(leading_zero_bits))
+}
+
 pub fn endpoint_publishable(endpoint: SocketAddr) -> bool {
     if endpoint.port() == 0 {
         return false;
@@ -294,6 +404,58 @@ mod tests {
         assert!(!endpoint_publishable("192.168.1.20:47000".parse().unwrap()));
         assert!(!endpoint_publishable("[::1]:47000".parse().unwrap()));
         assert!(endpoint_publishable("8.8.8.8:47000".parse().unwrap()));
+    }
+
+    #[test]
+    fn routing_table_keeps_only_bucket_limit_and_refreshes_peers() {
+        let local = "knp1-local";
+        let desired_bucket = 255;
+        let mut matching = Vec::new();
+
+        for index in 0..100_000_u32 {
+            let node_id = format!("knp1-candidate-{index}");
+            if bucket_index(key_hash(local), key_hash(&node_id)) == Some(desired_bucket) {
+                matching.push(node_id);
+                if matching.len() == DHT_BUCKET_SIZE + 2 {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(matching.len(), DHT_BUCKET_SIZE + 2);
+
+        let mut routing = RoutingTable::new(local);
+        let now = Instant::now();
+        for (index, node_id) in matching.into_iter().enumerate() {
+            routing.observe(
+                node_id,
+                format!("8.8.8.{}:47000", (index % 200) + 1)
+                    .parse()
+                    .unwrap(),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+
+        assert_eq!(routing.len(), DHT_BUCKET_SIZE);
+    }
+
+    #[test]
+    fn routing_table_nearest_prefers_target_identity() {
+        let mut routing = RoutingTable::new("knp1-local");
+        let now = Instant::now();
+        routing.observe(
+            "knp1-a".into(),
+            "8.8.8.8:47000".parse().unwrap(),
+            now,
+        );
+        routing.observe(
+            "knp1-b".into(),
+            "1.1.1.1:47000".parse().unwrap(),
+            now,
+        );
+
+        let nearest = routing.nearest("knp1-a", 2);
+        assert_eq!(nearest.first().map(|peer| peer.node_id.as_str()), Some("knp1-a"));
     }
 
     #[test]
