@@ -976,16 +976,15 @@ impl KonoNode {
                 circuit_id,
                 origin_node_id,
             } => {
-                let accepted = self
-                    .relay_manager
-                    .accept(circuit_id, source, sender_node_id, Instant::now());
+                let accepted =
+                    self.relay_manager
+                        .accept(circuit_id, source, sender_node_id, Instant::now());
 
                 let Ok((origin_endpoint, expected_origin_node_id)) = accepted else {
                     return Ok(());
                 };
                 if expected_origin_node_id != origin_node_id {
-                    self.relay_manager
-                        .close(circuit_id, source, sender_node_id);
+                    self.relay_manager.close(circuit_id, source, sender_node_id);
                     return Ok(());
                 }
 
@@ -1112,8 +1111,11 @@ impl KonoNode {
                 if let Some((other_endpoint, _)) =
                     self.relay_manager.close(circuit_id, source, sender_node_id)
                 {
-                    self.send_secure_payload(other_endpoint, SecurePayload::RelayClose { circuit_id })
-                        .await?;
+                    self.send_secure_payload(
+                        other_endpoint,
+                        SecurePayload::RelayClose { circuit_id },
+                    )
+                    .await?;
                 } else {
                     self.relay_paths.remove(&(source, circuit_id));
                     self.pending_relay_requests.remove(&circuit_id);
