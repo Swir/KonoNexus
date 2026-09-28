@@ -4,6 +4,16 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added alpha.14 direct KNP session key rotation using fresh X25519/HKDF/ChaCha20-Poly1305 session material.
+- Added deterministic lower-NodeID rekey initiation, ten-minute rotation cadence, one-second retry cadence, and four-send rekey retry bound.
+- Added cached responder rekey ACKs so lost ACK retransmission returns the same responder ephemeral public key.
+- Added `SessionSlot` with a 30-second previous-session grace window for authenticated in-flight frames during rekey.
+- Added unit coverage proving old in-flight frames survive the grace window while new traffic uses the rotated session.
+- Added NodeID-centric RelayApp transport selection: confirmed direct sessions are preferred, relay E2E remains fallback.
+- Added live direct↔relay application migration without resetting message IDs, reassembly, retransmission, or ACK state.
+- Added path-selection tests confirming direct preference and relay fallback.
+- Bumped the implementation package to 0.1.0-alpha.14.
+
 - Added application-visible `RelayAppDeliveryFailure` events with `RetriesExhausted` and `Expired` reasons and a live `RelayAppHandle::recv_failure()` channel.
 - Added bounded direct-session handshake retransmission: one-second retry interval and at most four `SESSION_INIT` sends using the same handshake ID/ephemeral key.
 - Added a ten-second bounded responder ACK cache so duplicate session-init packets receive the same responder public key instead of deriving conflicting sessions.
