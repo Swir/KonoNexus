@@ -42,6 +42,8 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - one-second RelayApp ACK timeout with at most four retransmissions, bounded delivered-message deduplication, and explicit application-visible delivery-failure events,
 - one-second direct-session INIT retransmission with at most four total attempts plus bounded ten-second responder ACK caching,
 - responder application/control traffic deferred until an authenticated encrypted frame confirms the initiator completed the session,
+- direct-session rekey uses fresh X25519 material, a deterministic single initiator, bounded retries, cached matching ACKs, and a 30-second previous-session grace window,
+- RelayApp path selection prefers confirmed direct encryption and falls back to authenticated relay E2E while retaining identity/message-bound delivery state,
 - relay per-NodeID circuit cap (16) plus per-direction rate quotas (128 cells/s and 256 KiB/s),
 - session keys zeroized when sessions are dropped.
 
@@ -65,7 +67,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - no port-prediction or safe alternate-candidate strategy exists,
 - positive endpoint-independent filtering evidence is supported, but negative results remain intentionally inconclusive,
 - session receive ordering remains strict,
-- session key rotation is not implemented,
+- periodic fresh-X25519 key rotation is implemented for direct KNP sessions; relay-inner E2E periodic rotation is not yet implemented,
 - DHT endpoint records are self-asserted by their owning NodeID and are not yet independently endpoint-attested,
 - recursive DHT routing exists, but full bucket persistence, endpoint attestations, and Sybil resistance are not yet implemented,
 - routing-cache files expose peer metadata on local disk even though they contain no private keys,
@@ -73,16 +75,16 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - application payload APIs are now exposed only through the inner E2E RelayApp layer; raw relay cells are not the application API,
 - whole-message RelayApp retransmission and explicit application delivery-failure callbacks are implemented, but selective fragment retransmission is not yet implemented,
 - relay quotas are implemented, but long-window abuse accounting, adaptive quotas, and reputation/Sybil controls are not yet implemented,
-- bounded alternate relay selection is implemented, but direct↔relay path migration and multi-relay policy are not yet implemented,
+- RelayApp direct↔relay path migration is implemented, but full control-plane migration and multi-relay policy are not yet implemented,
 - no independent security audit has been completed.
 
 ## Required before production
 
 - stronger long-window per-peer rendezvous/filter-test rate limits,
 - wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
-- session key rotation,
+- relay-inner E2E session key rotation,
 - independent endpoint attestations for DHT records, persistent bucket storage, stronger query rate limits, and Sybil mitigation,
-- selective RelayApp recovery, longer-window relay abuse accounting, adaptive per-peer quotas, session key rotation, and multi-path/direct↔relay failover hardening,
+- selective RelayApp recovery, relay-inner E2E rekey, longer-window relay abuse accounting, adaptive per-peer quotas, and multi-relay/control-plane failover hardening,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
 - load testing,
