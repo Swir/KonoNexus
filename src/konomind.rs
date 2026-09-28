@@ -102,10 +102,7 @@ fn baseline_score(metrics: PathMetrics) -> f32 {
     let stability_score = metrics.stability;
     let load_score = 1.0 - metrics.relay_load;
 
-    (latency_score * 0.35)
-        + (loss_score * 0.30)
-        + (stability_score * 0.25)
-        + (load_score * 0.10)
+    (latency_score * 0.35) + (loss_score * 0.30) + (stability_score * 0.25) + (load_score * 0.10)
 }
 
 #[cfg(test)]
