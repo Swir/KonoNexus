@@ -67,12 +67,7 @@ pub struct RelayAppManager {
 }
 
 impl RelayAppManager {
-    pub fn queue(
-        &mut self,
-        peer_node_id: String,
-        data: Vec<u8>,
-        now: Instant,
-    ) -> Result<u64> {
+    pub fn queue(&mut self, peer_node_id: String, data: Vec<u8>, now: Instant) -> Result<u64> {
         if data.is_empty() {
             bail!("relay application message cannot be empty");
         }
@@ -120,9 +115,7 @@ impl RelayAppManager {
         let message = self
             .outbound
             .iter()
-            .find(|message| {
-                !message.awaiting_ack && ready_peers.contains(&message.peer_node_id)
-            })?;
+            .find(|message| !message.awaiting_ack && ready_peers.contains(&message.peer_node_id))?;
 
         let index = usize::from(message.next_fragment_index);
         let start = index.saturating_mul(RELAY_APP_FRAGMENT_BYTES);
@@ -223,7 +216,8 @@ impl RelayAppManager {
 
         assembly.expires_at = now + RELAY_APP_REASSEMBLY_TTL;
         let index = usize::from(fragment.fragment_index);
-        let data = hex::decode(&fragment.data_hex).context("relay application fragment is not hex")?;
+        let data =
+            hex::decode(&fragment.data_hex).context("relay application fragment is not hex")?;
 
         match &assembly.fragments[index] {
             Some(existing) if existing == &data => return Ok(false),
@@ -447,7 +441,8 @@ mod tests {
         };
         manager.accept_fragment("peer", fragment, now).unwrap();
 
-        let (inbound, outbound) = manager.expire(now + RELAY_APP_OUTBOUND_TTL + Duration::from_secs(1));
+        let (inbound, outbound) =
+            manager.expire(now + RELAY_APP_OUTBOUND_TTL + Duration::from_secs(1));
         assert_eq!(inbound, 1);
         assert_eq!(outbound, 1);
     }
