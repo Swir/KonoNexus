@@ -1,6 +1,4 @@
-use crate::identity::{
-    node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-};
+use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -282,11 +280,8 @@ mod tests {
     #[test]
     fn signed_record_verifies_and_tampering_fails() {
         let identity = NodeIdentity::generate();
-        let mut record = PeerRecord::signed(
-            &identity,
-            vec!["8.8.8.8:47000".parse().unwrap()],
-        )
-        .unwrap();
+        let mut record =
+            PeerRecord::signed(&identity, vec!["8.8.8.8:47000".parse().unwrap()]).unwrap();
 
         record.verify().unwrap();
         record.endpoints[0] = "1.1.1.1:47000".to_owned();
