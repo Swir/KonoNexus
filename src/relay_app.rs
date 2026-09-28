@@ -54,6 +54,13 @@ pub struct RelayAppDeliveryReceipt {
     pub message_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayAppEvent {
+    Message(RelayAppMessage),
+    Delivered(RelayAppDeliveryReceipt),
+    Failed(RelayAppDeliveryFailure),
+}
+
 #[derive(Debug, Clone)]
 pub struct RelayAppOutboundFragment {
     pub peer_node_id: String,
