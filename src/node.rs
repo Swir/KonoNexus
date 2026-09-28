@@ -17,9 +17,7 @@ use crate::relay_e2e::{
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
 use crate::security::{CookieGuard, ReplayGuard, SequenceWindow};
-use crate::session::{
-    respond_handshake, PendingHandshake, SecurePayload, SecureSession, SessionSlot,
-};
+use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SessionSlot};
 use anyhow::{anyhow, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet};
