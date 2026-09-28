@@ -11,11 +11,7 @@ fn unique_state_dir() -> PathBuf {
     ))
 }
 
-async fn wait_for_message(
-    transport: &mut KonofixTransport,
-    peer_node_id: &str,
-    expected: &[u8],
-) {
+async fn wait_for_message(transport: &mut KonofixTransport, peer_node_id: &str, expected: &[u8]) {
     time::timeout(Duration::from_secs(15), async {
         loop {
             match transport.next_event().await {
@@ -39,17 +35,12 @@ async fn wait_for_message(
     .expect("timed out waiting for KonoNexus message");
 }
 
-async fn wait_for_receipt(
-    transport: &mut KonofixTransport,
-    peer_node_id: &str,
-    message_id: u64,
-) {
+async fn wait_for_receipt(transport: &mut KonofixTransport, peer_node_id: &str, message_id: u64) {
     time::timeout(Duration::from_secs(15), async {
         loop {
             match transport.next_event().await {
                 Some(RelayAppEvent::Delivered(receipt))
-                    if receipt.peer_node_id == peer_node_id
-                        && receipt.message_id == message_id =>
+                    if receipt.peer_node_id == peer_node_id && receipt.message_id == message_id =>
                 {
                     break;
                 }
