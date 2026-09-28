@@ -360,20 +360,11 @@ mod tests {
     fn relay_enforces_per_circuit_rate_quota() {
         let (mut relay, id, origin, target) = setup();
         let now = Instant::now();
-        relay
-            .accept(id, target, "knp1target", now)
-            .unwrap();
+        relay.accept(id, target, "knp1target", now).unwrap();
 
         for sequence in 0..MAX_RELAY_CELLS_PER_SECOND as u64 {
             relay
-                .forward(
-                    id,
-                    origin,
-                    "knp1origin",
-                    sequence,
-                    "aa".into(),
-                    now,
-                )
+                .forward(id, origin, "knp1origin", sequence, "aa".into(), now)
                 .unwrap();
         }
 
@@ -411,9 +402,7 @@ mod tests {
                     index as u64,
                     "203.0.113.10:47000".parse().unwrap(),
                     "knp1origin".into(),
-                    format!("198.51.100.{}:47000", index + 1)
-                        .parse()
-                        .unwrap(),
+                    format!("198.51.100.{}:47000", index + 1).parse().unwrap(),
                     format!("knp1target{index}"),
                     now,
                 )
