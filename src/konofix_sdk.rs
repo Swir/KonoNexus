@@ -13,6 +13,7 @@ pub struct KonofixSdkConfig {
     pub routing_cache_path: Option<PathBuf>,
     pub hello_interval: Duration,
     pub event_capacity: usize,
+    pub local_test_mode: bool,
 }
 
 impl KonofixSdkConfig {
@@ -26,6 +27,7 @@ impl KonofixSdkConfig {
             routing_cache_path: None,
             hello_interval: Duration::from_secs(2),
             event_capacity: 64,
+            local_test_mode: false,
         }
     }
 
@@ -58,6 +60,11 @@ impl KonofixSdkConfig {
         self.event_capacity = capacity.max(1);
         self
     }
+
+    pub fn with_local_test_mode(mut self, enabled: bool) -> Self {
+        self.local_test_mode = enabled;
+        self
+    }
 }
 
 pub struct KonofixTransport {
@@ -80,6 +87,8 @@ impl KonofixTransport {
             config.hello_interval,
         )
         .await?;
+
+        node.set_local_test_mode(config.local_test_mode);
 
         let local_addr = node.local_addr()?;
         let routing_cache_path = config
