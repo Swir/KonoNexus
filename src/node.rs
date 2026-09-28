@@ -6,7 +6,7 @@ use crate::identity::NodeIdentity;
 use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
-use crate::relay::{RelayManager, RELAY_CIRCUIT_TTL};
+use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
 use crate::security::{CookieGuard, ReplayGuard};
@@ -77,6 +77,12 @@ struct RelayPath {
 }
 
 #[derive(Debug, Clone)]
+struct PendingRelayAccept {
+    peer_node_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
 pub struct RelayDeliveredCell {
     pub relay_endpoint: SocketAddr,
     pub circuit_id: u64,
@@ -117,6 +123,7 @@ pub struct KonoNode {
     relay_manager: RelayManager,
     queued_relays: HashMap<SocketAddr, Vec<String>>,
     pending_relay_requests: HashMap<u64, (SocketAddr, String)>,
+    pending_relay_accepts: HashMap<(SocketAddr, u64), PendingRelayAccept>,
     relay_paths: HashMap<(SocketAddr, u64), RelayPath>,
     relay_inbox: VecDeque<RelayDeliveredCell>,
     hello_interval: Duration,
@@ -166,6 +173,7 @@ impl KonoNode {
             relay_manager: RelayManager::default(),
             queued_relays: HashMap::new(),
             pending_relay_requests: HashMap::new(),
+            pending_relay_accepts: HashMap::new(),
             relay_paths: HashMap::new(),
             relay_inbox: VecDeque::new(),
             hello_interval,
@@ -959,9 +967,20 @@ impl KonoNode {
                 circuit_id,
                 origin_node_id,
             } => {
-                if !plausible_node_id(&origin_node_id) || origin_node_id == self.node_id() {
+                if !plausible_node_id(&origin_node_id)
+                    || origin_node_id == self.node_id()
+                    || self.pending_relay_accepts.len() >= MAX_RELAY_CIRCUITS
+                {
                     return Ok(());
                 }
+
+                self.pending_relay_accepts.insert(
+                    (source, circuit_id),
+                    PendingRelayAccept {
+                        peer_node_id: origin_node_id.clone(),
+                        expires_at: Instant::now() + RELAY_CIRCUIT_TTL,
+                    },
+                );
 
                 self.send_secure_payload(
                     source,
@@ -1020,12 +1039,22 @@ impl KonoNode {
                     return Ok(());
                 }
 
-                if let Some((relay_endpoint, requested_peer)) =
-                    self.pending_relay_requests.remove(&circuit_id)
-                {
-                    if relay_endpoint != source || requested_peer != peer_node_id {
-                        return Ok(());
-                    }
+                let origin_valid = self
+                    .pending_relay_requests
+                    .remove(&circuit_id)
+                    .is_some_and(|(relay_endpoint, requested_peer)| {
+                        relay_endpoint == source && requested_peer == peer_node_id
+                    });
+                let target_valid = self
+                    .pending_relay_accepts
+                    .remove(&(source, circuit_id))
+                    .is_some_and(|pending| {
+                        pending.expires_at > Instant::now()
+                            && pending.peer_node_id == peer_node_id
+                    });
+
+                if !origin_valid && !target_valid {
+                    return Ok(());
                 }
 
                 self.relay_paths.insert(
@@ -1119,10 +1148,12 @@ impl KonoNode {
                 } else {
                     self.relay_paths.remove(&(source, circuit_id));
                     self.pending_relay_requests.remove(&circuit_id);
+                    self.pending_relay_accepts.remove(&(source, circuit_id));
                 }
             }
             SecurePayload::RelayReject { circuit_id } => {
                 self.pending_relay_requests.remove(&circuit_id);
+                self.pending_relay_accepts.remove(&(source, circuit_id));
                 self.relay_paths.remove(&(source, circuit_id));
                 debug!(relay = %sender_node_id, circuit_id, "relay request rejected");
             }
@@ -2014,6 +2045,8 @@ impl KonoNode {
             .retain(|_, expires_at| *expires_at > Instant::now());
         self.relay_paths
             .retain(|_, path| path.expires_at > Instant::now());
+        self.pending_relay_accepts
+            .retain(|_, pending| pending.expires_at > Instant::now());
         let expired_relay = self.relay_manager.expire(Instant::now());
         if expired_relay > 0 {
             debug!(expired_relay, "expired idle relay circuits");
