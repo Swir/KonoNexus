@@ -203,14 +203,12 @@ fn preferred_app_transport(
     direct: Option<SocketAddr>,
     relay: Option<(SocketAddr, u64)>,
 ) -> Option<AppTransport> {
-    direct
-        .map(AppTransport::Direct)
-        .or_else(|| {
-            relay.map(|(relay_endpoint, circuit_id)| AppTransport::Relay {
-                relay_endpoint,
-                circuit_id,
-            })
+    direct.map(AppTransport::Direct).or_else(|| {
+        relay.map(|(relay_endpoint, circuit_id)| AppTransport::Relay {
+            relay_endpoint,
+            circuit_id,
         })
+    })
 }
 
 pub struct KonoNode {
@@ -2016,11 +2014,8 @@ impl KonoNode {
             status,
             RelayAppReceiveStatus::Completed | RelayAppReceiveStatus::DuplicateCompleted
         ) {
-            self.send_app_secure_payload(
-                peer_node_id,
-                SecurePayload::RelayAppAck { message_id },
-            )
-            .await?;
+            self.send_app_secure_payload(peer_node_id, SecurePayload::RelayAppAck { message_id })
+                .await?;
         }
 
         if status == RelayAppReceiveStatus::Completed {
@@ -2165,9 +2160,11 @@ impl KonoNode {
             })
             .collect();
 
-        ready_peers.extend(self.confirmed_sessions.iter().filter_map(|endpoint| {
-            self.peers.get(endpoint).map(|peer| peer.node_id.clone())
-        }));
+        ready_peers.extend(
+            self.confirmed_sessions
+                .iter()
+                .filter_map(|endpoint| self.peers.get(endpoint).map(|peer| peer.node_id.clone())),
+        );
 
         for _ in 0..RELAY_APP_BURST_PER_TICK {
             let Some(outbound) = self.relay_app.peek_next(&ready_peers) else {
@@ -3368,7 +3365,6 @@ fn local_features() -> Vec<String> {
         "secure-ping-pong".to_owned(),
     ]
 }
-
 
 #[cfg(test)]
 mod tests {
