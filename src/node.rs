@@ -243,13 +243,10 @@ impl KonoNode {
                 handshake_id,
                 ephemeral_public_key,
             } => {
-                let valid_pending = self
-                    .pending_sessions
-                    .get(&source)
-                    .is_some_and(|pending| {
-                        pending.handshake_id() == handshake_id
-                            && pending.peer_node_id() == sender_node_id
-                    });
+                let valid_pending = self.pending_sessions.get(&source).is_some_and(|pending| {
+                    pending.handshake_id() == handshake_id
+                        && pending.peer_node_id() == sender_node_id
+                });
                 if !valid_pending {
                     debug!(%source, handshake_id, "ignoring unexpected session ack");
                     return Ok(());
@@ -449,8 +446,10 @@ impl KonoNode {
         let endpoints: Vec<SocketAddr> = self.peers.keys().copied().collect();
         for endpoint in endpoints {
             let token = random();
-            let body = if let Some(body) =
-                self.secure_message(endpoint, SecurePayload::Ping { token }).ok().flatten()
+            let body = if let Some(body) = self
+                .secure_message(endpoint, SecurePayload::Ping { token })
+                .ok()
+                .flatten()
             {
                 body
             } else {
