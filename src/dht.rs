@@ -320,6 +320,23 @@ impl RoutingTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn bucket_entries(&self) -> Vec<(usize, RoutingPeer)> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .flat_map(|(bucket_index, peers)| {
+                peers
+                    .iter()
+                    .cloned()
+                    .map(move |peer| (bucket_index, peer))
+            })
+            .collect()
+    }
+}
+
+pub fn routing_bucket_index(local_node_id: &str, remote_node_id: &str) -> Option<usize> {
+    bucket_index(key_hash(local_node_id), key_hash(remote_node_id))
 }
 
 fn bucket_index(local: [u8; 32], remote: [u8; 32]) -> Option<usize> {
@@ -432,6 +449,24 @@ mod tests {
         }
 
         assert_eq!(routing.len(), DHT_BUCKET_SIZE);
+    }
+
+    #[test]
+    fn routing_table_snapshot_preserves_bucket_membership() {
+        let local = "knp1-local";
+        let mut routing = RoutingTable::new(local);
+        let now = Instant::now();
+        routing.observe("knp1-a".into(), "8.8.8.8:47000".parse().unwrap(), now);
+        routing.observe("knp1-b".into(), "1.1.1.1:47000".parse().unwrap(), now);
+
+        let snapshot = routing.bucket_entries();
+        assert_eq!(snapshot.len(), 2);
+        for (bucket_index, peer) in snapshot {
+            assert_eq!(
+                routing_bucket_index(local, &peer.node_id),
+                Some(bucket_index)
+            );
+        }
     }
 
     #[test]
