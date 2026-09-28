@@ -363,13 +363,21 @@ mod tests {
         let (mut a, mut b) = establish();
         let inflight = encode_relay_payload(&mut a, &SecurePayload::Ping { token: 41 }).unwrap();
 
-        let peer_b = b.peer_node_id().to_owned();
-        let pending = PendingHandshake::new(peer_b);
+        let responder_node_id = a.peer_node_id().to_owned();
+        let initiator_node_id = b.peer_node_id().to_owned();
+        let pending = PendingHandshake::new(responder_node_id.clone());
         let rekey_id = pending.handshake_id();
         let initiator_public = pending.public_key_hex();
-        let (new_b, responder_public) =
-            respond_handshake("node-b", "node-a", rekey_id, &initiator_public).unwrap();
-        let new_a = pending.complete("node-a", &responder_public).unwrap();
+        let (new_b, responder_public) = respond_handshake(
+            &responder_node_id,
+            &initiator_node_id,
+            rekey_id,
+            &initiator_public,
+        )
+        .unwrap();
+        let new_a = pending
+            .complete(&initiator_node_id, &responder_public)
+            .unwrap();
 
         let now = Instant::now();
         a.rotate(new_a, now, Duration::from_secs(30)).unwrap();
