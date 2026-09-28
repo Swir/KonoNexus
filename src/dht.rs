@@ -294,12 +294,7 @@ impl RoutingTable {
 
     pub fn nearest(&self, target_node_id: &str, limit: usize) -> Vec<RoutingPeer> {
         let target = key_hash(target_node_id);
-        let mut peers: Vec<RoutingPeer> = self
-            .buckets
-            .iter()
-            .flatten()
-            .cloned()
-            .collect();
+        let mut peers: Vec<RoutingPeer> = self.buckets.iter().flatten().cloned().collect();
 
         peers.sort_by_key(|peer| xor_distance(key_hash(&peer.node_id), target));
         peers.truncate(limit);
@@ -443,19 +438,14 @@ mod tests {
     fn routing_table_nearest_prefers_target_identity() {
         let mut routing = RoutingTable::new("knp1-local");
         let now = Instant::now();
-        routing.observe(
-            "knp1-a".into(),
-            "8.8.8.8:47000".parse().unwrap(),
-            now,
-        );
-        routing.observe(
-            "knp1-b".into(),
-            "1.1.1.1:47000".parse().unwrap(),
-            now,
-        );
+        routing.observe("knp1-a".into(), "8.8.8.8:47000".parse().unwrap(), now);
+        routing.observe("knp1-b".into(), "1.1.1.1:47000".parse().unwrap(), now);
 
         let nearest = routing.nearest("knp1-a", 2);
-        assert_eq!(nearest.first().map(|peer| peer.node_id.as_str()), Some("knp1-a"));
+        assert_eq!(
+            nearest.first().map(|peer| peer.node_id.as_str()),
+            Some("knp1-a")
+        );
     }
 
     #[test]
