@@ -33,10 +33,13 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - inner relay handshake authenticated by Ed25519 and bound to circuit ID plus both endpoint NodeIDs,
 - fresh inner X25519/HKDF/ChaCha20-Poly1305 session keys that are never disclosed to the forwarding relay,
 - deterministic single-side punch-to-relay fallback to avoid duplicate circuit storms,
+- 128-sequence sliding anti-replay windows for encrypted sessions and relay transport, allowing bounded authenticated reordering while rejecting duplicates and stale sequences,
 - inner secure-session replay/tamper checks in addition to outer relay transport sequencing,
 - RelayApp message size, queue-byte, queue-count, reassembly-count, reassembly-byte, completed-queue, and expiry limits,
 - strict fragment metadata/length validation, duplicate-content consistency checks, and encrypted application ACKs,
 - bounded async application command/event channels so slow application consumers cannot create unbounded network-loop queues,
+- one-second RelayApp ACK timeout with at most four retransmissions and bounded delivered-message deduplication,
+- relay per-NodeID circuit cap (16) plus per-direction rate quotas (128 cells/s and 256 KiB/s),
 - session keys zeroized when sessions are dropped.
 
 ## NAT/rendezvous threats considered
@@ -65,19 +68,18 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - routing-cache files expose peer metadata on local disk even though they contain no private keys,
 - relay control metadata remains visible to the forwarding node, including endpoint identities, circuit IDs, timing, and cell sizes,
 - application payload APIs are now exposed only through the inner E2E RelayApp layer; raw relay cells are not the application API,
-- lost RelayApp fragments/ACKs are not yet retransmitted and unacknowledged outbound messages are dropped on TTL expiry,
-- strict secure-session sequencing still rejects reordered UDP frames, which can reduce delivery reliability on reordered paths,
-- relay bandwidth quotas, abuse accounting, broader relay selection, and path migration policy are not yet implemented,
+- whole-message RelayApp retransmission is implemented, but selective fragment retransmission and explicit application delivery-failure callbacks are not yet implemented,
+- relay quotas are implemented, but long-window abuse accounting, adaptive quotas, and reputation/Sybil controls are not yet implemented,
+- broader relay selection and path migration policy are not yet implemented,
 - no independent security audit has been completed.
 
 ## Required before production
 
 - stronger long-window per-peer rendezvous/filter-test rate limits,
 - wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
-- bounded sliding anti-replay windows for UDP reordering,
 - handshake retransmission and session key rotation,
 - independent endpoint attestations for DHT records, persistent bucket storage, stronger query rate limits, and Sybil mitigation,
-- RelayApp retransmission/ACK timeout policy, sliding UDP anti-replay windows, relay bandwidth quotas, per-peer rate limiting, abuse accounting, and multi-path failover hardening,
+- selective RelayApp recovery/delivery-failure reporting, longer-window relay abuse accounting, adaptive per-peer quotas, and multi-path failover hardening,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
 - load testing,
