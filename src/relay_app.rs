@@ -1,0 +1,454 @@
+use anyhow::{bail, Context, Result};
+use rand::random;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+pub const RELAY_APP_FRAGMENT_BYTES: usize = 512;
+pub const MAX_RELAY_APP_MESSAGE_BYTES: usize = 256 * 1024;
+pub const MAX_RELAY_APP_OUTBOUND_MESSAGES: usize = 64;
+pub const MAX_RELAY_APP_OUTBOUND_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_RELAY_APP_INBOUND_ASSEMBLIES: usize = 64;
+pub const MAX_RELAY_APP_INBOUND_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RELAY_APP_COMPLETED_MESSAGES: usize = 128;
+pub const MAX_RELAY_APP_COMPLETED_BYTES: usize = 4 * 1024 * 1024;
+pub const RELAY_APP_REASSEMBLY_TTL: Duration = Duration::from_secs(30);
+pub const RELAY_APP_OUTBOUND_TTL: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayAppFragment {
+    pub message_id: u64,
+    pub fragment_index: u16,
+    pub fragment_count: u16,
+    pub total_len: u32,
+    pub data_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAppMessage {
+    pub peer_node_id: String,
+    pub message_id: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayAppOutboundFragment {
+    pub peer_node_id: String,
+    pub fragment: RelayAppFragment,
+}
+
+#[derive(Debug)]
+struct OutboundMessage {
+    peer_node_id: String,
+    message_id: u64,
+    data: Vec<u8>,
+    fragment_count: u16,
+    next_fragment_index: u16,
+    awaiting_ack: bool,
+    created_at: Instant,
+}
+
+#[derive(Debug)]
+struct InboundAssembly {
+    total_len: usize,
+    fragments: Vec<Option<Vec<u8>>>,
+    received_count: usize,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+pub struct RelayAppManager {
+    outbound: VecDeque<OutboundMessage>,
+    outbound_bytes: usize,
+    inbound: HashMap<(String, u64), InboundAssembly>,
+    inbound_reserved_bytes: usize,
+    completed: VecDeque<RelayAppMessage>,
+    completed_bytes: usize,
+}
+
+impl RelayAppManager {
+    pub fn queue(
+        &mut self,
+        peer_node_id: String,
+        data: Vec<u8>,
+        now: Instant,
+    ) -> Result<u64> {
+        if data.is_empty() {
+            bail!("relay application message cannot be empty");
+        }
+        if data.len() > MAX_RELAY_APP_MESSAGE_BYTES {
+            bail!("relay application message exceeds maximum size");
+        }
+        if self.outbound.len() >= MAX_RELAY_APP_OUTBOUND_MESSAGES
+            || self.outbound_bytes.saturating_add(data.len()) > MAX_RELAY_APP_OUTBOUND_BYTES
+        {
+            bail!("relay application outbound queue is full");
+        }
+
+        let fragment_count = data.len().div_ceil(RELAY_APP_FRAGMENT_BYTES);
+        let fragment_count: u16 = fragment_count
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("relay application fragment count overflow"))?;
+
+        let mut message_id: u64 = random();
+        while self
+            .outbound
+            .iter()
+            .any(|message| message.message_id == message_id)
+        {
+            message_id = random();
+        }
+
+        self.outbound_bytes += data.len();
+        self.outbound.push_back(OutboundMessage {
+            peer_node_id,
+            message_id,
+            data,
+            fragment_count,
+            next_fragment_index: 0,
+            awaiting_ack: false,
+            created_at: now,
+        });
+
+        Ok(message_id)
+    }
+
+    pub fn peek_next(
+        &self,
+        ready_peers: &std::collections::HashSet<String>,
+    ) -> Option<RelayAppOutboundFragment> {
+        let message = self
+            .outbound
+            .iter()
+            .find(|message| {
+                !message.awaiting_ack && ready_peers.contains(&message.peer_node_id)
+            })?;
+
+        let index = usize::from(message.next_fragment_index);
+        let start = index.saturating_mul(RELAY_APP_FRAGMENT_BYTES);
+        let end = (start + RELAY_APP_FRAGMENT_BYTES).min(message.data.len());
+        if start >= end {
+            return None;
+        }
+
+        Some(RelayAppOutboundFragment {
+            peer_node_id: message.peer_node_id.clone(),
+            fragment: RelayAppFragment {
+                message_id: message.message_id,
+                fragment_index: message.next_fragment_index,
+                fragment_count: message.fragment_count,
+                total_len: message.data.len() as u32,
+                data_hex: hex::encode(&message.data[start..end]),
+            },
+        })
+    }
+
+    pub fn mark_fragment_sent(&mut self, message_id: u64, fragment_index: u16) -> Result<()> {
+        let message = self
+            .outbound
+            .iter_mut()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(|| anyhow::anyhow!("relay application outbound message not found"))?;
+
+        if message.awaiting_ack || message.next_fragment_index != fragment_index {
+            bail!("relay application fragment send state mismatch");
+        }
+
+        message.next_fragment_index = message
+            .next_fragment_index
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("relay application fragment index overflow"))?;
+        if message.next_fragment_index >= message.fragment_count {
+            message.awaiting_ack = true;
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge(&mut self, peer_node_id: &str, message_id: u64) -> bool {
+        let Some(index) = self.outbound.iter().position(|message| {
+            message.message_id == message_id
+                && message.peer_node_id == peer_node_id
+                && message.awaiting_ack
+        }) else {
+            return false;
+        };
+
+        if let Some(message) = self.outbound.remove(index) {
+            self.outbound_bytes = self.outbound_bytes.saturating_sub(message.data.len());
+            return true;
+        }
+        false
+    }
+
+    pub fn accept_fragment(
+        &mut self,
+        peer_node_id: &str,
+        fragment: RelayAppFragment,
+        now: Instant,
+    ) -> Result<bool> {
+        validate_fragment(&fragment)?;
+        let total_len = fragment.total_len as usize;
+        let key = (peer_node_id.to_owned(), fragment.message_id);
+
+        if !self.inbound.contains_key(&key) {
+            if self.inbound.len() >= MAX_RELAY_APP_INBOUND_ASSEMBLIES
+                || self.inbound_reserved_bytes.saturating_add(total_len)
+                    > MAX_RELAY_APP_INBOUND_BYTES
+            {
+                bail!("relay application inbound reassembly capacity exceeded");
+            }
+
+            self.inbound_reserved_bytes += total_len;
+            self.inbound.insert(
+                key.clone(),
+                InboundAssembly {
+                    total_len,
+                    fragments: vec![None; usize::from(fragment.fragment_count)],
+                    received_count: 0,
+                    expires_at: now + RELAY_APP_REASSEMBLY_TTL,
+                },
+            );
+        }
+
+        let assembly = self
+            .inbound
+            .get_mut(&key)
+            .ok_or_else(|| anyhow::anyhow!("relay application reassembly disappeared"))?;
+
+        if assembly.total_len != total_len
+            || assembly.fragments.len() != usize::from(fragment.fragment_count)
+        {
+            bail!("relay application fragment metadata changed mid-message");
+        }
+
+        assembly.expires_at = now + RELAY_APP_REASSEMBLY_TTL;
+        let index = usize::from(fragment.fragment_index);
+        let data = hex::decode(&fragment.data_hex).context("relay application fragment is not hex")?;
+
+        match &assembly.fragments[index] {
+            Some(existing) if existing == &data => return Ok(false),
+            Some(_) => bail!("relay application duplicate fragment content mismatch"),
+            None => {
+                assembly.fragments[index] = Some(data);
+                assembly.received_count += 1;
+            }
+        }
+
+        if assembly.received_count != assembly.fragments.len() {
+            return Ok(false);
+        }
+
+        let assembly = self
+            .inbound
+            .remove(&key)
+            .ok_or_else(|| anyhow::anyhow!("relay application reassembly disappeared"))?;
+        self.inbound_reserved_bytes = self
+            .inbound_reserved_bytes
+            .saturating_sub(assembly.total_len);
+
+        let mut data = Vec::with_capacity(assembly.total_len);
+        for fragment in assembly.fragments {
+            let fragment =
+                fragment.ok_or_else(|| anyhow::anyhow!("relay application fragment missing"))?;
+            data.extend_from_slice(&fragment);
+        }
+
+        if data.len() != assembly.total_len {
+            bail!("relay application reassembled length mismatch");
+        }
+
+        self.push_completed(RelayAppMessage {
+            peer_node_id: peer_node_id.to_owned(),
+            message_id: fragment.message_id,
+            data,
+        });
+
+        Ok(true)
+    }
+
+    pub fn take_completed(&mut self) -> Vec<RelayAppMessage> {
+        self.completed_bytes = 0;
+        self.completed.drain(..).collect()
+    }
+
+    pub fn expire(&mut self, now: Instant) -> (usize, usize) {
+        let expired_inbound: Vec<(String, u64)> = self
+            .inbound
+            .iter()
+            .filter(|(_, assembly)| assembly.expires_at <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in &expired_inbound {
+            if let Some(assembly) = self.inbound.remove(key) {
+                self.inbound_reserved_bytes = self
+                    .inbound_reserved_bytes
+                    .saturating_sub(assembly.total_len);
+            }
+        }
+
+        let expired_outbound: Vec<usize> = self
+            .outbound
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| now.duration_since(message.created_at) >= RELAY_APP_OUTBOUND_TTL)
+            .map(|(index, _)| index)
+            .collect();
+
+        for index in expired_outbound.iter().rev().copied() {
+            if let Some(message) = self.outbound.remove(index) {
+                self.outbound_bytes = self.outbound_bytes.saturating_sub(message.data.len());
+            }
+        }
+
+        (expired_inbound.len(), expired_outbound.len())
+    }
+
+    pub fn outbound_message_count(&self) -> usize {
+        self.outbound.len()
+    }
+
+    pub fn outbound_bytes(&self) -> usize {
+        self.outbound_bytes
+    }
+
+    fn push_completed(&mut self, message: RelayAppMessage) {
+        while self.completed.len() >= MAX_RELAY_APP_COMPLETED_MESSAGES
+            || self.completed_bytes.saturating_add(message.data.len())
+                > MAX_RELAY_APP_COMPLETED_BYTES
+        {
+            let Some(oldest) = self.completed.pop_front() else {
+                break;
+            };
+            self.completed_bytes = self.completed_bytes.saturating_sub(oldest.data.len());
+        }
+
+        self.completed_bytes += message.data.len();
+        self.completed.push_back(message);
+    }
+}
+
+fn validate_fragment(fragment: &RelayAppFragment) -> Result<()> {
+    if fragment.fragment_count == 0
+        || fragment.fragment_index >= fragment.fragment_count
+        || fragment.total_len == 0
+        || fragment.total_len as usize > MAX_RELAY_APP_MESSAGE_BYTES
+    {
+        bail!("invalid relay application fragment metadata");
+    }
+
+    let expected_count = (fragment.total_len as usize).div_ceil(RELAY_APP_FRAGMENT_BYTES);
+    if usize::from(fragment.fragment_count) != expected_count {
+        bail!("relay application fragment count does not match total length");
+    }
+
+    let decoded =
+        hex::decode(&fragment.data_hex).context("relay application fragment is not valid hex")?;
+    if decoded.is_empty() || decoded.len() > RELAY_APP_FRAGMENT_BYTES {
+        bail!("relay application fragment payload size is invalid");
+    }
+
+    let expected_last_len = {
+        let remainder = fragment.total_len as usize % RELAY_APP_FRAGMENT_BYTES;
+        if remainder == 0 {
+            RELAY_APP_FRAGMENT_BYTES
+        } else {
+            remainder
+        }
+    };
+
+    if fragment.fragment_index + 1 == fragment.fragment_count {
+        if decoded.len() != expected_last_len {
+            bail!("relay application final fragment length mismatch");
+        }
+    } else if decoded.len() != RELAY_APP_FRAGMENT_BYTES {
+        bail!("relay application non-final fragment length mismatch");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn fragments_reassemble_and_ack_releases_backpressure() {
+        let now = Instant::now();
+        let data = vec![0x5a; RELAY_APP_FRAGMENT_BYTES * 2 + 17];
+        let mut sender = RelayAppManager::default();
+        let mut receiver = RelayAppManager::default();
+        let message_id = sender.queue("peer-b".into(), data.clone(), now).unwrap();
+        let ready = HashSet::from(["peer-b".to_owned()]);
+
+        loop {
+            let Some(outbound) = sender.peek_next(&ready) else {
+                break;
+            };
+            let fragment_index = outbound.fragment.fragment_index;
+            let completed = receiver
+                .accept_fragment("peer-a", outbound.fragment.clone(), now)
+                .unwrap();
+            sender
+                .mark_fragment_sent(message_id, fragment_index)
+                .unwrap();
+            if completed {
+                break;
+            }
+        }
+
+        let completed = receiver.take_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].data, data);
+        assert_eq!(sender.outbound_message_count(), 1);
+        assert!(sender.acknowledge("peer-b", message_id));
+        assert_eq!(sender.outbound_message_count(), 0);
+        assert_eq!(sender.outbound_bytes(), 0);
+    }
+
+    #[test]
+    fn outbound_limits_apply_backpressure() {
+        let now = Instant::now();
+        let mut manager = RelayAppManager::default();
+        for _ in 0..MAX_RELAY_APP_OUTBOUND_MESSAGES {
+            manager.queue("peer".into(), vec![1], now).unwrap();
+        }
+        assert!(manager.queue("peer".into(), vec![1], now).is_err());
+    }
+
+    #[test]
+    fn fragment_metadata_tampering_is_rejected() {
+        let now = Instant::now();
+        let mut receiver = RelayAppManager::default();
+        let fragment = RelayAppFragment {
+            message_id: 1,
+            fragment_index: 0,
+            fragment_count: 2,
+            total_len: 10,
+            data_hex: hex::encode(vec![1_u8; 10]),
+        };
+
+        assert!(receiver.accept_fragment("peer", fragment, now).is_err());
+    }
+
+    #[test]
+    fn stale_reassembly_and_outbound_messages_expire() {
+        let now = Instant::now();
+        let mut manager = RelayAppManager::default();
+        manager.queue("peer".into(), vec![7_u8; 32], now).unwrap();
+
+        let fragment = RelayAppFragment {
+            message_id: 2,
+            fragment_index: 0,
+            fragment_count: 2,
+            total_len: (RELAY_APP_FRAGMENT_BYTES + 1) as u32,
+            data_hex: hex::encode(vec![3_u8; RELAY_APP_FRAGMENT_BYTES]),
+        };
+        manager.accept_fragment("peer", fragment, now).unwrap();
+
+        let (inbound, outbound) = manager.expire(now + RELAY_APP_OUTBOUND_TTL + Duration::from_secs(1));
+        assert_eq!(inbound, 1);
+        assert_eq!(outbound, 1);
+    }
+}
