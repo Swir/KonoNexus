@@ -176,6 +176,7 @@ pub struct KonoNode {
     pending_sessions: HashMap<SocketAddr, PendingSessionAttempt>,
     responder_session_acks: HashMap<(SocketAddr, u64), ResponderSessionAck>,
     sessions: HashMap<SocketAddr, SecureSession>,
+    confirmed_sessions: HashSet<SocketAddr>,
     nat_profile: NatProfile,
     pending_punches: HashMap<u64, PunchSchedule>,
     queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
@@ -234,6 +235,7 @@ impl KonoNode {
             pending_sessions: HashMap::new(),
             responder_session_acks: HashMap::new(),
             sessions: HashMap::new(),
+            confirmed_sessions: HashSet::new(),
             nat_profile: NatProfile::default(),
             pending_punches: HashMap::new(),
             queued_rendezvous: HashMap::new(),
@@ -636,10 +638,6 @@ impl KonoNode {
                     "encrypted KNP session established as responder"
                 );
 
-                self.flush_rendezvous_requests(source).await?;
-                self.flush_filter_test_request(source).await?;
-                self.flush_relay_requests(source).await?;
-                self.sync_dht_peer(source).await?;
             }
             MessageBody::SessionAck {
                 handshake_id,
@@ -663,6 +661,7 @@ impl KonoNode {
                 let session_id = session.session_id().to_owned();
                 let frame = session.encrypt(&SecurePayload::Ping { token: random() })?;
                 self.sessions.insert(source, session);
+                self.confirmed_sessions.insert(source);
 
                 self.send(
                     source,
@@ -703,6 +702,19 @@ impl KonoNode {
                         return Ok(());
                     }
                 };
+
+                let newly_confirmed = self.confirmed_sessions.insert(source);
+                if newly_confirmed {
+                    self.flush_rendezvous_requests(source).await?;
+                    self.flush_filter_test_request(source).await?;
+                    self.flush_relay_requests(source).await?;
+                    self.sync_dht_peer(source).await?;
+                    info!(
+                        peer = %sender_node_id,
+                        %source,
+                        "encrypted session confirmed by authenticated frame"
+                    );
+                }
 
                 self.handle_secure_payload(source, &sender_node_id, payload)
                     .await?;
@@ -843,13 +855,17 @@ impl KonoNode {
                 );
             }
             MessageBody::Ping { token } => {
-                if self.peers.contains_key(&source) && !self.sessions.contains_key(&source) {
+                if self.peers.contains_key(&source)
+                    && !self.confirmed_sessions.contains(&source)
+                {
                     self.record_peer(&envelope, source);
                     self.send(source, MessageBody::Pong { token }).await?;
                 }
             }
             MessageBody::Pong { token } => {
-                if self.peers.contains_key(&source) && !self.sessions.contains_key(&source) {
+                if self.peers.contains_key(&source)
+                    && !self.confirmed_sessions.contains(&source)
+                {
                     self.record_peer(&envelope, source);
                     debug!(peer = %sender_node_id, %source, token, "pong received");
                 }
@@ -2757,12 +2773,14 @@ impl KonoNode {
             self.responder_session_acks
                 .retain(|(endpoint, _), _| *endpoint != previous_endpoint);
             self.sessions.remove(&previous_endpoint);
+            self.confirmed_sessions.remove(&previous_endpoint);
             self.routing.remove_endpoint(previous_endpoint);
         }
 
         if let Some(existing) = self.peers.get(&source) {
             if existing.node_id != envelope.sender_node_id {
                 self.sessions.remove(&source);
+                self.confirmed_sessions.remove(&source);
                 self.pending_sessions.remove(&source);
                 self.responder_session_acks
                     .retain(|(endpoint, _), _| *endpoint != source);
@@ -2813,6 +2831,7 @@ impl KonoNode {
             self.responder_session_acks
                 .retain(|(ack_endpoint, _), _| *ack_endpoint != endpoint);
             self.sessions.remove(&endpoint);
+            self.confirmed_sessions.remove(&endpoint);
             self.routing.remove_endpoint(endpoint);
         }
     }
@@ -2845,12 +2864,11 @@ impl KonoNode {
         let endpoints: Vec<SocketAddr> = self.peers.keys().copied().collect();
         for endpoint in endpoints {
             let token = random();
-            let body = if let Some(body) = self
-                .secure_message(endpoint, SecurePayload::Ping { token })
-                .ok()
-                .flatten()
-            {
-                body
+            let body = if self.confirmed_sessions.contains(&endpoint) {
+                self.secure_message(endpoint, SecurePayload::Ping { token })
+                    .ok()
+                    .flatten()
+                    .unwrap_or(MessageBody::Ping { token })
             } else {
                 MessageBody::Ping { token }
             };
@@ -2874,6 +2892,8 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.sessions
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
+        self.confirmed_sessions
+            .retain(|endpoint| self.sessions.contains_key(endpoint));
         let active_session_endpoints: HashSet<SocketAddr> = self.sessions.keys().copied().collect();
         self.routing.retain_endpoints(&active_session_endpoints);
         self.pending_filter_probes
