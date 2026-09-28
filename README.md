@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.10 — authenticated E2E relay sessions + automatic punch fallback**. KNP now establishes a fresh end-to-end X25519/HKDF/ChaCha20-Poly1305 session inside an accepted cooperative relay circuit. The relay forwards only opaque inner packets and does not receive the end-to-end keys. When a coordinated hole-punch burst expires, one endpoint deterministically falls back to that same rendezvous coordinator as a relay when it is still available. Application-facing Konofix payload APIs, backpressure, and multi-relay routing are not yet claimed complete.
+> Status: **0.1.0-alpha.11 — live RelayApp API + bounded fragmentation/backpressure**. KNP now exposes a live async application handle that can send and receive end-to-end encrypted messages while the node event loop is running. Relay application messages are fragmented into bounded 512-byte chunks, reassembled only after the relay E2E session authenticates them, retained under explicit memory/count limits, and released from the sender queue only after an encrypted application ACK. Automatic retransmission after packet/ACK loss and UDP reordering tolerance are not yet claimed complete.
 
 ## Principles
 
@@ -88,7 +88,11 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Single-hop cooperative relay circuit/control foundation
 - [x] Bounded opaque relay cell forwarding
 - [x] Authenticated end-to-end inner session over relay
+- [x] Live async RelayApp send/receive handle
+- [x] 512-byte relay application fragmentation and bounded reassembly
+- [x] ACK-based bounded outbound backpressure
 - [x] Automatic hole-punch → single-relay fallback via rendezvous coordinator
+- [ ] Reliable fragment/ACK retransmission and UDP reordering tolerance
 - [ ] Broader automatic relay selection and multi-relay/path migration
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
@@ -183,3 +187,24 @@ Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per 
 For a requested NodeID, KNP still prefers a direct authenticated session. If rendezvous is required, it performs the bounded UDP punch burst first. When that punch schedule expires without confirmation, the two endpoints use NodeID ordering so only one side initiates fallback. If the rendezvous coordinator is still connected with an encrypted KNP session, that node requests a cooperative relay circuit through the same coordinator.
 
 After `RelayReady`, the lower NodeID starts the signed inner E2E handshake. Once the handshake completes, an encrypted inner PING/PONG confirms that the relay path carries data the forwarding node cannot decrypt. A failed relay request does not mark the target as authenticated or connected.
+
+
+### RelayApp application API
+
+Before starting the node, an application can request a bounded runtime handle:
+
+```rust
+let mut node = KonoNode::bind(identity, bind, peers, interval).await?;
+let mut app = node.configure_relay_app_handle(64)?;
+
+// Run `node.run()` on the network task.
+// From the application task:
+let message_id = app.send(target_node_id, payload).await?;
+if let Some(message) = app.recv().await {
+    // message.peer_node_id, message.message_id, message.data
+}
+```
+
+The command/event channels are bounded; application send calls wait for command-channel capacity rather than creating an unbounded queue. The internal outbound queue accepts at most 64 messages / 2 MiB and keeps a sent message allocated until the remote E2E endpoint returns `RelayAppAck`. Incoming messages are limited to 256 KiB each, use 512-byte fragments, allow at most 64 concurrent reassemblies / 4 MiB reserved reassembly memory, and expire incomplete state after 30 seconds. Completed messages are also kept in a bounded queue if the application event channel is temporarily full.
+
+Alpha.11 does not yet retransmit lost fragments or lost ACKs. Outbound unacknowledged messages expire after 120 seconds. The current secure-session receive logic also rejects reordered UDP secure frames, so reliability/reordering hardening is the next transport step.
