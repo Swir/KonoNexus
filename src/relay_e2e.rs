@@ -244,12 +244,8 @@ pub fn packet_kind(encoded: &[u8]) -> Result<&'static str> {
     }
 }
 
-fn sign_handshake(
-    identity: &NodeIdentity,
-    fields: &UnsignedRelayHandshake<'_>,
-) -> Result<String> {
-    let bytes =
-        serde_json::to_vec(fields).context("failed to serialize relay inner handshake")?;
+fn sign_handshake(identity: &NodeIdentity, fields: &UnsignedRelayHandshake<'_>) -> Result<String> {
+    let bytes = serde_json::to_vec(fields).context("failed to serialize relay inner handshake")?;
     Ok(hex::encode(identity.sign(&bytes)))
 }
 
@@ -264,14 +260,12 @@ fn verify_handshake(fields: &UnsignedRelayHandshake<'_>, signature: &str) -> Res
         bail!("relay inner NodeID/public-key mismatch");
     }
 
-    let raw_signature =
-        hex::decode(signature).context("relay inner signature is not valid hex")?;
+    let raw_signature = hex::decode(signature).context("relay inner signature is not valid hex")?;
     let signature: [u8; SIGNATURE_LEN] = raw_signature
         .try_into()
         .map_err(|_| anyhow!("relay inner signature must be 64 bytes"))?;
 
-    let bytes =
-        serde_json::to_vec(fields).context("failed to serialize relay inner handshake")?;
+    let bytes = serde_json::to_vec(fields).context("failed to serialize relay inner handshake")?;
     NodeIdentity::verify_with_public_key(&public_key, &bytes, &signature)
 }
 
