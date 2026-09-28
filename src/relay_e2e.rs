@@ -1,8 +1,11 @@
 use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use crate::relay::MAX_RELAY_CELL_BYTES;
-use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
+use crate::session::{
+    respond_handshake, PendingHandshake, SecurePayload, SecureSession, SessionSlot,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 pub const MAX_RELAY_INNER_PACKET_BYTES: usize = MAX_RELAY_CELL_BYTES;
 const RELAY_E2E_CONTEXT: &str = "knp-relay-e2e-v1";
@@ -211,7 +214,7 @@ pub fn accept_relay_init(
 }
 
 pub fn encode_relay_payload(
-    session: &mut SecureSession,
+    session: &mut SessionSlot,
     payload: &SecurePayload,
 ) -> Result<Vec<u8>> {
     let frame = session.encrypt(payload)?;
@@ -222,7 +225,25 @@ pub fn encode_relay_payload(
     })
 }
 
-pub fn decode_relay_payload(session: &mut SecureSession, encoded: &[u8]) -> Result<SecurePayload> {
+pub fn encode_relay_payload_on_session(
+    session: &mut SessionSlot,
+    session_id: &str,
+    payload: &SecurePayload,
+    now: Instant,
+) -> Result<Vec<u8>> {
+    let frame = session.encrypt_with_session_id(session_id, payload, now)?;
+    encode_packet(&RelayInnerPacket::Data {
+        session_id: frame.session_id,
+        sequence: frame.sequence,
+        ciphertext: frame.ciphertext,
+    })
+}
+
+pub fn decode_relay_payload(
+    session: &mut SessionSlot,
+    encoded: &[u8],
+    now: Instant,
+) -> Result<(String, SecurePayload)> {
     let packet = decode_packet(encoded)?;
     let RelayInnerPacket::Data {
         session_id,
@@ -233,7 +254,8 @@ pub fn decode_relay_payload(session: &mut SecureSession, encoded: &[u8]) -> Resu
         bail!("expected relay inner data packet");
     };
 
-    session.decrypt(&session_id, sequence, &ciphertext)
+    let payload = session.decrypt(&session_id, sequence, &ciphertext, now)?;
+    Ok((session_id, payload))
 }
 
 pub fn packet_kind(encoded: &[u8]) -> Result<&'static str> {
@@ -288,7 +310,7 @@ fn decode_packet(encoded: &[u8]) -> Result<RelayInnerPacket> {
 mod tests {
     use super::*;
 
-    fn establish() -> (SecureSession, SecureSession) {
+    fn establish() -> (SessionSlot, SessionSlot) {
         let a = NodeIdentity::generate();
         let b = NodeIdentity::generate();
         let (initiator, init) =
@@ -298,16 +320,16 @@ mod tests {
         let origin = initiator
             .complete(&a, &ack)
             .expect("origin should complete");
-        (origin, responder)
+        (SessionSlot::new(origin), SessionSlot::new(responder))
     }
 
     #[test]
     fn relay_inner_handshake_derives_end_to_end_session() {
         let (mut a, mut b) = establish();
-        assert_eq!(a.session_id(), b.session_id());
+        assert_eq!(a.current_session_id(), b.current_session_id());
 
         let encoded = encode_relay_payload(&mut a, &SecurePayload::Ping { token: 9 }).unwrap();
-        let decoded = decode_relay_payload(&mut b, &encoded).unwrap();
+        let (_, decoded) = decode_relay_payload(&mut b, &encoded, Instant::now()).unwrap();
         assert_eq!(decoded, SecurePayload::Ping { token: 9 });
     }
 
@@ -333,8 +355,35 @@ mod tests {
         .expect("maximum relay app fragment should fit");
 
         assert!(encoded.len() <= MAX_RELAY_CELL_BYTES);
-        let decoded = decode_relay_payload(&mut b, &encoded).unwrap();
+        let (_, decoded) = decode_relay_payload(&mut b, &encoded, Instant::now()).unwrap();
         assert_eq!(decoded, SecurePayload::RelayAppFragment { fragment });
+    }
+
+    #[test]
+    fn relay_inner_slot_accepts_previous_session_during_rekey_grace() {
+        use std::time::Duration;
+
+        let (mut a, mut b) = establish();
+        let inflight = encode_relay_payload(&mut a, &SecurePayload::Ping { token: 41 }).unwrap();
+
+        let peer_b = b.peer_node_id().to_owned();
+        let pending = PendingHandshake::new(peer_b);
+        let rekey_id = pending.handshake_id();
+        let initiator_public = pending.public_key_hex();
+        let (new_b, responder_public) =
+            respond_handshake("node-b", "node-a", rekey_id, &initiator_public).unwrap();
+        let new_a = pending.complete("node-a", &responder_public).unwrap();
+
+        let now = Instant::now();
+        a.rotate(new_a, now, Duration::from_secs(30)).unwrap();
+        b.rotate(new_b, now, Duration::from_secs(30)).unwrap();
+
+        let (_, payload) = decode_relay_payload(&mut b, &inflight, now).unwrap();
+        assert_eq!(payload, SecurePayload::Ping { token: 41 });
+
+        let fresh = encode_relay_payload(&mut a, &SecurePayload::Ping { token: 42 }).unwrap();
+        let (_, payload) = decode_relay_payload(&mut b, &fresh, now).unwrap();
+        assert_eq!(payload, SecurePayload::Ping { token: 42 });
     }
 
     #[test]
@@ -363,6 +412,6 @@ mod tests {
         let last = encoded.len() - 2;
         encoded[last] ^= 1;
 
-        assert!(decode_relay_payload(&mut b, &encoded).is_err());
+        assert!(decode_relay_payload(&mut b, &encoded, Instant::now()).is_err());
     }
 }
