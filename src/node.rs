@@ -16,7 +16,9 @@ use crate::relay_e2e::{
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
 use crate::security::{CookieGuard, ReplayGuard, SequenceWindow};
-use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
+use crate::session::{
+    respond_handshake, PendingHandshake, SecurePayload, SecureSession, SessionSlot,
+};
 use anyhow::{anyhow, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet};
@@ -44,6 +46,12 @@ const SESSION_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SESSION_HANDSHAKE_MAX_ATTEMPTS: u8 = 4;
 const SESSION_RESPONDER_ACK_TTL: Duration = Duration::from_secs(10);
 const MAX_SESSION_RESPONDER_ACKS: usize = 256;
+const SESSION_REKEY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const SESSION_REKEY_GRACE: Duration = Duration::from_secs(30);
+const SESSION_REKEY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SESSION_REKEY_MAX_ATTEMPTS: u8 = 4;
+const SESSION_REKEY_ACK_TTL: Duration = Duration::from_secs(10);
+const MAX_SESSION_REKEY_ACKS: usize = 256;
 const AUTO_RELAY_MAX_CANDIDATES: usize = 3;
 const AUTO_RELAY_RETRY_DELAY: Duration = Duration::from_secs(2);
 const AUTO_RELAY_STATE_TTL: Duration = Duration::from_secs(30);
@@ -116,6 +124,23 @@ struct ResponderSessionAck {
     expires_at: Instant,
 }
 
+struct PendingRekeyAttempt {
+    pending: PendingHandshake,
+    rekey_id: u64,
+    peer_node_id: String,
+    ephemeral_public_key: String,
+    attempts: u8,
+    next_retry_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ResponderRekeyAck {
+    peer_node_id: String,
+    initiator_public_key: String,
+    responder_public_key: String,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct PendingFilterProbe {
     expected_helper_node_id: String,
@@ -175,8 +200,11 @@ pub struct KonoNode {
     cookie_guard: CookieGuard,
     pending_sessions: HashMap<SocketAddr, PendingSessionAttempt>,
     responder_session_acks: HashMap<(SocketAddr, u64), ResponderSessionAck>,
-    sessions: HashMap<SocketAddr, SecureSession>,
+    sessions: HashMap<SocketAddr, SessionSlot>,
     confirmed_sessions: HashSet<SocketAddr>,
+    pending_rekeys: HashMap<SocketAddr, PendingRekeyAttempt>,
+    responder_rekey_acks: HashMap<(SocketAddr, u64), ResponderRekeyAck>,
+    last_rekey: HashMap<SocketAddr, Instant>,
     nat_profile: NatProfile,
     pending_punches: HashMap<u64, PunchSchedule>,
     queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
@@ -236,6 +264,9 @@ impl KonoNode {
             responder_session_acks: HashMap::new(),
             sessions: HashMap::new(),
             confirmed_sessions: HashSet::new(),
+            pending_rekeys: HashMap::new(),
+            responder_rekey_acks: HashMap::new(),
+            last_rekey: HashMap::new(),
             nat_profile: NatProfile::default(),
             pending_punches: HashMap::new(),
             queued_rendezvous: HashMap::new(),
@@ -426,6 +457,7 @@ impl KonoNode {
                 }
                 _ = rendezvous_ticker.tick() => {
                     self.drive_session_handshakes().await;
+                    self.drive_session_rekeys().await;
                     self.drive_auto_rendezvous().await;
                     self.drive_auto_relay_fallbacks().await;
                     self.drive_dht_queries().await;
@@ -627,7 +659,7 @@ impl KonoNode {
                     },
                 )
                 .await?;
-                self.sessions.insert(source, session);
+                self.sessions.insert(source, SessionSlot::new(session));
                 self.routing
                     .observe(sender_node_id.clone(), source, Instant::now());
 
@@ -659,8 +691,9 @@ impl KonoNode {
                     .complete(&self.node_id(), &ephemeral_public_key)?;
                 let session_id = session.session_id().to_owned();
                 let frame = session.encrypt(&SecurePayload::Ping { token: random() })?;
-                self.sessions.insert(source, session);
+                self.sessions.insert(source, SessionSlot::new(session));
                 self.confirmed_sessions.insert(source);
+                self.last_rekey.insert(source, Instant::now());
 
                 self.send(
                     source,
@@ -695,7 +728,12 @@ impl KonoNode {
                 }
 
                 let payload = match self.sessions.get_mut(&source) {
-                    Some(session) => session.decrypt(&session_id, sequence, &ciphertext)?,
+                    Some(session) => session.decrypt(
+                        &session_id,
+                        sequence,
+                        &ciphertext,
+                        Instant::now(),
+                    )?,
                     None => {
                         debug!(%source, "ignoring secure frame without established session");
                         return Ok(());
@@ -704,6 +742,7 @@ impl KonoNode {
 
                 let newly_confirmed = self.confirmed_sessions.insert(source);
                 if newly_confirmed {
+                    self.last_rekey.insert(source, Instant::now());
                     self.flush_rendezvous_requests(source).await?;
                     self.flush_filter_test_request(source).await?;
                     self.flush_relay_requests(source).await?;
@@ -715,8 +754,13 @@ impl KonoNode {
                     );
                 }
 
-                self.handle_secure_payload(source, &sender_node_id, payload)
-                    .await?;
+                self.handle_secure_payload(
+                    source,
+                    &sender_node_id,
+                    &session_id,
+                    payload,
+                )
+                .await?;
             }
             MessageBody::PunchProbe { punch_token } => {
                 if !self.authorize_punch(punch_token, &sender_node_id) {
@@ -2738,6 +2782,24 @@ impl KonoNode {
         }))
     }
 
+    fn secure_message_on_session(
+        &mut self,
+        target: SocketAddr,
+        session_id: &str,
+        payload: SecurePayload,
+    ) -> Result<Option<MessageBody>> {
+        let Some(session) = self.sessions.get_mut(&target) else {
+            return Ok(None);
+        };
+        let frame =
+            session.encrypt_with_session_id(session_id, &payload, Instant::now())?;
+        Ok(Some(MessageBody::Encrypted {
+            session_id: frame.session_id,
+            sequence: frame.sequence,
+            ciphertext: frame.ciphertext,
+        }))
+    }
+
     fn peer_endpoint_by_node_id(&self, node_id: &str) -> Option<SocketAddr> {
         self.peers
             .iter()
@@ -2769,6 +2831,10 @@ impl KonoNode {
                 .retain(|(endpoint, _), _| *endpoint != previous_endpoint);
             self.sessions.remove(&previous_endpoint);
             self.confirmed_sessions.remove(&previous_endpoint);
+            self.pending_rekeys.remove(&previous_endpoint);
+            self.responder_rekey_acks
+                .retain(|(endpoint, _), _| *endpoint != previous_endpoint);
+            self.last_rekey.remove(&previous_endpoint);
             self.routing.remove_endpoint(previous_endpoint);
         }
 
@@ -2777,6 +2843,10 @@ impl KonoNode {
                 self.sessions.remove(&source);
                 self.confirmed_sessions.remove(&source);
                 self.pending_sessions.remove(&source);
+                self.pending_rekeys.remove(&source);
+                self.responder_rekey_acks
+                    .retain(|(endpoint, _), _| *endpoint != source);
+                self.last_rekey.remove(&source);
                 self.responder_session_acks
                     .retain(|(endpoint, _), _| *endpoint != source);
                 self.routing.remove_endpoint(source);
@@ -2827,6 +2897,10 @@ impl KonoNode {
                 .retain(|(ack_endpoint, _), _| *ack_endpoint != endpoint);
             self.sessions.remove(&endpoint);
             self.confirmed_sessions.remove(&endpoint);
+            self.pending_rekeys.remove(&endpoint);
+            self.responder_rekey_acks
+                .retain(|(ack_endpoint, _), _| *ack_endpoint != endpoint);
+            self.last_rekey.remove(&endpoint);
             self.routing.remove_endpoint(endpoint);
         }
     }
@@ -2889,6 +2963,16 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.confirmed_sessions
             .retain(|endpoint| self.sessions.contains_key(endpoint));
+        for session in self.sessions.values_mut() {
+            session.expire_previous(Instant::now());
+        }
+        self.pending_rekeys
+            .retain(|endpoint, _| self.sessions.contains_key(endpoint));
+        self.responder_rekey_acks.retain(|(endpoint, _), state| {
+            self.sessions.contains_key(endpoint) && state.expires_at > Instant::now()
+        });
+        self.last_rekey
+            .retain(|endpoint, _| self.sessions.contains_key(endpoint));
         let active_session_endpoints: HashSet<SocketAddr> = self.sessions.keys().copied().collect();
         self.routing.retain_endpoints(&active_session_endpoints);
         self.pending_filter_probes
@@ -2948,6 +3032,8 @@ fn local_features() -> Vec<String> {
         "cookie-challenge".to_owned(),
         "x25519-hkdf-session".to_owned(),
         "session-handshake-retry".to_owned(),
+        "session-x25519-rekey".to_owned(),
+        "session-rekey-grace".to_owned(),
         "chacha20poly1305-aead".to_owned(),
         "nat-observation".to_owned(),
         "decentralized-rendezvous".to_owned(),
