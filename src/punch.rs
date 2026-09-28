@@ -5,8 +5,7 @@ pub const PUNCH_MAX_ATTEMPTS: usize = 7;
 pub const PUNCH_START_DELAY: Duration = Duration::from_millis(100);
 pub const PUNCH_AUTH_TTL: Duration = Duration::from_secs(5);
 
-const RETRY_DELAYS_AFTER_SEND_MS: [u64; PUNCH_MAX_ATTEMPTS - 1] =
-    [100, 150, 250, 400, 650, 1_000];
+const RETRY_DELAYS_AFTER_SEND_MS: [u64; PUNCH_MAX_ATTEMPTS - 1] = [100, 150, 250, 400, 650, 1_000];
 
 #[derive(Debug, Clone)]
 pub struct PunchSchedule {
@@ -35,7 +34,10 @@ impl PunchSchedule {
 
         match endpoint.ip() {
             IpAddr::V4(ip) => {
-                !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() && !ip.is_broadcast()
+                !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !ip.is_multicast()
+                    && !ip.is_broadcast()
             }
             IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast(),
         }
