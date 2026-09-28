@@ -6,8 +6,7 @@ pub mod security;
 
 pub use identity::NodeIdentity;
 pub use konomind::{
-    KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate,
-    RouteRecommendation,
+    KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
 };
 pub use node::{KonoNode, PeerInfo};
 pub use protocol::{MessageBody, WireEnvelope, KNP_VERSION};
