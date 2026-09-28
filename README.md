@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.13 — delivery failures + handshake retry + alternate relay selection**. RelayApp now reports explicit delivery failures after retry exhaustion or message TTL expiry. Direct KNP session establishment retransmits `SESSION_INIT` with a bounded retry schedule and responders cache the matching ACK so duplicate handshakes cannot derive mismatched sessions. Responder-side application/control traffic is deferred until the first authenticated encrypted frame confirms the session. If punch-to-relay fallback loses its preferred coordinator, KNP can try up to three different existing encrypted peers as relay candidates. Session key rotation, direct↔relay migration, and broad multi-network validation are still not claimed complete.
+> Status: **0.1.0-alpha.14 — direct-session rekey + live direct↔relay application migration**. Confirmed direct KNP sessions now rotate to fresh X25519/HKDF/ChaCha20-Poly1305 keys on a bounded schedule, retry rekey safely, and keep the previous session ID for a short receive grace window so in-flight packets are not discarded. RelayApp traffic is now NodeID-centric rather than path-centric: confirmed direct transport is preferred, relay E2E is the fallback, and the same queued message/ACK can continue across a path change. Periodic rekey of relay-inner E2E sessions, real multi-network validation, and production hardening are still not claimed complete.
 
 ## Principles
 
@@ -98,11 +98,13 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] RelayApp delivery-failure callbacks
 - [x] Sliding 128-sequence anti-replay windows with UDP reordering tolerance
 - [x] Bounded alternate relay selection across up to 3 encrypted peers
-- [ ] Multi-relay/path migration and direct↔relay handoff
+- [x] Live RelayApp direct↔relay migration with direct preference
+- [ ] Multi-relay routing and full control-plane path migration
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
-- [ ] Session key rotation
+- [x] Direct KNP session key rotation with 30-second grace window
+- [ ] Relay-inner E2E session key rotation
 - [ ] KonoNexus Network Tester GUI
 - [ ] Konofix SDK and Windows integration
 - [ ] Android transport integration
@@ -230,3 +232,22 @@ Alpha.13 retransmits the same `SESSION_INIT` after a one-second timeout, up to f
 ### Alternate relay selection
 
 When direct UDP punching fails, the preferred relay remains the rendezvous coordinator that helped produce the punch candidate. If that relay is gone, cannot open the target, or rejects the circuit, the lower-NodeID endpoint can try other already-authenticated encrypted peers. Alpha.13 tries at most three distinct relay candidates in a 30-second fallback state, never repeats the same candidate, and stops as soon as a direct or relay path to the target becomes active.
+
+
+### Direct session key rotation
+
+Alpha.14 rotates confirmed **direct KNP sessions** using a fresh ephemeral X25519 exchange carried inside the already authenticated encrypted session. Only the lexicographically lower NodeID initiates periodic rekey, avoiding simultaneous competing rotations. Rekey starts after roughly 10 minutes, retries every second for at most four sends, and reuses the same rekey ID and initiator ephemeral key across retries.
+
+The responder returns the matching new X25519 public key over the old authenticated session, caches the ACK briefly for duplicate retries, and then switches to the newly derived HKDF/ChaCha20-Poly1305 session. Both endpoints retain the previous session for a 30-second grace window so authenticated packets already in flight under the old session ID can still be decrypted. New ordinary traffic uses the new session immediately.
+
+This rotation currently applies to direct KNP sessions. Periodic rekey of the inner E2E session inside relay circuits remains separate work.
+
+### Live direct ↔ relay application migration
+
+RelayApp queues are keyed by peer NodeID, not by a socket or circuit. Alpha.14 therefore selects a transport at send time:
+
+1. a confirmed direct encrypted session is preferred;
+2. otherwise an established relay E2E path is used;
+3. if neither exists, the message remains queued/backpressured until a path becomes available or its existing delivery timeout policy fires.
+
+Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-independent. A message may begin through relay and continue/retry through direct transport after a direct session appears, or fall back to relay if the direct session disappears. The relay circuit may remain available as a hot fallback until its normal idle expiry.
