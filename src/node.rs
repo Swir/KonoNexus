@@ -53,7 +53,9 @@ impl KonoNode {
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr().context("failed to read local UDP address")
+        self.socket
+            .local_addr()
+            .context("failed to read local UDP address")
     }
 
     pub async fn run(mut self) -> Result<()> {
