@@ -860,9 +860,7 @@ impl KonoNode {
                 }
             }
             MessageBody::Pong { token } => {
-                if self.peers.contains_key(&source)
-                    && !self.confirmed_sessions.contains(&source)
-                {
+                if self.peers.contains_key(&source) && !self.confirmed_sessions.contains(&source) {
                     self.record_peer(&envelope, source);
                     debug!(peer = %sender_node_id, %source, token, "pong received");
                 }
