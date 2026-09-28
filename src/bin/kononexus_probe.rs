@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time;
 
@@ -20,7 +21,7 @@ struct Args {
     peers: Vec<SocketAddr>,
 
     #[arg(long)]
-    identity: PathBuf,
+    identity: Option<PathBuf>,
 
     #[arg(long)]
     routing_cache: Option<PathBuf>,
@@ -34,12 +35,23 @@ struct Args {
     #[arg(long)]
     message: Option<String>,
 
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 3600)]
     run_seconds: u64,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!();
+        eprintln!("KONONEXUS ERROR: {error:#}");
+        eprintln!();
+        eprintln!("Nacisnij ENTER aby zamknac okno...");
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+    }
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -50,8 +62,15 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let identity_path = args.identity.unwrap_or(default_identity_path()?);
 
-    let mut config = KonofixSdkConfig::new(args.identity.clone())
+    println!("===============================================");
+    println!(" KonoNexus 0.1.0-alpha.15.1 TEST PROBE");
+    println!(" Windows / multi-PC network test");
+    println!("===============================================");
+    println!("IDENTITY={}", identity_path.display());
+
+    let mut config = KonofixSdkConfig::new(identity_path.clone())
         .with_bind(args.bind)
         .with_seed_peers(args.peers)
         .with_hello_interval(Duration::from_secs(args.hello_interval.max(1)))
@@ -65,9 +84,15 @@ async fn main() -> Result<()> {
         .await
         .context("failed to start KonoNexus probe")?;
 
+    println!();
     println!("NODE_ID={}", transport.node_id());
     println!("LOCAL_ADDR={}", transport.local_addr());
     println!("READY=1");
+    println!();
+    println!("Zostaw to okno otwarte.");
+    println!("Skopiuj NODE_ID i podeslij go do testu drugiego PC.");
+    println!("Aby zakonczyc: Ctrl+C albo zamknij okno.");
+    println!();
 
     if let (Some(target), Some(message)) = (args.target, args.message) {
         let message_id = transport
@@ -126,4 +151,12 @@ async fn main() -> Result<()> {
 
     transport.shutdown().await;
     Ok(())
+}
+
+fn default_identity_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot locate kononexus_probe.exe")?;
+    Ok(exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("kononexus-probe.key"))
 }
