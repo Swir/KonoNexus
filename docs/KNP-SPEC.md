@@ -6,7 +6,7 @@ Status: **Draft 0.1 / experimental**
 
 KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Alpha.13 adds explicit RelayApp delivery-failure events, bounded direct-session handshake retransmission with cached responder ACKs, responder-side confirmation before deferred encrypted control traffic is flushed, and bounded alternate relay selection across existing encrypted peers. Full persistent k-bucket state, endpoint attestations, broad convergence testing, route migration, session key rotation, and robust NAT/filtering validation are not complete.
+Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Alpha.13 adds explicit RelayApp delivery-failure events, bounded direct-session handshake retransmission with cached responder ACKs, responder-side confirmation before deferred encrypted control traffic is flushed, and bounded alternate relay selection across existing encrypted peers. Alpha.14 adds periodic fresh-X25519 rekey for direct KNP sessions with previous-session grace, plus NodeID-centric RelayApp transport migration that prefers confirmed direct sessions and falls back to relay E2E without resetting application message state. Relay-inner periodic rekey, full persistent k-bucket state, endpoint attestations, broad convergence testing, multi-network validation, and production hardening are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -216,6 +216,29 @@ The responder may derive and store the session immediately, but it does not trea
 
 Automatic relay fallback is bounded to three distinct currently encrypted peers. The last rendezvous coordinator is preferred when available. A rejection or failed candidate advances the fallback state to another encrypted peer without retrying the same endpoint. The fallback state expires after 30 seconds and is removed immediately when either a direct peer session or a relay path to the target becomes active.
 
-## 23. Versioning
+## 23. Direct-session rekey
+
+Direct KNP session rotation is initiated only by the endpoint with the lexicographically lower NodeID. A confirmed session becomes eligible for rekey after approximately ten minutes.
+
+The initiator creates a fresh X25519 ephemeral key and sends encrypted `SessionRekeyInit(rekey_id, ephemeral_public_key)` through the existing current session. The same rekey ID and ephemeral key are reused for retry attempts. Retry cadence is one second with at most four sends.
+
+The responder derives a new session with the existing authenticated identity-bound X25519/HKDF schedule and sends `SessionRekeyAck` encrypted specifically through the session ID that carried the init. Matching ACK state is cached for ten seconds so a duplicate init caused by a lost ACK receives the same responder ephemeral public key rather than creating a divergent key agreement.
+
+After a valid ACK, the initiator derives the same new session. Both sides switch ordinary sends to the new session immediately and retain the previous session for a 30-second grace window. During that window the old session may decrypt authenticated in-flight frames; the responder may also use it to resend a cached rekey ACK. After expiry, old session keys are dropped/zeroized with the normal `SecureSession` lifecycle.
+
+This periodic rekey currently applies to direct KNP sessions. Relay-inner E2E session rotation is not yet included.
+
+## 24. NodeID-centric application path migration
+
+RelayApp message state is independent from a particular network path. For each outgoing application fragment or ACK, the runtime chooses:
+
+1. confirmed direct KNP transport when available;
+2. otherwise an active relay E2E circuit for the same peer NodeID.
+
+Because message IDs, reassembly state, delivery ACKs, retransmission state, and deduplication are keyed by peer identity/message rather than path, transport may change between fragments or retries without restarting the application message. Direct transport is preferred automatically as soon as it becomes confirmed. If direct transport disappears while a relay E2E path remains active, later sends may use relay.
+
+This migration currently covers RelayApp application traffic. Full migration of all KNP control-plane responsibilities and multi-relay route switching remain future work.
+
+## 25. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
