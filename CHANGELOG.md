@@ -4,6 +4,15 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added automatic bounded rendezvous coordinator selection across existing encrypted peers.
+- Added explicit rendezvous-miss responses and automatic retry/cooldown behavior.
+- Added per-requester rendezvous and filtering-test cooldowns.
+- Added consent-based endpoint-independent filtering evidence using short-lived Ed25519 authorization.
+- Bound filter authorization to the tested NodeID/public key, exact coordinator-observed endpoint, helper NodeID, and random token.
+- Added positive filtering-evidence tracking while keeping negative results inconclusive.
+- Added CLI controls `--connect-node` and `--filter-test` for controlled validation.
+- Bumped the implementation package to 0.1.0-alpha.6.
+
 - Added a bounded seven-attempt UDP punch burst with increasing retry delays and a five-second authorization window.
 - Added a 50 ms punch scheduler independent of the slower discovery timer.
 - Added a hard limit of 128 pending punch schedules and deterministic expiry reporting.
