@@ -1039,11 +1039,7 @@ impl KonoNode {
                 let Some(slot) = self.sessions.get_mut(&source) else {
                     return Ok(());
                 };
-                slot.rotate(
-                    new_session,
-                    Instant::now(),
-                    SESSION_REKEY_GRACE,
-                )?;
+                slot.rotate(new_session, Instant::now(), SESSION_REKEY_GRACE)?;
                 self.last_rekey.insert(source, Instant::now());
 
                 info!(
