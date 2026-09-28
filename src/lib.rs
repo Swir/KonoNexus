@@ -29,8 +29,8 @@ pub use relay::{
     MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL,
 };
 pub use relay_e2e::{
-    accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind,
-    RelayE2eInitiator, RelayInnerPacket, MAX_RELAY_INNER_PACKET_BYTES,
+    accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
+    RelayInnerPacket, MAX_RELAY_INNER_PACKET_BYTES,
 };
 pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 pub use routing_cache::{
