@@ -193,9 +193,7 @@ impl RelayAppManager {
         let mut drop_indices = Vec::new();
 
         for (index, message) in self.outbound.iter_mut().enumerate() {
-            if !message.awaiting_ack
-                || !message.retry_at.is_some_and(|retry_at| retry_at <= now)
-            {
+            if !message.awaiting_ack || !message.retry_at.is_some_and(|retry_at| retry_at <= now) {
                 continue;
             }
 
@@ -586,11 +584,7 @@ mod tests {
             RelayAppReceiveStatus::DuplicateCompleted
         );
         sender
-            .mark_fragment_sent(
-                message_id,
-                outbound.fragment.fragment_index,
-                retry_at,
-            )
+            .mark_fragment_sent(message_id, outbound.fragment.fragment_index, retry_at)
             .unwrap();
 
         assert!(receiver.take_completed().is_empty());
