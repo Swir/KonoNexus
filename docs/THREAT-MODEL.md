@@ -1,71 +1,58 @@
 # KonoNexus Threat Model — Draft
 
-KonoNexus should assume that the public Internet and arbitrary relay nodes are hostile.
-
-## Assets
-
-- long-term node identity keys,
-- ephemeral X25519 secrets,
-- derived session keys,
-- application message confidentiality,
-- peer authenticity,
-- availability and routing integrity,
-- user metadata.
-
-## Adversaries considered
-
-- passive network observers,
-- active packet injectors,
-- malicious peers,
-- malicious relay nodes,
-- replay attackers,
-- identity impersonators,
-- Sybil participants,
-- peers attempting resource exhaustion,
-- attackers spoofing UDP source addresses to cause reflected traffic.
+KonoNexus assumes that the public Internet, arbitrary peers, and future relay nodes may be hostile.
 
 ## Alpha protections already present
 
-- Ed25519 identity keys,
-- NodeID bound to public key,
-- signatures over KNP control envelopes,
-- explicit protocol version,
-- datagram size ceiling,
-- bounded timestamp/nonce replay filtering,
-- stateless HMAC endpoint cookies before new inbound peer admission,
-- bounded active peer table with oldest-peer eviction,
+- Ed25519 node identity and signed outer envelopes,
+- NodeID/public-key binding,
+- timestamp and nonce replay filtering,
+- stateless endpoint cookies before ordinary inbound admission,
+- bounded peer/replay/NAT-observation state,
 - authenticated ephemeral X25519 key agreement,
-- all-zero X25519 shared-secret rejection,
-- HKDF-SHA256 transcript-bound directional key derivation,
+- HKDF-SHA256 directional key derivation,
 - ChaCha20-Poly1305 secure frames,
-- authenticated session/sequence AEAD associated data,
-- monotonic secure-frame replay rejection,
-- session keys zeroized when the in-memory session is dropped,
-- unverified packets rejected before peer acceptance.
+- encrypted rendezvous request/offer messages,
+- punch authorization bound to both a random short-lived token and expected signed NodeID,
+- direct endpoint migration only after authenticated control,
+- session keys zeroized when sessions are dropped.
+
+## NAT/rendezvous threats considered
+
+- forged endpoint offers,
+- UDP source spoofing,
+- reflection/amplification,
+- unsolicited punch traffic,
+- malicious coordinators,
+- stale punch tokens,
+- peer endpoint changes.
+
+A malicious coordinator can give peers incorrect candidate endpoints or refuse rendezvous. It cannot forge the target peer's Ed25519 identity or complete the target peer's X25519 session. KNP therefore treats rendezvous as a reachability hint, not identity authority.
+
+Punch packets are accepted only for a pending token delivered over an encrypted coordinator session and for the expected signed NodeID. Pending punch authorizations expire.
 
 ## Current limitations
 
-- secure-frame receive ordering is strict and may reject valid reordered UDP packets,
-- session handshakes do not yet have a dedicated retransmission/timeout state machine,
-- session keys are not yet periodically rotated,
-- secure sessions have automated tests but no independent security audit,
-- metadata such as peer IP endpoints remains observable to network participants on the path.
+- one-shot hole punching is not yet resilient to timing differences,
+- no port-prediction strategy exists,
+- NAT mapping evidence does not yet characterize filtering behavior,
+- session receive ordering remains strict,
+- session key rotation is not implemented,
+- no independent security audit has been completed.
 
 ## Required before production
 
-- handshake timeout/retransmission hardening,
-- bounded sliding replay windows for encrypted UDP frames,
-- session key rotation and teardown,
-- rate limits per endpoint and identity,
-- secure identity-key file permissions on each supported OS,
-- load testing and audit of replay/cookie/session state limits,
-- DHT record signatures and expiry,
-- Sybil resistance / routing diversity,
+- timed punch bursts/retry/backoff,
+- rate limiting of rendezvous and punch attempts,
+- bounded sliding anti-replay windows for UDP reordering,
+- handshake retransmission and session key rotation,
+- DHT signature/expiry rules and Sybil mitigation,
 - relay abuse controls,
-- fuzzing of wire and encrypted-frame parsers,
-- dependency and supply-chain scanning,
+- secure key-file permissions,
+- parser fuzzing and dependency scanning,
+- load testing,
 - independent security review.
 
 ## Non-goals
 
-KNP cannot make an endpoint safe after the endpoint itself is compromised. It also cannot guarantee a connection when there is no physical Internet path and no reachable cooperative peer.
+KNP cannot guarantee a direct path through every NAT. When direct traversal is impossible, a cooperative encrypted relay path is required. KNP also cannot protect an endpoint after that endpoint itself is compromised.

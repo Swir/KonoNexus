@@ -33,6 +33,13 @@ pub enum MessageBody {
         sequence: u64,
         ciphertext: String,
     },
+    PunchProbe {
+        punch_token: u64,
+    },
+    PunchAck {
+        punch_token: u64,
+        observed_endpoint: String,
+    },
     Ping {
         token: u64,
     },

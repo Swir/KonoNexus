@@ -1,4 +1,5 @@
 use crate::identity::NodeIdentity;
+use crate::nat::{NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::security::{CookieGuard, ReplayGuard};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
@@ -13,6 +14,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 const MAX_ACTIVE_PEERS: usize = 2_048;
+const PUNCH_AUTH_TTL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -22,6 +24,13 @@ pub struct PeerInfo {
     pub first_seen: Instant,
     pub last_seen: Instant,
     pub observed_external_endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPunch {
+    expected_node_id: String,
+    candidate_endpoint: SocketAddr,
+    expires_at: Instant,
 }
 
 pub struct KonoNode {
@@ -34,6 +43,9 @@ pub struct KonoNode {
     cookie_guard: CookieGuard,
     pending_sessions: HashMap<SocketAddr, PendingHandshake>,
     sessions: HashMap<SocketAddr, SecureSession>,
+    nat_profile: NatProfile,
+    pending_punches: HashMap<u64, PendingPunch>,
+    queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
     hello_interval: Duration,
 }
 
@@ -58,8 +70,18 @@ impl KonoNode {
             cookie_guard: CookieGuard::default(),
             pending_sessions: HashMap::new(),
             sessions: HashMap::new(),
+            nat_profile: NatProfile::default(),
+            pending_punches: HashMap::new(),
+            queued_rendezvous: HashMap::new(),
             hello_interval,
         })
+    }
+
+    pub fn queue_rendezvous(&mut self, coordinator: SocketAddr, target_node_id: String) {
+        self.queued_rendezvous
+            .entry(coordinator)
+            .or_default()
+            .push(target_node_id);
     }
 
     pub fn node_id(&self) -> String {
@@ -70,6 +92,14 @@ impl KonoNode {
         self.socket
             .local_addr()
             .context("failed to read local UDP address")
+    }
+
+    pub fn nat_behavior(&self) -> NatMappingBehavior {
+        self.nat_profile.behavior()
+    }
+
+    pub fn observed_external_endpoint(&self) -> Option<SocketAddr> {
+        self.nat_profile.preferred_endpoint()
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -104,7 +134,7 @@ impl KonoNode {
                 _ = ticker.tick() => {
                     self.refresh_discovery().await;
                     self.ping_known_peers().await;
-                    self.expire_stale_peers();
+                    self.expire_stale_state();
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("shutdown requested");
@@ -185,6 +215,18 @@ impl KonoNode {
                 if let Some(peer) = self.peers.get_mut(&source) {
                     peer.observed_external_endpoint = Some(observed_endpoint.clone());
                 }
+
+                if let Ok(observed) = observed_endpoint.parse::<SocketAddr>() {
+                    self.nat_profile.observe(sender_node_id.clone(), observed);
+                    info!(
+                        observer = %sender_node_id,
+                        observed = %observed,
+                        observations = self.nat_profile.observation_count(),
+                        nat_mapping = ?self.nat_profile.behavior(),
+                        "updated NAT mapping observations"
+                    );
+                }
+
                 info!(
                     peer = %sender_node_id,
                     endpoint = %source,
@@ -238,6 +280,8 @@ impl KonoNode {
                     %session_id,
                     "encrypted KNP session established as responder"
                 );
+
+                self.flush_rendezvous_requests(source).await?;
             }
             MessageBody::SessionAck {
                 handshake_id,
@@ -277,6 +321,8 @@ impl KonoNode {
                     %session_id,
                     "encrypted KNP session established as initiator"
                 );
+
+                self.flush_rendezvous_requests(source).await?;
             }
             MessageBody::Encrypted {
                 session_id,
@@ -296,18 +342,67 @@ impl KonoNode {
                     }
                 };
 
-                match payload {
-                    SecurePayload::Ping { token } => {
-                        if let Some(response) =
-                            self.secure_message(source, SecurePayload::Pong { token })?
-                        {
-                            self.send(source, response).await?;
-                        }
-                    }
-                    SecurePayload::Pong { token } => {
-                        debug!(peer = %sender_node_id, %source, token, "secure pong received");
-                    }
+                self.handle_secure_payload(source, &sender_node_id, payload)
+                    .await?;
+            }
+            MessageBody::PunchProbe { punch_token } => {
+                if !self.authorize_punch(punch_token, &sender_node_id) {
+                    debug!(
+                        peer = %sender_node_id,
+                        %source,
+                        punch_token,
+                        "ignoring unauthorized punch probe"
+                    );
+                    return Ok(());
                 }
+
+                self.record_peer(&envelope, source);
+                self.pending_punches.remove(&punch_token);
+
+                self.send(
+                    source,
+                    MessageBody::PunchAck {
+                        punch_token,
+                        observed_endpoint: source.to_string(),
+                    },
+                )
+                .await?;
+
+                info!(
+                    peer = %sender_node_id,
+                    %source,
+                    punch_token,
+                    "direct UDP punch probe accepted"
+                );
+
+                self.maybe_start_session(source, &sender_node_id).await?;
+            }
+            MessageBody::PunchAck {
+                punch_token,
+                observed_endpoint,
+            } => {
+                if !self.authorize_punch(punch_token, &sender_node_id) {
+                    debug!(
+                        peer = %sender_node_id,
+                        %source,
+                        punch_token,
+                        "ignoring unauthorized punch ack"
+                    );
+                    return Ok(());
+                }
+
+                self.record_peer(&envelope, source);
+                self.pending_punches.remove(&punch_token);
+
+                info!(
+                    peer = %sender_node_id,
+                    %source,
+                    %observed_endpoint,
+                    punch_token,
+                    "direct UDP punch acknowledged"
+                );
+
+                self.maybe_start_session(source, &sender_node_id).await?;
             }
             MessageBody::Ping { token } => {
                 if self.peers.contains_key(&source) && !self.sessions.contains_key(&source) {
@@ -324,6 +419,147 @@ impl KonoNode {
         }
 
         Ok(())
+    }
+
+    async fn handle_secure_payload(
+        &mut self,
+        source: SocketAddr,
+        sender_node_id: &str,
+        payload: SecurePayload,
+    ) -> Result<()> {
+        match payload {
+            SecurePayload::Ping { token } => {
+                if let Some(response) =
+                    self.secure_message(source, SecurePayload::Pong { token })?
+                {
+                    self.send(source, response).await?;
+                }
+            }
+            SecurePayload::Pong { token } => {
+                debug!(peer = %sender_node_id, %source, token, "secure pong received");
+            }
+            SecurePayload::RendezvousRequest { target_node_id } => {
+                self.handle_rendezvous_request(source, sender_node_id, &target_node_id)
+                    .await?;
+            }
+            SecurePayload::RendezvousOffer {
+                peer_node_id,
+                candidate_endpoint,
+                punch_token,
+            } => {
+                let candidate = match candidate_endpoint.parse::<SocketAddr>() {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        debug!(%error, %candidate_endpoint, "invalid rendezvous candidate");
+                        return Ok(());
+                    }
+                };
+
+                self.pending_punches.insert(
+                    punch_token,
+                    PendingPunch {
+                        expected_node_id: peer_node_id.clone(),
+                        candidate_endpoint: candidate,
+                        expires_at: Instant::now() + PUNCH_AUTH_TTL,
+                    },
+                );
+
+                self.send(candidate, MessageBody::PunchProbe { punch_token })
+                    .await?;
+
+                info!(
+                    peer = %peer_node_id,
+                    %candidate,
+                    punch_token,
+                    coordinator = %sender_node_id,
+                    "started direct UDP punch attempt"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_rendezvous_request(
+        &mut self,
+        requester_endpoint: SocketAddr,
+        requester_node_id: &str,
+        target_node_id: &str,
+    ) -> Result<()> {
+        let Some(target_endpoint) = self.peer_endpoint_by_node_id(target_node_id) else {
+            debug!(
+                requester = %requester_node_id,
+                target = %target_node_id,
+                "rendezvous target is not known to coordinator"
+            );
+            return Ok(());
+        };
+
+        if !self.sessions.contains_key(&target_endpoint) {
+            debug!(
+                requester = %requester_node_id,
+                target = %target_node_id,
+                "rendezvous target has no encrypted coordinator session"
+            );
+            return Ok(());
+        }
+
+        let punch_token = random();
+        let requester_offer = SecurePayload::RendezvousOffer {
+            peer_node_id: target_node_id.to_owned(),
+            candidate_endpoint: target_endpoint.to_string(),
+            punch_token,
+        };
+        let target_offer = SecurePayload::RendezvousOffer {
+            peer_node_id: requester_node_id.to_owned(),
+            candidate_endpoint: requester_endpoint.to_string(),
+            punch_token,
+        };
+
+        if let Some(message) = self.secure_message(requester_endpoint, requester_offer)? {
+            self.send(requester_endpoint, message).await?;
+        }
+        if let Some(message) = self.secure_message(target_endpoint, target_offer)? {
+            self.send(target_endpoint, message).await?;
+        }
+
+        info!(
+            requester = %requester_node_id,
+            target = %target_node_id,
+            punch_token,
+            "coordinated decentralized UDP rendezvous"
+        );
+
+        Ok(())
+    }
+
+    async fn flush_rendezvous_requests(&mut self, coordinator: SocketAddr) -> Result<()> {
+        let Some(targets) = self.queued_rendezvous.remove(&coordinator) else {
+            return Ok(());
+        };
+
+        for target_node_id in targets {
+            let payload = SecurePayload::RendezvousRequest {
+                target_node_id: target_node_id.clone(),
+            };
+            if let Some(message) = self.secure_message(coordinator, payload)? {
+                self.send(coordinator, message).await?;
+                info!(
+                    %coordinator,
+                    target = %target_node_id,
+                    "requested decentralized rendezvous"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn authorize_punch(&self, token: u64, sender_node_id: &str) -> bool {
+        self.pending_punches.get(&token).is_some_and(|pending| {
+            pending.expected_node_id == sender_node_id
+                && pending.expires_at > Instant::now()
+        })
     }
 
     async fn maybe_start_session(&mut self, target: SocketAddr, peer_node_id: &str) -> Result<()> {
@@ -369,6 +605,13 @@ impl KonoNode {
         }))
     }
 
+    fn peer_endpoint_by_node_id(&self, node_id: &str) -> Option<SocketAddr> {
+        self.peers
+            .iter()
+            .find(|(_, peer)| peer.node_id == node_id)
+            .map(|(endpoint, _)| *endpoint)
+    }
+
     fn is_expected_endpoint(&self, source: SocketAddr) -> bool {
         self.bootstrap_peers.contains(&source)
             || self.peers.contains_key(&source)
@@ -376,6 +619,21 @@ impl KonoNode {
     }
 
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
+        let previous_endpoint = self
+            .peers
+            .iter()
+            .find(|(endpoint, peer)| {
+                **endpoint != source && peer.node_id == envelope.sender_node_id
+            })
+            .map(|(endpoint, _)| *endpoint);
+
+        if let Some(previous_endpoint) = previous_endpoint {
+            self.peers.remove(&previous_endpoint);
+            self.cookie_cache.remove(&previous_endpoint);
+            self.pending_sessions.remove(&previous_endpoint);
+            self.sessions.remove(&previous_endpoint);
+        }
+
         if let Some(existing) = self.peers.get(&source) {
             if existing.node_id != envelope.sender_node_id {
                 self.sessions.remove(&source);
@@ -462,7 +720,7 @@ impl KonoNode {
         }
     }
 
-    fn expire_stale_peers(&mut self) {
+    fn expire_stale_state(&mut self) {
         let max_age = self.hello_interval.saturating_mul(4);
         let before = self.peers.len();
         self.peers
@@ -475,6 +733,8 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.sessions
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
+        self.pending_punches
+            .retain(|_, pending| pending.expires_at > Instant::now());
 
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
@@ -501,6 +761,9 @@ fn local_features() -> Vec<String> {
         "cookie-challenge".to_owned(),
         "x25519-hkdf-session".to_owned(),
         "chacha20poly1305-aead".to_owned(),
+        "nat-observation".to_owned(),
+        "decentralized-rendezvous".to_owned(),
+        "udp-punch-probe".to_owned(),
         "secure-ping-pong".to_owned(),
     ]
 }

@@ -20,6 +20,14 @@ const FRAME_CONTEXT: &[u8] = b"knp-secure-frame-v1";
 pub enum SecurePayload {
     Ping { token: u64 },
     Pong { token: u64 },
+    RendezvousRequest {
+        target_node_id: String,
+    },
+    RendezvousOffer {
+        peer_node_id: String,
+        candidate_endpoint: String,
+        punch_token: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
