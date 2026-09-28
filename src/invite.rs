@@ -59,11 +59,17 @@ impl InviteCode {
         if payload.len() > MAX_INVITE_CODE_BYTES {
             bail!("invite is too large");
         }
-        Ok(format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(payload)))
+        Ok(format!(
+            "{INVITE_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(payload)
+        ))
     }
 
     pub fn decode(code: &str) -> Result<Self> {
-        let compact: String = code.chars().filter(|character| !character.is_whitespace()).collect();
+        let compact: String = code
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
         let encoded = compact
             .strip_prefix(INVITE_PREFIX)
             .context("invite must start with KNX1.")?;
@@ -105,7 +111,8 @@ impl InviteCode {
         }
         normalize_endpoints(parsed)?;
 
-        let public_key_raw = hex::decode(&self.public_key).context("invite public key is invalid")?;
+        let public_key_raw =
+            hex::decode(&self.public_key).context("invite public key is invalid")?;
         let public_key: [u8; PUBLIC_KEY_LEN] = public_key_raw
             .try_into()
             .map_err(|_| anyhow!("invite public key must be 32 bytes"))?;
@@ -173,7 +180,10 @@ mod tests {
         let identity = NodeIdentity::generate();
         let invite = InviteCode::signed(
             &identity,
-            vec!["192.168.1.10:47000".parse().unwrap(), "203.0.113.5:47000".parse().unwrap()],
+            vec![
+                "192.168.1.10:47000".parse().unwrap(),
+                "203.0.113.5:47000".parse().unwrap(),
+            ],
         )
         .unwrap();
         let decoded = InviteCode::decode(&invite.encode().unwrap()).unwrap();
@@ -184,11 +194,8 @@ mod tests {
     #[test]
     fn tampered_invite_is_rejected() {
         let identity = NodeIdentity::generate();
-        let mut invite = InviteCode::signed(
-            &identity,
-            vec!["192.168.1.10:47000".parse().unwrap()],
-        )
-        .unwrap();
+        let mut invite =
+            InviteCode::signed(&identity, vec!["192.168.1.10:47000".parse().unwrap()]).unwrap();
         invite.endpoints[0] = "198.51.100.4:47000".into();
         assert!(invite.encode().is_err());
     }

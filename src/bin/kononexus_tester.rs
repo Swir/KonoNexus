@@ -117,7 +117,7 @@ impl TesterApp {
     }
 
     fn poll_events(&mut self) {
-        for event in self.event_rx.try_iter() {
+        while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 WorkerEvent::Ready { node_id, invite } => {
                     self.node_id = node_id;
@@ -151,7 +151,10 @@ impl TesterApp {
                 WorkerEvent::TestProgress { delivered, sent } => {
                     self.progress = (delivered, sent);
                 }
-                WorkerEvent::TestFinished { rtt_ms, packet_loss } => {
+                WorkerEvent::TestFinished {
+                    rtt_ms,
+                    packet_loss,
+                } => {
                     self.rtt_ms = Some(rtt_ms);
                     self.packet_loss = Some(packet_loss);
                     if packet_loss < 100.0 {
@@ -176,7 +179,8 @@ impl TesterApp {
     }
 
     fn push_log(&mut self, message: impl Into<String>) {
-        self.logs.push(format!("[{:02}] {}", self.logs.len() + 1, message.into()));
+        self.logs
+            .push(format!("[{:02}] {}", self.logs.len() + 1, message.into()));
         if self.logs.len() > 300 {
             self.logs.drain(..50);
         }
@@ -219,7 +223,9 @@ impl TesterApp {
             self.status = UiStatus::Testing;
             let _ = self.command_tx.send(Command::StartTest);
         } else {
-            self.error = Some("Najpierw wklej invite z drugiego komputera albo poczekaj na połączenie.".into());
+            self.error = Some(
+                "Najpierw wklej invite z drugiego komputera albo poczekaj na połączenie.".into(),
+            );
         }
     }
 
@@ -254,16 +260,35 @@ impl eframe::App for TesterApp {
         ctx.request_repaint_after(Duration::from_millis(100));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(8, 13, 27)).inner_margin(24.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(8, 13, 27))
+                    .inner_margin(24.0),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("KONONEXUS").size(12.0).color(Color32::from_rgb(83, 215, 255)).strong());
-                        ui.label(RichText::new("Network Tester").size(28.0).color(Color32::WHITE).strong());
+                        ui.label(
+                            RichText::new("KONONEXUS")
+                                .size(12.0)
+                                .color(Color32::from_rgb(83, 215, 255))
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new("Network Tester")
+                                .size(28.0)
+                                .color(Color32::WHITE)
+                                .strong(),
+                        );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("alpha.16  •  Windows x64  •  UDP 47000\ncore {APP_VERSION}"))
-                            .size(11.0).color(Color32::from_rgb(122, 139, 171)));
+                        ui.label(
+                            RichText::new(format!(
+                                "alpha.16  •  Windows x64  •  UDP 47000\ncore {APP_VERSION}"
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(122, 139, 171)),
+                        );
                     });
                 });
                 ui.add_space(18.0);
@@ -282,60 +307,111 @@ impl eframe::App for TesterApp {
 
                 ui.horizontal(|ui| {
                     let enabled = self.target_node_id.is_some() && self.status != UiStatus::Testing;
-                    let button = egui::Button::new(RichText::new("▶  START TESTU WAN").size(16.0).strong())
-                        .fill(Color32::from_rgb(21, 132, 225))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(89, 207, 255)))
-                        .min_size(Vec2::new(230.0, 46.0));
+                    let button =
+                        egui::Button::new(RichText::new("▶  START TESTU WAN").size(16.0).strong())
+                            .fill(Color32::from_rgb(21, 132, 225))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(89, 207, 255)))
+                            .min_size(Vec2::new(230.0, 46.0));
                     if ui.add_enabled(enabled, button).clicked() {
                         self.start_test();
                     }
                     if self.status == UiStatus::Testing {
-                        ui.add(egui::ProgressBar::new(self.progress.0 as f32 / TEST_SAMPLE_COUNT as f32)
-                            .text(format!("Potwierdzone: {} / {}", self.progress.0, self.progress.1))
-                            .desired_width(280.0));
+                        ui.add(
+                            egui::ProgressBar::new(
+                                self.progress.0 as f32 / TEST_SAMPLE_COUNT as f32,
+                            )
+                            .text(format!(
+                                "Potwierdzone: {} / {}",
+                                self.progress.0, self.progress.1
+                            ))
+                            .desired_width(280.0),
+                        );
                     }
                 });
 
                 if let Some(error) = &self.error {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(error).color(Color32::from_rgb(255, 118, 133)).strong());
+                    ui.label(
+                        RichText::new(error)
+                            .color(Color32::from_rgb(255, 118, 133))
+                            .strong(),
+                    );
                 }
 
                 ui.add_space(8.0);
-                egui::CollapsingHeader::new(RichText::new("Szczegóły techniczne i log").color(Color32::from_rgb(167, 185, 216)))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        technical_details(ui, self);
-                        ui.separator();
-                        egui::ScrollArea::vertical().max_height(150.0).stick_to_bottom(true).show(ui, |ui| {
+                egui::CollapsingHeader::new(
+                    RichText::new("Szczegóły techniczne i log")
+                        .color(Color32::from_rgb(167, 185, 216)),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    technical_details(ui, self);
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
                             for line in &self.logs {
-                                ui.label(RichText::new(line).monospace().size(11.0).color(Color32::from_rgb(150, 169, 202)));
+                                ui.label(
+                                    RichText::new(line)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(150, 169, 202)),
+                                );
                             }
                         });
-                    });
+                });
             });
     }
 }
 
 fn status_card(ui: &mut egui::Ui, app: &TesterApp) {
     let (title, subtitle, color) = match app.status {
-        UiStatus::Starting => ("URUCHAMIANIE…", "Inicjalizacja bezpiecznej tożsamości i UDP", Color32::from_rgb(113, 151, 220)),
-        UiStatus::Waiting => ("GOTOWY", "Skopiuj invite na drugi komputer albo wklej otrzymany kod", Color32::from_rgb(69, 193, 255)),
-        UiStatus::Connecting => ("ŁĄCZENIE…", "DIRECT → UDP HOLE PUNCH → RELAY", Color32::from_rgb(83, 174, 255)),
-        UiStatus::Testing => ("TESTOWANIE…", "Szyfrowane próbki i potwierdzenia dostawy", Color32::from_rgb(83, 174, 255)),
-        UiStatus::Connected => ("CONNECTED  ✓", "KNP potwierdził dostawę end-to-end", Color32::from_rgb(68, 211, 155)),
-        UiStatus::Failed => ("FAILED  ✕", "Sprawdź szczegóły techniczne poniżej", Color32::from_rgb(255, 101, 122)),
+        UiStatus::Starting => (
+            "URUCHAMIANIE…",
+            "Inicjalizacja bezpiecznej tożsamości i UDP",
+            Color32::from_rgb(113, 151, 220),
+        ),
+        UiStatus::Waiting => (
+            "GOTOWY",
+            "Skopiuj invite na drugi komputer albo wklej otrzymany kod",
+            Color32::from_rgb(69, 193, 255),
+        ),
+        UiStatus::Connecting => (
+            "ŁĄCZENIE…",
+            "DIRECT → UDP HOLE PUNCH → RELAY",
+            Color32::from_rgb(83, 174, 255),
+        ),
+        UiStatus::Testing => (
+            "TESTOWANIE…",
+            "Szyfrowane próbki i potwierdzenia dostawy",
+            Color32::from_rgb(83, 174, 255),
+        ),
+        UiStatus::Connected => (
+            "CONNECTED  ✓",
+            "KNP potwierdził dostawę end-to-end",
+            Color32::from_rgb(68, 211, 155),
+        ),
+        UiStatus::Failed => (
+            "FAILED  ✕",
+            "Sprawdź szczegóły techniczne poniżej",
+            Color32::from_rgb(255, 101, 122),
+        ),
     };
     egui::Frame::new()
         .fill(Color32::from_rgb(15, 25, 47))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.65)))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
         .corner_radius(14.0)
         .inner_margin(18.0)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(RichText::new(title).size(30.0).color(color).strong());
-                    ui.label(RichText::new(subtitle).size(13.0).color(Color32::from_rgb(171, 188, 218)));
+                    ui.label(
+                        RichText::new(subtitle)
+                            .size(13.0)
+                            .color(Color32::from_rgb(171, 188, 218)),
+                    );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (path, path_color) = app.path_label();
@@ -347,15 +423,27 @@ fn status_card(ui: &mut egui::Ui, app: &TesterApp) {
 
 fn invite_creator(ui: &mut egui::Ui, app: &mut TesterApp, ctx: &egui::Context) {
     card(ui, |ui| {
-        ui.label(RichText::new("PC A — UTWÓRZ INVITE").strong().color(Color32::from_rgb(92, 211, 255)));
+        ui.label(
+            RichText::new("PC A — UTWÓRZ INVITE")
+                .strong()
+                .color(Color32::from_rgb(92, 211, 255)),
+        );
         ui.add_space(8.0);
-        ui.add(egui::TextEdit::multiline(&mut app.invite).desired_rows(3).font(egui::TextStyle::Monospace).interactive(false));
+        ui.add(
+            egui::TextEdit::multiline(&mut app.invite)
+                .desired_rows(3)
+                .font(egui::TextStyle::Monospace)
+                .interactive(false),
+        );
         ui.add_space(8.0);
         if ui.button("Kopiuj invite").clicked() {
             app.copy_invite(ctx);
         }
         let (text, color) = if app.has_wan_evidence() {
-            ("Publiczny endpoint potwierdzony przez peer evidence.", Color32::from_rgb(68, 211, 155))
+            (
+                "Publiczny endpoint potwierdzony przez peer evidence.",
+                Color32::from_rgb(68, 211, 155),
+            )
         } else {
             ("Brak publicznego endpoint evidence — kod zawiera bieżący adres lokalny. WAN wymaga osiągalnego peera/bootstrapu.", Color32::from_rgb(241, 181, 72))
         };
@@ -366,9 +454,18 @@ fn invite_creator(ui: &mut egui::Ui, app: &mut TesterApp, ctx: &egui::Context) {
 
 fn invite_joiner(ui: &mut egui::Ui, app: &mut TesterApp) {
     card(ui, |ui| {
-        ui.label(RichText::new("PC B — DOŁĄCZ I TESTUJ").strong().color(Color32::from_rgb(177, 132, 255)));
+        ui.label(
+            RichText::new("PC B — DOŁĄCZ I TESTUJ")
+                .strong()
+                .color(Color32::from_rgb(177, 132, 255)),
+        );
         ui.add_space(8.0);
-        ui.add(egui::TextEdit::multiline(&mut app.invite_input).desired_rows(3).hint_text("Wklej kod KNX1…").font(egui::TextStyle::Monospace));
+        ui.add(
+            egui::TextEdit::multiline(&mut app.invite_input)
+                .desired_rows(3)
+                .hint_text("Wklej kod KNX1…")
+                .font(egui::TextStyle::Monospace),
+        );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Wklej invite").clicked() {
@@ -379,15 +476,35 @@ fn invite_joiner(ui: &mut egui::Ui, app: &mut TesterApp) {
             }
         });
         ui.add_space(6.0);
-        ui.label(RichText::new("Kod jest podpisany Ed25519 i nie zawiera klucza prywatnego.").size(10.5).color(Color32::from_rgb(139, 156, 187)));
+        ui.label(
+            RichText::new("Kod jest podpisany Ed25519 i nie zawiera klucza prywatnego.")
+                .size(10.5)
+                .color(Color32::from_rgb(139, 156, 187)),
+        );
     });
 }
 
 fn metrics_row(ui: &mut egui::Ui, app: &TesterApp) {
     ui.columns(4, |columns| {
-        metric(&mut columns[0], "RTT / ping", app.rtt_ms.map(|v| format!("{v:.1} ms")).unwrap_or_else(|| "—".into()));
-        metric(&mut columns[1], "Packet loss", app.packet_loss.map(|v| format!("{v:.0}%")).unwrap_or_else(|| "—".into()));
-        let nat = app.snapshot.as_ref().map(|s| nat_label(s.nat_behavior)).unwrap_or("—");
+        metric(
+            &mut columns[0],
+            "RTT / ping",
+            app.rtt_ms
+                .map(|v| format!("{v:.1} ms"))
+                .unwrap_or_else(|| "—".into()),
+        );
+        metric(
+            &mut columns[1],
+            "Packet loss",
+            app.packet_loss
+                .map(|v| format!("{v:.0}%"))
+                .unwrap_or_else(|| "—".into()),
+        );
+        let nat = app
+            .snapshot
+            .as_ref()
+            .map(|s| nat_label(s.nat_behavior))
+            .unwrap_or("—");
         metric(&mut columns[2], "NAT evidence", nat.to_owned());
         let (path, _) = app.path_label();
         metric(&mut columns[3], "Wybrana ścieżka", path.to_owned());
@@ -395,41 +512,87 @@ fn metrics_row(ui: &mut egui::Ui, app: &TesterApp) {
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: String) {
-    egui::Frame::new().fill(Color32::from_rgb(13, 22, 42)).corner_radius(10.0).inner_margin(12.0).show(ui, |ui| {
-        ui.label(RichText::new(label).size(10.5).color(Color32::from_rgb(125, 144, 176)));
-        ui.label(RichText::new(value).size(17.0).color(Color32::WHITE).strong());
-    });
+    egui::Frame::new()
+        .fill(Color32::from_rgb(13, 22, 42))
+        .corner_radius(10.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(label)
+                    .size(10.5)
+                    .color(Color32::from_rgb(125, 144, 176)),
+            );
+            ui.label(
+                RichText::new(value)
+                    .size(17.0)
+                    .color(Color32::WHITE)
+                    .strong(),
+            );
+        });
 }
 
 fn technical_details(ui: &mut egui::Ui, app: &TesterApp) {
-    egui::Grid::new("technical-grid").striped(true).show(ui, |ui| {
-        detail(ui, "NodeID", if app.node_id.is_empty() { "—" } else { &app.node_id });
-        detail(ui, "Target NodeID", app.target_node_id.as_deref().unwrap_or("—"));
-        if let Some(snapshot) = &app.snapshot {
-            detail(ui, "Local UDP", &snapshot.local_addr.to_string());
-            detail(ui, "Endpoint evidence", &snapshot.observed_external_endpoint.map(|e| e.to_string()).unwrap_or_else(|| "brak".into()));
-            detail(ui, "NAT mapping", nat_label(snapshot.nat_behavior));
-            detail(ui, "NAT filtering", filtering_label(snapshot.filtering_evidence));
-            detail(ui, "Authenticated peers", &snapshot.authenticated_peers.to_string());
-            detail(ui, "DHT records", &snapshot.dht_records.to_string());
-            detail(ui, "Pending punches", &snapshot.pending_punches.to_string());
-            if let Some(path) = snapshot.active_paths.first() {
-                detail(ui, "Path endpoint", &path.endpoint.to_string());
+    egui::Grid::new("technical-grid")
+        .striped(true)
+        .show(ui, |ui| {
+            detail(
+                ui,
+                "NodeID",
+                if app.node_id.is_empty() {
+                    "—"
+                } else {
+                    &app.node_id
+                },
+            );
+            detail(
+                ui,
+                "Target NodeID",
+                app.target_node_id.as_deref().unwrap_or("—"),
+            );
+            if let Some(snapshot) = &app.snapshot {
+                detail(ui, "Local UDP", &snapshot.local_addr.to_string());
+                detail(
+                    ui,
+                    "Endpoint evidence",
+                    &snapshot
+                        .observed_external_endpoint
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "brak".into()),
+                );
+                detail(ui, "NAT mapping", nat_label(snapshot.nat_behavior));
+                detail(
+                    ui,
+                    "NAT filtering",
+                    filtering_label(snapshot.filtering_evidence),
+                );
+                detail(
+                    ui,
+                    "Authenticated peers",
+                    &snapshot.authenticated_peers.to_string(),
+                );
+                detail(ui, "DHT records", &snapshot.dht_records.to_string());
+                detail(ui, "Pending punches", &snapshot.pending_punches.to_string());
+                if let Some(path) = snapshot.active_paths.first() {
+                    detail(ui, "Path endpoint", &path.endpoint.to_string());
+                }
             }
-        }
-    });
+        });
 }
 
 fn detail(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(RichText::new(label).color(Color32::from_rgb(125, 144, 176)));
-    ui.label(RichText::new(value).monospace().color(Color32::from_rgb(210, 223, 244)));
+    ui.label(
+        RichText::new(value)
+            .monospace()
+            .color(Color32::from_rgb(210, 223, 244)),
+    );
     ui.end_row();
 }
 
 fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(Color32::from_rgb(13, 22, 42))
-        .stroke(Stroke::new(1.0, Color32::from_rgb(31, 49, 79)))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(31, 49, 79)))
         .corner_radius(12.0)
         .inner_margin(14.0)
         .show(ui, add_contents);
@@ -442,7 +605,10 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(22, 35, 61);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(31, 62, 100);
     style.visuals.widgets.active.bg_fill = Color32::from_rgb(25, 112, 183);
-    style.text_styles.insert(egui::TextStyle::Body, FontId::new(13.0, FontFamily::Proportional));
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        FontId::new(13.0, FontFamily::Proportional),
+    );
     ctx.set_style(style);
 }
 
@@ -469,7 +635,9 @@ fn spawn_worker(event_tx: Sender<WorkerEvent>) -> tokio_mpsc::UnboundedSender<Co
     std::thread::Builder::new()
         .name("kononexus-network-runtime".into())
         .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build();
             match runtime {
                 Ok(runtime) => {
                     if let Err(error) = runtime.block_on(worker(command_rx, event_tx.clone())) {
@@ -477,7 +645,9 @@ fn spawn_worker(event_tx: Sender<WorkerEvent>) -> tokio_mpsc::UnboundedSender<Co
                     }
                 }
                 Err(error) => {
-                    let _ = event_tx.send(WorkerEvent::Error(format!("Nie można uruchomić runtime: {error}")));
+                    let _ = event_tx.send(WorkerEvent::Error(format!(
+                        "Nie można uruchomić runtime: {error}"
+                    )));
                 }
             }
         })
@@ -671,7 +841,10 @@ fn main() -> eframe::Result<()> {
     }
     eframe::run_native(
         "KonoNexus Network Tester",
-        eframe::NativeOptions { viewport, ..Default::default() },
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
         Box::new(move |cc| Ok(Box::new(TesterApp::new(cc, command_tx, event_rx)))),
     )
 }

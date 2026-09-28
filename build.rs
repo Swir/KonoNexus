@@ -6,6 +6,8 @@ fn main() {
         resource.set("ProductName", "KonoNexus Network Tester");
         resource.set("FileDescription", "KonoNexus WAN / Internet Network Tester");
         resource.set("LegalCopyright", "KonoNexus contributors");
-        resource.compile().expect("failed to embed Windows resources");
+        resource
+            .compile()
+            .expect("failed to embed Windows resources");
     }
 }
