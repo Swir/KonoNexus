@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.5 — bounded hole-punch burst**. KNP now adds a timed, bounded UDP punch state machine on top of encrypted decentralized rendezvous. Each direct-path authorization sends a small backoff burst to the single coordinator-observed candidate, keeps authorization alive briefly for delayed replies, and expires deterministically. Automatic global discovery, full NAT/filtering classification, DHT routing, and cooperative relay are still not claimed complete.
+> Status: **0.1.0-alpha.6 — automatic rendezvous + filtering evidence**. KNP can now cycle through a bounded set of existing encrypted peers as rendezvous coordinators, and it has a consent-signed third-peer probe that can collect positive evidence for endpoint-independent inbound filtering. Negative probe results remain inconclusive. DHT discovery, cooperative relay, and broad real-world NAT validation are still not claimed complete.
 
 ## Principles
 
@@ -41,13 +41,21 @@ A -------- signed PUNCH_PROBE / ACK -------- B
 
 C is not a fixed service. It is just another running KonoNexus peer and does not become a permanent dependency after a direct A↔B path is established.
 
-For controlled tests, A can queue a request:
+For controlled tests, A can still name a coordinator explicitly:
 
 ```bash
 cargo run -- \
   --peer COORDINATOR_IP:47000 \
   --rendezvous COORDINATOR_IP:47000=TARGET_KNP_NODE_ID
 ```
+
+Automatic mode only needs the target NodeID:
+
+```bash
+cargo run -- --peer KNOWN_PEER:47000 --connect-node TARGET_KNP_NODE_ID
+```
+
+KNP then tries at most three currently encrypted peers per round as coordinators, avoids repeating them in the same round, and backs off before another round.
 
 Both A and B must already have an encrypted KNP session with that coordinator. The coordinator sends each side the UDP source endpoint it currently observes for the other side. Each side waits briefly, then emits a locally bounded seven-probe backoff burst over roughly 2.7 seconds while the signed punch authorization remains valid for five seconds. A successful `PUNCH_PROBE/PUNCH_ACK` stops the schedule, establishes the authenticated direct endpoint, and starts a fresh encrypted KNP session over it.
 
@@ -67,9 +75,10 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Experimental decentralized rendezvous messages
 - [x] Signed UDP punch probe/ack primitive
 - [x] Multi-attempt timed hole-punch burst/state machine
-- [ ] Filtering-behavior tests and stronger NAT classification
+- [x] Consent-based endpoint-independent filtering evidence test
+- [ ] Broader filtering-behavior matrix and negative-result interpretation
 - [ ] Multi-candidate/path prioritization without unsafe port spraying
-- [ ] Automatic selection of rendezvous peers
+- [x] Bounded automatic selection of encrypted rendezvous peers
 - [ ] IPv6 direct-path preference
 - [ ] Distributed peer discovery / DHT
 - [ ] Cooperative multi-hop relay fallback
@@ -98,3 +107,14 @@ KonoNexus is pre-release networking/security software. Its security and NAT trav
 ## License
 
 MIT
+
+
+### Consent-based filtering evidence
+
+A controlled positive filtering-evidence test can be requested through a coordinator:
+
+```bash
+cargo run -- --peer COORDINATOR_IP:47000 --filter-test COORDINATOR_IP:47000
+```
+
+The coordinator proposes an independent helper and the exact endpoint it already observes for the tested node. The tested node signs a short-lived Ed25519 authorization binding its NodeID/public key, that endpoint, the helper NodeID, and a random token. Only then may the helper send one signed direct probe. Receiving it is positive evidence that an independent endpoint can reach the mapping. Failure to receive it remains **inconclusive**, not proof of restrictive filtering.
