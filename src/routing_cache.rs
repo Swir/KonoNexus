@@ -182,11 +182,7 @@ pub fn load_routing_bucket_snapshot(
             {
                 return Ok(Vec::new());
             }
-            Ok(normalize_bucket_entries(
-                local_node_id,
-                cache.entries,
-                now,
-            ))
+            Ok(normalize_bucket_entries(local_node_id, cache.entries, now))
         }
         _ => Ok(Vec::new()),
     }
