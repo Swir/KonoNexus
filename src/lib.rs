@@ -3,6 +3,7 @@ pub mod konomind;
 pub mod node;
 pub mod protocol;
 pub mod security;
+pub mod session;
 
 pub use identity::NodeIdentity;
 pub use konomind::{
@@ -10,3 +11,6 @@ pub use konomind::{
 };
 pub use node::{KonoNode, PeerInfo};
 pub use protocol::{MessageBody, WireEnvelope, KNP_VERSION};
+pub use session::{
+    respond_handshake, EncryptedFrame, PendingHandshake, SecurePayload, SecureSession,
+};

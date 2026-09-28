@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.2 — protocol foundation**. The current implementation provides persistent cryptographic node identities, signed UDP discovery packets, bounded replay protection, stateless endpoint cookies before peer admission, peer tracking, ping/pong health checks, and bootstrap-by-peer-address. End-to-end application payload encryption, NAT traversal, DHT routing, multi-hop relay, and store-and-forward are intentionally not claimed as complete yet.
+> Status: **0.1.0-alpha.3 — secure-session foundation**. The implementation now provides persistent cryptographic node identities, signed UDP discovery, bounded replay protection, stateless endpoint cookies, authenticated ephemeral X25519 session establishment, HKDF-SHA256 directional key derivation, and ChaCha20-Poly1305 encrypted session frames. NAT traversal, DHT routing, multi-hop relay, key rotation, and store-and-forward are intentionally not claimed as complete yet.
 
 ## Principles
 
@@ -19,21 +19,25 @@ The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applicat
 ## What works now
 
 ```text
-Node A                        Node B
-  |                             |
-  | signed HELLO                |
-  |---------------------------->|
-  | signed COOKIE_CHALLENGE     |
-  |<----------------------------|
-  | signed HELLO + cookie       |
-  |---------------------------->|
-  | signed HELLO_ACK            |
-  |<----------------------------|
-  | signed PING / PONG          |
-  |<--------------------------->|
+Node A                              Node B
+  |                                  |
+  | signed HELLO                     |
+  |--------------------------------->|
+  | signed COOKIE_CHALLENGE          |
+  |<---------------------------------|
+  | signed HELLO + cookie            |
+  |--------------------------------->|
+  | signed HELLO_ACK                 |
+  |<---------------------------------|
+  | signed SESSION_INIT (X25519 eph) |
+  |--------------------------------->|
+  | signed SESSION_ACK  (X25519 eph) |
+  |<---------------------------------|
+  |   ChaCha20-Poly1305 secure data  |
+  |<================================>|
 ```
 
-Each installation creates and stores an Ed25519 identity key. KNP envelopes are signature-checked, timestamp/nonce replay-checked, and new inbound peers must prove endpoint reachability with a short-lived HMAC cookie before admission.
+The X25519 ephemeral keys are carried inside Ed25519-signed KNP envelopes, so the session transcript is tied to authenticated node identities. HKDF-SHA256 derives separate keys for each direction. Session frames use sequence-bound AEAD and reject duplicate/older sequence numbers in the current alpha implementation.
 
 ## Quick start
 
@@ -68,12 +72,16 @@ Set `RUST_LOG=debug` for verbose diagnostics.
 - [x] Persistent Ed25519 node identity
 - [x] Signed HELLO / HELLO_ACK
 - [x] Peer table and health timestamps
-- [x] Signed PING / PONG
+- [x] Signed PING / PONG fallback
 - [x] CI: formatting, Clippy, tests
 - [x] Replay window / bounded replay protection
 - [x] Stateless anti-amplification endpoint cookies
 - [x] Bounded active peer table
-- [ ] Encrypted session handshake
+- [x] Authenticated X25519 session handshake
+- [x] HKDF-SHA256 directional session keys
+- [x] ChaCha20-Poly1305 encrypted secure frames
+- [ ] Session handshake retransmission and key rotation
+- [ ] Sliding anti-replay window for reordered encrypted UDP frames
 - [ ] Automatic NAT type detection
 - [ ] UDP hole punching
 - [ ] LAN discovery without configuration
@@ -98,7 +106,7 @@ A completely new node cannot discover an existing global mesh from nothing: it n
 
 ## Security note
 
-KonoNexus is pre-release networking/security software. Do not treat an alpha build as audited or production-ready. The project will use established primitives, explicit protocol versioning, fuzz/property tests, and external review before a stable release.
+KonoNexus is pre-release networking/security software. The secure-session design has automated tests but has not undergone independent cryptographic review. Do not treat an alpha build as production-ready.
 
 ## License
 

@@ -20,6 +20,19 @@ pub enum MessageBody {
         observed_endpoint: String,
         features: Vec<String>,
     },
+    SessionInit {
+        handshake_id: u64,
+        ephemeral_public_key: String,
+    },
+    SessionAck {
+        handshake_id: u64,
+        ephemeral_public_key: String,
+    },
+    Encrypted {
+        session_id: String,
+        sequence: u64,
+        ciphertext: String,
+    },
     Ping {
         token: u64,
     },

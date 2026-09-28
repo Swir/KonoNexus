@@ -1,6 +1,7 @@
 use crate::identity::NodeIdentity;
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::security::{CookieGuard, ReplayGuard};
+use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{Context, Result};
 use rand::random;
 use std::collections::HashMap;
@@ -31,6 +32,8 @@ pub struct KonoNode {
     cookie_cache: HashMap<SocketAddr, String>,
     replay_guard: ReplayGuard,
     cookie_guard: CookieGuard,
+    pending_sessions: HashMap<SocketAddr, PendingHandshake>,
+    sessions: HashMap<SocketAddr, SecureSession>,
     hello_interval: Duration,
 }
 
@@ -53,6 +56,8 @@ impl KonoNode {
             cookie_cache: HashMap::new(),
             replay_guard: ReplayGuard::default(),
             cookie_guard: CookieGuard::default(),
+            pending_sessions: HashMap::new(),
+            sessions: HashMap::new(),
             hello_interval,
         })
     }
@@ -186,15 +191,135 @@ impl KonoNode {
                     observed = %observed_endpoint,
                     "peer handshake acknowledged"
                 );
+
+                self.maybe_start_session(source, &sender_node_id).await?;
+            }
+            MessageBody::SessionInit {
+                handshake_id,
+                ephemeral_public_key,
+            } => {
+                if !self.peers.contains_key(&source) {
+                    debug!(%source, "ignoring session init from unadmitted peer");
+                    return Ok(());
+                }
+
+                let local_node_id = self.node_id();
+                if self.pending_sessions.contains_key(&source) && local_node_id < sender_node_id {
+                    debug!(
+                        peer = %sender_node_id,
+                        %source,
+                        "simultaneous handshake: keeping local initiator role"
+                    );
+                    return Ok(());
+                }
+
+                self.pending_sessions.remove(&source);
+                let (session, responder_public_key) = respond_handshake(
+                    &local_node_id,
+                    &sender_node_id,
+                    handshake_id,
+                    &ephemeral_public_key,
+                )?;
+                let session_id = session.session_id().to_owned();
+
+                self.send(
+                    source,
+                    MessageBody::SessionAck {
+                        handshake_id,
+                        ephemeral_public_key: responder_public_key,
+                    },
+                )
+                .await?;
+                self.sessions.insert(source, session);
+
+                info!(
+                    peer = %sender_node_id,
+                    %source,
+                    %session_id,
+                    "encrypted KNP session established as responder"
+                );
+            }
+            MessageBody::SessionAck {
+                handshake_id,
+                ephemeral_public_key,
+            } => {
+                let valid_pending = self
+                    .pending_sessions
+                    .get(&source)
+                    .is_some_and(|pending| {
+                        pending.handshake_id() == handshake_id
+                            && pending.peer_node_id() == sender_node_id
+                    });
+                if !valid_pending {
+                    debug!(%source, handshake_id, "ignoring unexpected session ack");
+                    return Ok(());
+                }
+
+                let pending = self
+                    .pending_sessions
+                    .remove(&source)
+                    .expect("pending session checked above");
+                let mut session = pending.complete(&self.node_id(), &ephemeral_public_key)?;
+                let session_id = session.session_id().to_owned();
+                let frame = session.encrypt(&SecurePayload::Ping { token: random() })?;
+                self.sessions.insert(source, session);
+
+                self.send(
+                    source,
+                    MessageBody::Encrypted {
+                        session_id: frame.session_id,
+                        sequence: frame.sequence,
+                        ciphertext: frame.ciphertext,
+                    },
+                )
+                .await?;
+
+                info!(
+                    peer = %sender_node_id,
+                    %source,
+                    %session_id,
+                    "encrypted KNP session established as initiator"
+                );
+            }
+            MessageBody::Encrypted {
+                session_id,
+                sequence,
+                ciphertext,
+            } => {
+                if !self.peers.contains_key(&source) {
+                    debug!(%source, "ignoring secure frame from unadmitted peer");
+                    return Ok(());
+                }
+
+                let payload = match self.sessions.get_mut(&source) {
+                    Some(session) => session.decrypt(&session_id, sequence, &ciphertext)?,
+                    None => {
+                        debug!(%source, "ignoring secure frame without established session");
+                        return Ok(());
+                    }
+                };
+
+                match payload {
+                    SecurePayload::Ping { token } => {
+                        if let Some(response) =
+                            self.secure_message(source, SecurePayload::Pong { token })?
+                        {
+                            self.send(source, response).await?;
+                        }
+                    }
+                    SecurePayload::Pong { token } => {
+                        debug!(peer = %sender_node_id, %source, token, "secure pong received");
+                    }
+                }
             }
             MessageBody::Ping { token } => {
-                if self.peers.contains_key(&source) {
+                if self.peers.contains_key(&source) && !self.sessions.contains_key(&source) {
                     self.record_peer(&envelope, source);
                     self.send(source, MessageBody::Pong { token }).await?;
                 }
             }
             MessageBody::Pong { token } => {
-                if self.peers.contains_key(&source) {
+                if self.peers.contains_key(&source) && !self.sessions.contains_key(&source) {
                     self.record_peer(&envelope, source);
                     debug!(peer = %sender_node_id, %source, token, "pong received");
                 }
@@ -204,6 +329,49 @@ impl KonoNode {
         Ok(())
     }
 
+    async fn maybe_start_session(&mut self, target: SocketAddr, peer_node_id: &str) -> Result<()> {
+        if self.sessions.contains_key(&target) || self.pending_sessions.contains_key(&target) {
+            return Ok(());
+        }
+
+        let pending = PendingHandshake::new(peer_node_id.to_owned());
+        let handshake_id = pending.handshake_id();
+        let ephemeral_public_key = pending.public_key_hex();
+        self.pending_sessions.insert(target, pending);
+
+        if let Err(error) = self
+            .send(
+                target,
+                MessageBody::SessionInit {
+                    handshake_id,
+                    ephemeral_public_key,
+                },
+            )
+            .await
+        {
+            self.pending_sessions.remove(&target);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn secure_message(
+        &mut self,
+        target: SocketAddr,
+        payload: SecurePayload,
+    ) -> Result<Option<MessageBody>> {
+        let Some(session) = self.sessions.get_mut(&target) else {
+            return Ok(None);
+        };
+        let frame = session.encrypt(&payload)?;
+        Ok(Some(MessageBody::Encrypted {
+            session_id: frame.session_id,
+            sequence: frame.sequence,
+            ciphertext: frame.ciphertext,
+        }))
+    }
+
     fn is_expected_endpoint(&self, source: SocketAddr) -> bool {
         self.bootstrap_peers.contains(&source)
             || self.peers.contains_key(&source)
@@ -211,6 +379,13 @@ impl KonoNode {
     }
 
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
+        if let Some(existing) = self.peers.get(&source) {
+            if existing.node_id != envelope.sender_node_id {
+                self.sessions.remove(&source);
+                self.pending_sessions.remove(&source);
+            }
+        }
+
         if !self.peers.contains_key(&source) && self.peers.len() >= MAX_ACTIVE_PEERS {
             self.evict_oldest_peer();
         }
@@ -242,6 +417,8 @@ impl KonoNode {
         {
             self.peers.remove(&endpoint);
             self.cookie_cache.remove(&endpoint);
+            self.pending_sessions.remove(&endpoint);
+            self.sessions.remove(&endpoint);
         }
     }
 
@@ -268,13 +445,19 @@ impl KonoNode {
         }
     }
 
-    async fn ping_known_peers(&self) {
+    async fn ping_known_peers(&mut self) {
         let endpoints: Vec<SocketAddr> = self.peers.keys().copied().collect();
         for endpoint in endpoints {
-            if let Err(error) = self
-                .send(endpoint, MessageBody::Ping { token: random() })
-                .await
+            let token = random();
+            let body = if let Some(body) =
+                self.secure_message(endpoint, SecurePayload::Ping { token }).ok().flatten()
             {
+                body
+            } else {
+                MessageBody::Ping { token }
+            };
+
+            if let Err(error) = self.send(endpoint, body).await {
                 debug!(%endpoint, %error, "PING send failed");
             }
         }
@@ -285,9 +468,14 @@ impl KonoNode {
         let before = self.peers.len();
         self.peers
             .retain(|_, peer| peer.last_seen.elapsed() <= max_age);
+
         self.cookie_cache.retain(|endpoint, _| {
             self.bootstrap_peers.contains(endpoint) || self.peers.contains_key(endpoint)
         });
+        self.pending_sessions
+            .retain(|endpoint, _| self.peers.contains_key(endpoint));
+        self.sessions
+            .retain(|endpoint, _| self.peers.contains_key(endpoint));
 
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
@@ -312,6 +500,8 @@ fn local_features() -> Vec<String> {
         "signed-discovery".to_owned(),
         "replay-guard".to_owned(),
         "cookie-challenge".to_owned(),
-        "ping-pong".to_owned(),
+        "x25519-hkdf-session".to_owned(),
+        "chacha20poly1305-aead".to_owned(),
+        "secure-ping-pong".to_owned(),
     ]
 }
