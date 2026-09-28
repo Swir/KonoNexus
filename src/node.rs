@@ -19,12 +19,12 @@ use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
 use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
 use crate::security::{CookieGuard, ReplayGuard, SequenceWindow};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SessionSlot};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -72,11 +72,56 @@ pub struct PeerInfo {
     pub observed_external_endpoint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathMethod {
+    Direct,
+    HolePunch,
+    Relay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathDiagnostic {
+    pub peer_node_id: String,
+    pub method: PathMethod,
+    pub endpoint: SocketAddr,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkDiagnostics {
+    pub local_addr: SocketAddr,
+    pub observed_external_endpoint: Option<SocketAddr>,
+    pub nat_behavior: NatMappingBehavior,
+    pub filtering_evidence: NatFilteringEvidence,
+    pub authenticated_peers: usize,
+    pub dht_records: usize,
+    pub active_paths: Vec<PathDiagnostic>,
+    pub pending_punches: usize,
+}
+
+#[derive(Clone)]
+pub struct NetworkDiagnosticsHandle {
+    inner: Arc<RwLock<NetworkDiagnostics>>,
+}
+
+impl NetworkDiagnosticsHandle {
+    pub fn snapshot(&self) -> NetworkDiagnostics {
+        self.inner
+            .read()
+            .expect("network diagnostics lock poisoned")
+            .clone()
+    }
+}
+
 enum RelayAppCommand {
     Send {
         peer_node_id: String,
         data: Vec<u8>,
         response: oneshot::Sender<std::result::Result<u64, String>>,
+    },
+    Connect {
+        peer_node_id: String,
+        endpoints: Vec<SocketAddr>,
+        response: oneshot::Sender<std::result::Result<(), String>>,
     },
 }
 
@@ -102,6 +147,22 @@ impl RelayAppHandle {
         response_rx
             .await
             .map_err(|_| anyhow!("KonoNexus relay application response channel closed"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub async fn connect(&self, peer_node_id: String, endpoints: Vec<SocketAddr>) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(RelayAppCommand::Connect {
+                peer_node_id,
+                endpoints,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| anyhow!("KonoNexus relay application runtime is closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow!("KonoNexus connect response channel closed"))?
             .map_err(anyhow::Error::msg)
     }
 
@@ -264,6 +325,7 @@ pub struct KonoNode {
     last_rekey: HashMap<SocketAddr, Instant>,
     nat_profile: NatProfile,
     pending_punches: HashMap<u64, PunchSchedule>,
+    punched_endpoints: HashSet<SocketAddr>,
     queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
     auto_rendezvous: HashMap<String, AutoRendezvousState>,
     queued_filter_tests: HashSet<SocketAddr>,
@@ -298,6 +360,7 @@ pub struct KonoNode {
     relay_app_receipt_tx: Option<mpsc::Sender<RelayAppDeliveryReceipt>>,
     relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
+    diagnostics: Option<Arc<RwLock<NetworkDiagnostics>>>,
     local_test_mode: bool,
     hello_interval: Duration,
 }
@@ -331,6 +394,7 @@ impl KonoNode {
             last_rekey: HashMap::new(),
             nat_profile: NatProfile::default(),
             pending_punches: HashMap::new(),
+            punched_endpoints: HashSet::new(),
             queued_rendezvous: HashMap::new(),
             auto_rendezvous: HashMap::new(),
             queued_filter_tests: HashSet::new(),
@@ -365,6 +429,7 @@ impl KonoNode {
             relay_app_receipt_tx: None,
             relay_app_failure_tx: None,
             punch_relay_candidates: HashMap::new(),
+            diagnostics: None,
             local_test_mode: false,
             hello_interval,
         })
@@ -445,6 +510,15 @@ impl KonoNode {
         })
     }
 
+    pub fn configure_diagnostics_handle(&mut self) -> Result<NetworkDiagnosticsHandle> {
+        if self.diagnostics.is_some() {
+            return Err(anyhow!("network diagnostics handle is already configured"));
+        }
+        let inner = Arc::new(RwLock::new(self.diagnostics_snapshot()?));
+        self.diagnostics = Some(inner.clone());
+        Ok(NetworkDiagnosticsHandle { inner })
+    }
+
     pub fn queue_relay_app_message(&mut self, peer_node_id: String, data: Vec<u8>) -> Result<u64> {
         if !plausible_node_id(&peer_node_id) || peer_node_id == self.node_id() {
             return Err(anyhow!("invalid relay application peer NodeID"));
@@ -510,6 +584,7 @@ impl KonoNode {
                             if let Err(error) = self.handle_datagram(&recv_buf[..len], source).await {
                                 debug!(%source, %error, "dropping invalid KNP datagram");
                             }
+                            self.publish_diagnostics();
                         }
                         Err(error) => {
                             warn!(%error, "UDP receive failed");
@@ -523,12 +598,14 @@ impl KonoNode {
                     if let Err(error) = self.persist_routing_cache() {
                         debug!(%error, "routing cache persistence failed");
                     }
+                    self.publish_diagnostics();
                 }
                 _ = punch_ticker.tick() => {
                     self.drive_punch_attempts().await;
                     self.drive_relay_app().await;
                     self.flush_relay_app_events();
                     self.flush_relay_app_failures();
+                    self.publish_diagnostics();
                 }
                 _ = rendezvous_ticker.tick() => {
                     self.drive_session_handshakes().await;
@@ -857,6 +934,7 @@ impl KonoNode {
                     .get(&punch_token)
                     .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
+                self.punched_endpoints.insert(source);
                 self.pending_punches.remove(&punch_token);
                 self.punch_relay_candidates.remove(&punch_token);
                 self.auto_rendezvous.remove(&sender_node_id);
@@ -910,6 +988,7 @@ impl KonoNode {
                     .get(&punch_token)
                     .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
+                self.punched_endpoints.insert(source);
                 self.pending_punches.remove(&punch_token);
                 self.punch_relay_candidates.remove(&punch_token);
 
@@ -2320,6 +2399,90 @@ impl KonoNode {
 
                 let _ = response.send(result);
             }
+            RelayAppCommand::Connect {
+                peer_node_id,
+                endpoints,
+                response,
+            } => {
+                let result = self
+                    .queue_connect(peer_node_id, endpoints)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = response.send(result);
+            }
+        }
+    }
+
+    fn queue_connect(&mut self, peer_node_id: String, endpoints: Vec<SocketAddr>) -> Result<()> {
+        if !plausible_node_id(&peer_node_id) || peer_node_id == self.node_id() {
+            bail!("invalid connection target NodeID");
+        }
+        if endpoints.is_empty() || endpoints.len() > 8 {
+            bail!("connection requires between one and eight endpoints");
+        }
+        for endpoint in endpoints {
+            if endpoint.port() == 0 || endpoint.ip().is_unspecified() {
+                bail!("connection endpoint is unusable");
+            }
+            if !self.bootstrap_peers.contains(&endpoint) {
+                self.bootstrap_peers.push(endpoint);
+            }
+        }
+        self.queue_auto_rendezvous(peer_node_id);
+        Ok(())
+    }
+
+    fn diagnostics_snapshot(&self) -> Result<NetworkDiagnostics> {
+        let now = Instant::now();
+        let mut active_paths = Vec::new();
+        for endpoint in &self.confirmed_sessions {
+            if let Some(peer) = self.peers.get(endpoint) {
+                active_paths.push(PathDiagnostic {
+                    peer_node_id: peer.node_id.clone(),
+                    method: if self.punched_endpoints.contains(endpoint) {
+                        PathMethod::HolePunch
+                    } else {
+                        PathMethod::Direct
+                    },
+                    endpoint: *endpoint,
+                });
+            }
+        }
+        for ((relay_endpoint, _), path) in &self.relay_paths {
+            if path.expires_at > now
+                && self.relay_e2e_path_for_peer(&path.peer_node_id).is_some()
+                && !active_paths
+                    .iter()
+                    .any(|active| active.peer_node_id == path.peer_node_id)
+            {
+                active_paths.push(PathDiagnostic {
+                    peer_node_id: path.peer_node_id.clone(),
+                    method: PathMethod::Relay,
+                    endpoint: *relay_endpoint,
+                });
+            }
+        }
+        active_paths.sort_by(|left, right| left.peer_node_id.cmp(&right.peer_node_id));
+        Ok(NetworkDiagnostics {
+            local_addr: self.local_addr()?,
+            observed_external_endpoint: self.observed_external_endpoint(),
+            nat_behavior: self.nat_behavior(),
+            filtering_evidence: self.nat_filtering_evidence(),
+            authenticated_peers: self.confirmed_sessions.len(),
+            dht_records: self.dht_record_count(),
+            active_paths,
+            pending_punches: self.pending_punches.len(),
+        })
+    }
+
+    fn publish_diagnostics(&self) {
+        let Some(diagnostics) = &self.diagnostics else {
+            return;
+        };
+        let Ok(snapshot) = self.diagnostics_snapshot() else {
+            return;
+        };
+        if let Ok(mut current) = diagnostics.write() {
+            *current = snapshot;
         }
     }
 

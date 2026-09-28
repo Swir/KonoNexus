@@ -1,4 +1,7 @@
-use crate::{KonoNode, NodeIdentity, RelayAppEvent, RelayAppHandle};
+use crate::{
+    KonoNode, NetworkDiagnostics, NetworkDiagnosticsHandle, NodeIdentity, RelayAppEvent,
+    RelayAppHandle,
+};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -71,6 +74,7 @@ pub struct KonofixTransport {
     node_id: String,
     local_addr: SocketAddr,
     app: RelayAppHandle,
+    diagnostics: NetworkDiagnosticsHandle,
     task: JoinHandle<Result<()>>,
 }
 
@@ -97,12 +101,14 @@ impl KonofixTransport {
         node.configure_routing_cache(routing_cache_path)?;
 
         let app = node.configure_relay_app_handle(config.event_capacity)?;
+        let diagnostics = node.configure_diagnostics_handle()?;
         let task = tokio::spawn(node.run());
 
         Ok(Self {
             node_id,
             local_addr,
             app,
+            diagnostics,
             task,
         })
     }
@@ -121,6 +127,18 @@ impl KonofixTransport {
 
     pub async fn send(&self, peer_node_id: impl Into<String>, data: Vec<u8>) -> Result<u64> {
         self.app.send(peer_node_id.into(), data).await
+    }
+
+    pub async fn connect(
+        &self,
+        peer_node_id: impl Into<String>,
+        endpoints: Vec<SocketAddr>,
+    ) -> Result<()> {
+        self.app.connect(peer_node_id.into(), endpoints).await
+    }
+
+    pub fn diagnostics(&self) -> NetworkDiagnostics {
+        self.diagnostics.snapshot()
     }
 
     pub async fn next_event(&mut self) -> Option<RelayAppEvent> {
