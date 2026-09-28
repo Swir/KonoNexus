@@ -8,7 +8,8 @@ use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
 use crate::relay_app::{
-    RelayAppDeliveryFailure, RelayAppManager, RelayAppMessage, RelayAppReceiveStatus,
+    RelayAppDeliveryFailure, RelayAppDeliveryReceipt, RelayAppManager, RelayAppMessage,
+    RelayAppReceiveStatus,
 };
 use crate::relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, encode_relay_payload_on_session,
@@ -82,6 +83,7 @@ enum RelayAppCommand {
 pub struct RelayAppHandle {
     command_tx: mpsc::Sender<RelayAppCommand>,
     message_rx: mpsc::Receiver<RelayAppMessage>,
+    receipt_rx: mpsc::Receiver<RelayAppDeliveryReceipt>,
     failure_rx: mpsc::Receiver<RelayAppDeliveryFailure>,
 }
 
@@ -105,6 +107,10 @@ impl RelayAppHandle {
 
     pub async fn recv(&mut self) -> Option<RelayAppMessage> {
         self.message_rx.recv().await
+    }
+
+    pub async fn recv_receipt(&mut self) -> Option<RelayAppDeliveryReceipt> {
+        self.receipt_rx.recv().await
     }
 
     pub async fn recv_failure(&mut self) -> Option<RelayAppDeliveryFailure> {
@@ -281,6 +287,7 @@ pub struct KonoNode {
     relay_app: RelayAppManager,
     relay_app_command_rx: Option<mpsc::Receiver<RelayAppCommand>>,
     relay_app_event_tx: Option<mpsc::Sender<RelayAppMessage>>,
+    relay_app_receipt_tx: Option<mpsc::Sender<RelayAppDeliveryReceipt>>,
     relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
     hello_interval: Duration,
@@ -346,6 +353,7 @@ impl KonoNode {
             relay_app: RelayAppManager::default(),
             relay_app_command_rx: None,
             relay_app_event_tx: None,
+            relay_app_receipt_tx: None,
             relay_app_failure_tx: None,
             punch_relay_candidates: HashMap::new(),
             hello_interval,
@@ -398,6 +406,7 @@ impl KonoNode {
     pub fn configure_relay_app_handle(&mut self, capacity: usize) -> Result<RelayAppHandle> {
         if self.relay_app_command_rx.is_some()
             || self.relay_app_event_tx.is_some()
+            || self.relay_app_receipt_tx.is_some()
             || self.relay_app_failure_tx.is_some()
         {
             return Err(anyhow!("relay application handle is already configured"));
@@ -406,15 +415,18 @@ impl KonoNode {
         let capacity = capacity.clamp(1, MAX_RELAY_APP_HANDLE_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(capacity);
         let (event_tx, message_rx) = mpsc::channel(capacity);
+        let (receipt_tx, receipt_rx) = mpsc::channel(capacity);
         let (failure_tx, failure_rx) = mpsc::channel(capacity);
 
         self.relay_app_command_rx = Some(command_rx);
         self.relay_app_event_tx = Some(event_tx);
+        self.relay_app_receipt_tx = Some(receipt_tx);
         self.relay_app_failure_tx = Some(failure_tx);
 
         Ok(RelayAppHandle {
             command_tx,
             message_rx,
+            receipt_rx,
             failure_rx,
         })
     }
@@ -2211,6 +2223,21 @@ impl KonoNode {
 
     fn handle_app_ack(&mut self, peer_node_id: &str, message_id: u64) {
         if self.relay_app.acknowledge(peer_node_id, message_id) {
+            if let Some(sender) = self.relay_app_receipt_tx.as_ref() {
+                let receipt = RelayAppDeliveryReceipt {
+                    peer_node_id: peer_node_id.to_owned(),
+                    message_id,
+                };
+                if let Err(error) = sender.try_send(receipt) {
+                    debug!(
+                        peer = %peer_node_id,
+                        message_id,
+                        %error,
+                        "delivery receipt channel unavailable"
+                    );
+                }
+            }
+
             debug!(
                 peer = %peer_node_id,
                 message_id,
@@ -2267,9 +2294,18 @@ impl KonoNode {
                 data,
                 response,
             } => {
+                let needs_path = self
+                    .direct_app_endpoint_for_peer(&peer_node_id)
+                    .is_none()
+                    && self.relay_e2e_path_for_peer(&peer_node_id).is_none();
                 let result = self
-                    .queue_relay_app_message(peer_node_id, data)
+                    .queue_relay_app_message(peer_node_id.clone(), data)
                     .map_err(|error| error.to_string());
+
+                if result.is_ok() && needs_path {
+                    self.queue_auto_rendezvous(peer_node_id);
+                }
+
                 let _ = response.send(result);
             }
         }
