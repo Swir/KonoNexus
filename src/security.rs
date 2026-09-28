@@ -83,7 +83,8 @@ impl ReplayGuard {
             bail!("KNP packet timestamp outside accepted window");
         }
 
-        if !self.peers.contains_key(&envelope.sender_node_id) && self.peers.len() >= self.max_peers {
+        if !self.peers.contains_key(&envelope.sender_node_id) && self.peers.len() >= self.max_peers
+        {
             self.evict_oldest();
         }
 
@@ -126,8 +127,12 @@ mod tests {
         let id = NodeIdentity::generate();
         let env = packet(&id, 7);
         let mut guard = ReplayGuard::default();
-        guard.check_and_record_at(&env, env.timestamp_unix_ms).unwrap();
-        assert!(guard.check_and_record_at(&env, env.timestamp_unix_ms).is_err());
+        guard
+            .check_and_record_at(&env, env.timestamp_unix_ms)
+            .unwrap();
+        assert!(guard
+            .check_and_record_at(&env, env.timestamp_unix_ms)
+            .is_err());
     }
 
     #[test]
