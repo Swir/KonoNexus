@@ -47,5 +47,5 @@ pub use routing_cache::{
 };
 pub use security::SequenceWindow;
 pub use session::{
-    respond_handshake, EncryptedFrame, PendingHandshake, SecurePayload, SecureSession,
+    respond_handshake, EncryptedFrame, PendingHandshake, SecurePayload, SecureSession, SessionSlot,
 };
