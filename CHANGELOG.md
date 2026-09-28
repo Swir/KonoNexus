@@ -4,6 +4,14 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added application-visible `RelayAppDeliveryFailure` events with `RetriesExhausted` and `Expired` reasons and a live `RelayAppHandle::recv_failure()` channel.
+- Added bounded direct-session handshake retransmission: one-second retry interval and at most four `SESSION_INIT` sends using the same handshake ID/ephemeral key.
+- Added a ten-second bounded responder ACK cache so duplicate session-init packets receive the same responder public key instead of deriving conflicting sessions.
+- Deferred responder-side encrypted control/application flush until the first authenticated encrypted frame confirms the initiator completed the session.
+- Added bounded alternate relay selection: prefer the last rendezvous coordinator, then try up to three distinct existing encrypted peers without repeating failed candidates.
+- Added rejection-driven relay failover and automatic cleanup when a direct or relay path becomes active.
+- Bumped the implementation package to 0.1.0-alpha.13.
+
 - Added a reusable 128-sequence sliding replay window and applied it to encrypted KNP sessions, relay forwarding, and endpoint relay paths.
 - Authenticated encrypted UDP frames may now arrive out of order within the replay window while duplicates and frames older than the window remain rejected.
 - Added RelayApp ACK-timeout retransmission: one-second timeout, up to four bounded retries, and automatic queue release after retry exhaustion.
