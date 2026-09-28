@@ -1,3 +1,4 @@
+use crate::security::SequenceWindow;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,8 +23,8 @@ pub struct RelayCircuit {
     pub target_node_id: String,
     pub state: RelayCircuitState,
     pub expires_at: Instant,
-    origin_sequence: Option<u64>,
-    target_sequence: Option<u64>,
+    origin_window: SequenceWindow,
+    target_window: SequenceWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +71,8 @@ impl RelayManager {
                 target_node_id,
                 state: RelayCircuitState::PendingTargetConsent,
                 expires_at: now + RELAY_CIRCUIT_TTL,
-                origin_sequence: None,
-                target_sequence: None,
+                origin_window: SequenceWindow::default(),
+                target_window: SequenceWindow::default(),
             },
         );
         Ok(())
@@ -128,14 +129,14 @@ impl RelayManager {
             bail!("relay circuit is not active");
         }
 
-        let (destination, peer_node_id, last_sequence) = if source_endpoint
+        let (destination, peer_node_id, receive_window) = if source_endpoint
             == circuit.origin_endpoint
             && source_node_id == circuit.origin_node_id
         {
             (
                 circuit.target_endpoint,
                 circuit.target_node_id.clone(),
-                &mut circuit.origin_sequence,
+                &mut circuit.origin_window,
             )
         } else if source_endpoint == circuit.target_endpoint
             && source_node_id == circuit.target_node_id
@@ -143,16 +144,13 @@ impl RelayManager {
             (
                 circuit.origin_endpoint,
                 circuit.origin_node_id.clone(),
-                &mut circuit.target_sequence,
+                &mut circuit.target_window,
             )
         } else {
             bail!("relay cell source does not match circuit");
         };
 
-        if last_sequence.is_some_and(|last| sequence <= last) {
-            bail!("relay cell sequence replay or rollback");
-        }
-        *last_sequence = Some(sequence);
+        receive_window.check_and_record(sequence)?;
         circuit.expires_at = now + RELAY_CIRCUIT_TTL;
 
         Ok(RelayForward {
@@ -246,6 +244,28 @@ mod tests {
         assert_eq!(forwarded.destination, target);
         assert_eq!(forwarded.peer_node_id, "knp1target");
         assert_eq!(forwarded.opaque_payload_hex, "aabb");
+    }
+
+    #[test]
+    fn relay_accepts_bounded_reordered_cells() {
+        let (mut relay, id, origin, target) = setup();
+        relay
+            .accept(id, target, "knp1target", Instant::now())
+            .unwrap();
+
+        relay
+            .forward(id, origin, "knp1origin", 2, "aa".into(), Instant::now())
+            .unwrap();
+        relay
+            .forward(id, origin, "knp1origin", 0, "bb".into(), Instant::now())
+            .unwrap();
+        relay
+            .forward(id, origin, "knp1origin", 1, "cc".into(), Instant::now())
+            .unwrap();
+
+        assert!(relay
+            .forward(id, origin, "knp1origin", 1, "dd".into(), Instant::now())
+            .is_err());
     }
 
     #[test]
