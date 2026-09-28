@@ -65,6 +65,33 @@ pub enum SecurePayload {
         target_node_id: String,
         records: Vec<PeerRecord>,
     },
+    RelayOpen {
+        circuit_id: u64,
+        target_node_id: String,
+    },
+    RelayOffer {
+        circuit_id: u64,
+        origin_node_id: String,
+    },
+    RelayAccept {
+        circuit_id: u64,
+        origin_node_id: String,
+    },
+    RelayReady {
+        circuit_id: u64,
+        peer_node_id: String,
+    },
+    RelayCell {
+        circuit_id: u64,
+        sequence: u64,
+        opaque_payload_hex: String,
+    },
+    RelayClose {
+        circuit_id: u64,
+    },
+    RelayReject {
+        circuit_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
