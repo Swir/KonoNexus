@@ -2479,9 +2479,10 @@ impl KonoNode {
 
         for target_node_id in targets {
             if self.peer_endpoint_by_node_id(&target_node_id).is_some()
-                || self.relay_paths.values().any(|path| {
-                    path.peer_node_id == target_node_id && path.expires_at > now
-                })
+                || self
+                    .relay_paths
+                    .values()
+                    .any(|path| path.peer_node_id == target_node_id && path.expires_at > now)
             {
                 self.auto_relay_fallbacks.remove(&target_node_id);
                 continue;
@@ -2505,9 +2506,7 @@ impl KonoNode {
                 } else if state.next_attempt_at > now {
                     continue;
                 } else if let Some(preferred) = state.preferred {
-                    if !state.tried.contains(&preferred)
-                        && self.sessions.contains_key(&preferred)
-                    {
+                    if !state.tried.contains(&preferred) && self.sessions.contains_key(&preferred) {
                         Some(preferred)
                     } else {
                         let mut candidates: Vec<(SocketAddr, Instant)> = self
@@ -2560,13 +2559,13 @@ impl KonoNode {
             };
 
             let Some(candidate) = candidate else {
-                let exhausted = self
-                    .auto_relay_fallbacks
-                    .get(&target_node_id)
-                    .is_some_and(|state| {
-                        state.expires_at <= now
-                            || state.tried.len() >= AUTO_RELAY_MAX_CANDIDATES
-                    });
+                let exhausted =
+                    self.auto_relay_fallbacks
+                        .get(&target_node_id)
+                        .is_some_and(|state| {
+                            state.expires_at <= now
+                                || state.tried.len() >= AUTO_RELAY_MAX_CANDIDATES
+                        });
                 if exhausted {
                     self.auto_relay_fallbacks.remove(&target_node_id);
                     debug!(
@@ -2781,8 +2780,7 @@ impl KonoNode {
             .retain(|_, query| query.target_node_id != envelope.sender_node_id);
         self.last_dht_query_start.remove(&envelope.sender_node_id);
         self.auto_rendezvous.remove(&envelope.sender_node_id);
-        self.auto_relay_fallbacks
-            .remove(&envelope.sender_node_id);
+        self.auto_relay_fallbacks.remove(&envelope.sender_node_id);
 
         let now = Instant::now();
         self.peers
