@@ -4,6 +4,14 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added a bounded seven-attempt UDP punch burst with increasing retry delays and a five-second authorization window.
+- Added a 50 ms punch scheduler independent of the slower discovery timer.
+- Added a hard limit of 128 pending punch schedules and deterministic expiry reporting.
+- Rejected unsafe rendezvous candidates such as loopback, unspecified, multicast, broadcast and port-zero endpoints.
+- Kept punching restricted to the coordinator-observed endpoint instead of spraying adjacent ports.
+- Added unit tests for burst timing, identity binding, expiry and candidate safety.
+- Bumped the implementation package to 0.1.0-alpha.5.
+
 - Added bounded peer-attributed external UDP endpoint observations.
 - Added NAT mapping-behavior classification without overstating full NAT type detection.
 - Added encrypted decentralized rendezvous requests/offers through ordinary KonoNexus peers.

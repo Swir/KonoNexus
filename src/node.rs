@@ -1,6 +1,7 @@
 use crate::identity::NodeIdentity;
 use crate::nat::{NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
+use crate::punch::PunchSchedule;
 use crate::security::{CookieGuard, ReplayGuard};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 const MAX_ACTIVE_PEERS: usize = 2_048;
-const PUNCH_AUTH_TTL: Duration = Duration::from_secs(15);
+const MAX_PENDING_PUNCHES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -24,13 +25,6 @@ pub struct PeerInfo {
     pub first_seen: Instant,
     pub last_seen: Instant,
     pub observed_external_endpoint: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingPunch {
-    expected_node_id: String,
-    candidate_endpoint: SocketAddr,
-    expires_at: Instant,
 }
 
 pub struct KonoNode {
@@ -44,7 +38,7 @@ pub struct KonoNode {
     pending_sessions: HashMap<SocketAddr, PendingHandshake>,
     sessions: HashMap<SocketAddr, SecureSession>,
     nat_profile: NatProfile,
-    pending_punches: HashMap<u64, PendingPunch>,
+    pending_punches: HashMap<u64, PunchSchedule>,
     queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
     hello_interval: Duration,
 }
@@ -112,6 +106,8 @@ impl KonoNode {
         let mut recv_buf = vec![0_u8; MAX_PACKET_SIZE + 1];
         let mut ticker = time::interval(self.hello_interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut punch_ticker = time::interval(Duration::from_millis(50));
+        punch_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -135,6 +131,9 @@ impl KonoNode {
                     self.refresh_discovery().await;
                     self.ping_known_peers().await;
                     self.expire_stale_state();
+                }
+                _ = punch_ticker.tick() => {
+                    self.drive_punch_attempts().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("shutdown requested");
@@ -357,9 +356,9 @@ impl KonoNode {
                 }
 
                 if let Some(pending) = self.pending_punches.get(&punch_token) {
-                    if pending.candidate_endpoint != source {
+                    if pending.candidate_endpoint() != source {
                         debug!(
-                            offered = %pending.candidate_endpoint,
+                            offered = %pending.candidate_endpoint(),
                             actual = %source,
                             peer = %sender_node_id,
                             "punch peer arrived from an alternate mapped endpoint"
@@ -367,6 +366,10 @@ impl KonoNode {
                     }
                 }
 
+                let attempts = self
+                    .pending_punches
+                    .get(&punch_token)
+                    .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
                 self.pending_punches.remove(&punch_token);
 
@@ -383,6 +386,7 @@ impl KonoNode {
                     peer = %sender_node_id,
                     %source,
                     punch_token,
+                    attempts,
                     "direct UDP punch probe accepted"
                 );
 
@@ -403,9 +407,9 @@ impl KonoNode {
                 }
 
                 if let Some(pending) = self.pending_punches.get(&punch_token) {
-                    if pending.candidate_endpoint != source {
+                    if pending.candidate_endpoint() != source {
                         debug!(
-                            offered = %pending.candidate_endpoint,
+                            offered = %pending.candidate_endpoint(),
                             actual = %source,
                             peer = %sender_node_id,
                             "punch ack arrived from an alternate mapped endpoint"
@@ -413,6 +417,10 @@ impl KonoNode {
                     }
                 }
 
+                let attempts = self
+                    .pending_punches
+                    .get(&punch_token)
+                    .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
                 self.pending_punches.remove(&punch_token);
 
@@ -421,6 +429,7 @@ impl KonoNode {
                     %source,
                     %observed_endpoint,
                     punch_token,
+                    attempts,
                     "direct UDP punch acknowledged"
                 );
 
@@ -477,24 +486,36 @@ impl KonoNode {
                     }
                 };
 
+                if !PunchSchedule::candidate_allowed(candidate) {
+                    warn!(
+                        %candidate,
+                        coordinator = %sender_node_id,
+                        "rejected unsafe rendezvous candidate"
+                    );
+                    return Ok(());
+                }
+
+                if !self.pending_punches.contains_key(&punch_token)
+                    && self.pending_punches.len() >= MAX_PENDING_PUNCHES
+                {
+                    warn!(
+                        coordinator = %sender_node_id,
+                        "pending punch limit reached; ignoring rendezvous offer"
+                    );
+                    return Ok(());
+                }
+
                 self.pending_punches.insert(
                     punch_token,
-                    PendingPunch {
-                        expected_node_id: peer_node_id.clone(),
-                        candidate_endpoint: candidate,
-                        expires_at: Instant::now() + PUNCH_AUTH_TTL,
-                    },
+                    PunchSchedule::new(peer_node_id.clone(), candidate, Instant::now()),
                 );
-
-                self.send(candidate, MessageBody::PunchProbe { punch_token })
-                    .await?;
 
                 info!(
                     peer = %peer_node_id,
                     %candidate,
                     punch_token,
                     coordinator = %sender_node_id,
-                    "started direct UDP punch attempt"
+                    "scheduled bounded UDP punch burst"
                 );
             }
         }
@@ -578,9 +599,69 @@ impl KonoNode {
     }
 
     fn authorize_punch(&self, token: u64, sender_node_id: &str) -> bool {
-        self.pending_punches.get(&token).is_some_and(|pending| {
-            pending.expected_node_id == sender_node_id && pending.expires_at > Instant::now()
-        })
+        self.pending_punches
+            .get(&token)
+            .is_some_and(|pending| pending.is_authorized(sender_node_id, Instant::now()))
+    }
+
+    async fn drive_punch_attempts(&mut self) {
+        let now = Instant::now();
+        let mut due = Vec::new();
+
+        for (token, schedule) in &mut self.pending_punches {
+            if schedule.probe_due(now) {
+                let attempt = schedule.mark_probe_sent(now);
+                due.push((
+                    *token,
+                    schedule.candidate_endpoint(),
+                    schedule.expected_node_id().to_owned(),
+                    attempt,
+                ));
+            }
+        }
+
+        for (token, candidate, peer_node_id, attempt) in due {
+            if let Err(error) = self
+                .send(candidate, MessageBody::PunchProbe { punch_token: token })
+                .await
+            {
+                debug!(
+                    %candidate,
+                    peer = %peer_node_id,
+                    punch_token = token,
+                    attempt,
+                    %error,
+                    "UDP punch probe send failed"
+                );
+            } else {
+                debug!(
+                    %candidate,
+                    peer = %peer_node_id,
+                    punch_token = token,
+                    attempt,
+                    "sent UDP punch probe"
+                );
+            }
+        }
+
+        let expired: Vec<u64> = self
+            .pending_punches
+            .iter()
+            .filter(|(_, schedule)| schedule.is_expired(Instant::now()))
+            .map(|(token, _)| *token)
+            .collect();
+
+        for token in expired {
+            if let Some(schedule) = self.pending_punches.remove(&token) {
+                info!(
+                    peer = %schedule.expected_node_id(),
+                    candidate = %schedule.candidate_endpoint(),
+                    punch_token = token,
+                    attempts = schedule.attempts_sent(),
+                    "UDP punch burst expired without direct-path confirmation"
+                );
+            }
+        }
     }
 
     async fn maybe_start_session(&mut self, target: SocketAddr, peer_node_id: &str) -> Result<()> {
@@ -754,9 +835,6 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.sessions
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
-        self.pending_punches
-            .retain(|_, pending| pending.expires_at > Instant::now());
-
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
             debug!(removed, "expired stale peers");
@@ -785,6 +863,7 @@ fn local_features() -> Vec<String> {
         "nat-observation".to_owned(),
         "decentralized-rendezvous".to_owned(),
         "udp-punch-probe".to_owned(),
+        "udp-punch-burst-v1".to_owned(),
         "secure-ping-pong".to_owned(),
     ]
 }

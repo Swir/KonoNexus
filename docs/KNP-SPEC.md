@@ -57,36 +57,42 @@ The authorization is short-lived and is removed after successful use.
 
 This coordinator is not a fixed server. Any suitable peer with encrypted sessions to both endpoints may perform this role.
 
-## 7. Current limitations of punching
+## 7. Timed punch burst
 
-The present alpha sends one immediate probe to the candidate endpoint. It does not yet implement:
+A rendezvous offer creates a bounded local punch schedule instead of sending only one probe.
 
-- synchronized multi-packet bursts,
-- port prediction,
-- alternate candidate sets,
-- retry/backoff state,
-- filtering-behavior probes,
-- ICE-like prioritization,
-- automatic rendezvous selection.
+- first probe is delayed by 100 ms to give both peers time to receive their offers,
+- at most seven signed probes are sent,
+- retries use increasing local delays (100, 150, 250, 400, 650 and 1000 ms after prior sends),
+- authorization remains valid for five seconds so delayed replies can still succeed,
+- success removes the schedule immediately,
+- expiration removes the schedule deterministically and logs the attempt count,
+- at most 128 punch schedules may be pending on one node.
 
-Destination-specific/symmetric NAT mappings may therefore fail. Cooperative relay remains the planned fallback.
+The implementation deliberately sends only to the coordinator-observed candidate. It does not spray adjacent ports. Rendezvous candidates with port 0, loopback, unspecified, multicast, or IPv4 broadcast addresses are rejected locally.
 
-## 8. Security properties of rendezvous
+## 8. Current limitations of punching
+
+The burst improves timing tolerance but does not yet implement port prediction, alternate candidate sets, filtering-behavior probes, ICE-like candidate prioritization, or automatic rendezvous selection.
+
+Destination-specific/symmetric NAT mappings may therefore still fail. Cooperative relay remains the planned fallback.
+
+## 9. Security properties of rendezvous
 
 Rendezvous control data is sent inside the existing AEAD session to the coordinator. Direct punch packets remain signed outer KNP messages so that a peer can authenticate a previously unseen direct source endpoint before a direct encrypted session exists.
 
 A token alone is insufficient: the punch sender must also prove possession of the Ed25519 identity corresponding to the NodeID named in the encrypted rendezvous offer.
 
-## 9. Planned next stages
+## 10. Planned next stages
 
-1. timed hole-punch burst and retry state machine,
-2. richer mapping/filtering tests,
-3. automatic rendezvous peer selection,
-4. IPv6 direct-path preference,
+1. richer mapping/filtering tests,
+2. automatic rendezvous peer selection,
+3. IPv6 direct-path preference,
+4. safe multi-candidate/path prioritization,
 5. DHT-based peer discovery,
 6. cooperative encrypted relay fallback,
 7. route scoring and KonoMind optimization.
 
-## 10. Versioning
+## 11. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.

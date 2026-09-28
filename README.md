@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.4 — NAT traversal groundwork**. KNP now has authenticated encrypted sessions, peer-reported external endpoint observations, bounded NAT mapping classification, and an experimental decentralized rendezvous/hole-punch primitive through an ordinary KonoNexus peer. Automatic global discovery, robust NAT classification, production-grade hole punching, DHT routing, and cooperative relay are not yet claimed complete.
+> Status: **0.1.0-alpha.5 — bounded hole-punch burst**. KNP now adds a timed, bounded UDP punch state machine on top of encrypted decentralized rendezvous. Each direct-path authorization sends a small backoff burst to the single coordinator-observed candidate, keeps authorization alive briefly for delayed replies, and expires deterministically. Automatic global discovery, full NAT/filtering classification, DHT routing, and cooperative relay are still not claimed complete.
 
 ## Principles
 
@@ -49,7 +49,7 @@ cargo run -- \
   --rendezvous COORDINATOR_IP:47000=TARGET_KNP_NODE_ID
 ```
 
-Both A and B must already have an encrypted KNP session with that coordinator. The coordinator sends each side the UDP source endpoint it currently observes for the other side. Both endpoints then exchange signed, short-lived `PUNCH_PROBE/PUNCH_ACK` messages. A successful probe establishes the candidate direct endpoint and starts a fresh encrypted KNP session over it.
+Both A and B must already have an encrypted KNP session with that coordinator. The coordinator sends each side the UDP source endpoint it currently observes for the other side. Each side waits briefly, then emits a locally bounded seven-probe backoff burst over roughly 2.7 seconds while the signed punch authorization remains valid for five seconds. A successful `PUNCH_PROBE/PUNCH_ACK` stops the schedule, establishes the authenticated direct endpoint, and starts a fresh encrypted KNP session over it.
 
 This is an experimental primitive. NATs that create destination-specific mappings can still defeat this strategy; cooperative relay is the later fallback.
 
@@ -66,8 +66,9 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Bounded NAT mapping-behavior profile
 - [x] Experimental decentralized rendezvous messages
 - [x] Signed UDP punch probe/ack primitive
-- [ ] Multi-attempt timed hole-punch burst/state machine
+- [x] Multi-attempt timed hole-punch burst/state machine
 - [ ] Filtering-behavior tests and stronger NAT classification
+- [ ] Multi-candidate/path prioritization without unsafe port spraying
 - [ ] Automatic selection of rendezvous peers
 - [ ] IPv6 direct-path preference
 - [ ] Distributed peer discovery / DHT
