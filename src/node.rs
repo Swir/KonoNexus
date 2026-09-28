@@ -121,8 +121,9 @@ impl KonoNode {
 
         self.replay_guard.check_and_record(&envelope)?;
         let sender_node_id = envelope.sender_node_id.clone();
+        let body = envelope.body.clone();
 
-        match envelope.body {
+        match body {
             MessageBody::Hello { cookie, .. } => {
                 let cookie_valid = match cookie {
                     Some(cookie) => self.cookie_guard.validate(&source, &cookie)?,
