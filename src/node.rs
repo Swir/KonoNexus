@@ -282,6 +282,9 @@ impl KonoNode {
                     self.refresh_discovery().await;
                     self.ping_known_peers().await;
                     self.expire_stale_state();
+                    if let Err(error) = self.persist_routing_cache() {
+                        debug!(%error, "routing cache persistence failed");
+                    }
                 }
                 _ = punch_ticker.tick() => {
                     self.drive_punch_attempts().await;
@@ -291,6 +294,9 @@ impl KonoNode {
                     self.drive_dht_queries().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
+                    if let Err(error) = self.persist_routing_cache() {
+                        debug!(%error, "routing cache persistence failed during shutdown");
+                    }
                     info!("shutdown requested");
                     break;
                 }
@@ -439,6 +445,7 @@ impl KonoNode {
 
                 self.flush_rendezvous_requests(source).await?;
                 self.flush_filter_test_request(source).await?;
+                self.flush_relay_requests(source).await?;
                 self.sync_dht_peer(source).await?;
             }
             MessageBody::SessionAck {
@@ -482,6 +489,7 @@ impl KonoNode {
 
                 self.flush_rendezvous_requests(source).await?;
                 self.flush_filter_test_request(source).await?;
+                self.flush_relay_requests(source).await?;
                 self.sync_dht_peer(source).await?;
             }
             MessageBody::Encrypted {
@@ -900,6 +908,222 @@ impl KonoNode {
                     }
                 }
             }
+            SecurePayload::RelayOpen {
+                circuit_id,
+                target_node_id,
+            } => {
+                let Some(target_endpoint) = self.peer_endpoint_by_node_id(&target_node_id) else {
+                    self.send_secure_payload(source, SecurePayload::RelayReject { circuit_id })
+                        .await?;
+                    return Ok(());
+                };
+
+                if target_endpoint == source || !self.sessions.contains_key(&target_endpoint) {
+                    self.send_secure_payload(source, SecurePayload::RelayReject { circuit_id })
+                        .await?;
+                    return Ok(());
+                }
+
+                match self.relay_manager.open(
+                    circuit_id,
+                    source,
+                    sender_node_id.to_owned(),
+                    target_endpoint,
+                    target_node_id.clone(),
+                    Instant::now(),
+                ) {
+                    Ok(()) => {
+                        self.send_secure_payload(
+                            target_endpoint,
+                            SecurePayload::RelayOffer {
+                                circuit_id,
+                                origin_node_id: sender_node_id.to_owned(),
+                            },
+                        )
+                        .await?;
+                        info!(
+                            circuit_id,
+                            origin = %sender_node_id,
+                            target = %target_node_id,
+                            "relay circuit awaiting target consent"
+                        );
+                    }
+                    Err(error) => {
+                        debug!(circuit_id, %error, "relay open rejected");
+                        self.send_secure_payload(source, SecurePayload::RelayReject { circuit_id })
+                            .await?;
+                    }
+                }
+            }
+            SecurePayload::RelayOffer {
+                circuit_id,
+                origin_node_id,
+            } => {
+                if !plausible_node_id(&origin_node_id) || origin_node_id == self.node_id() {
+                    return Ok(());
+                }
+
+                self.send_secure_payload(
+                    source,
+                    SecurePayload::RelayAccept {
+                        circuit_id,
+                        origin_node_id,
+                    },
+                )
+                .await?;
+            }
+            SecurePayload::RelayAccept {
+                circuit_id,
+                origin_node_id,
+            } => {
+                let accepted = self
+                    .relay_manager
+                    .accept(circuit_id, source, sender_node_id, Instant::now());
+
+                let Ok((origin_endpoint, expected_origin_node_id)) = accepted else {
+                    return Ok(());
+                };
+                if expected_origin_node_id != origin_node_id {
+                    self.relay_manager
+                        .close(circuit_id, source, sender_node_id);
+                    return Ok(());
+                }
+
+                self.send_secure_payload(
+                    origin_endpoint,
+                    SecurePayload::RelayReady {
+                        circuit_id,
+                        peer_node_id: sender_node_id.to_owned(),
+                    },
+                )
+                .await?;
+                self.send_secure_payload(
+                    source,
+                    SecurePayload::RelayReady {
+                        circuit_id,
+                        peer_node_id: origin_node_id,
+                    },
+                )
+                .await?;
+
+                info!(
+                    circuit_id,
+                    origin = %expected_origin_node_id,
+                    target = %sender_node_id,
+                    "cooperative relay circuit active"
+                );
+            }
+            SecurePayload::RelayReady {
+                circuit_id,
+                peer_node_id,
+            } => {
+                if !plausible_node_id(&peer_node_id) {
+                    return Ok(());
+                }
+
+                if let Some((relay_endpoint, requested_peer)) =
+                    self.pending_relay_requests.remove(&circuit_id)
+                {
+                    if relay_endpoint != source || requested_peer != peer_node_id {
+                        return Ok(());
+                    }
+                }
+
+                self.relay_paths.insert(
+                    (source, circuit_id),
+                    RelayPath {
+                        peer_node_id: peer_node_id.clone(),
+                        expires_at: Instant::now() + RELAY_CIRCUIT_TTL,
+                    },
+                );
+
+                info!(
+                    relay = %sender_node_id,
+                    peer = %peer_node_id,
+                    circuit_id,
+                    "relay path ready for opaque end-to-end cells"
+                );
+            }
+            SecurePayload::RelayCell {
+                circuit_id,
+                sequence,
+                opaque_payload_hex,
+            } => {
+                if self.relay_manager.get(circuit_id).is_some() {
+                    match self.relay_manager.forward(
+                        circuit_id,
+                        source,
+                        sender_node_id,
+                        sequence,
+                        opaque_payload_hex,
+                        Instant::now(),
+                    ) {
+                        Ok(forward) => {
+                            self.send_secure_payload(
+                                forward.destination,
+                                SecurePayload::RelayCell {
+                                    circuit_id: forward.circuit_id,
+                                    sequence: forward.sequence,
+                                    opaque_payload_hex: forward.opaque_payload_hex,
+                                },
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            debug!(circuit_id, %error, "relay cell rejected");
+                        }
+                    }
+                } else if let Some(path) = self.relay_paths.get_mut(&(source, circuit_id)) {
+                    if path.expires_at <= Instant::now() {
+                        self.relay_paths.remove(&(source, circuit_id));
+                        return Ok(());
+                    }
+
+                    let raw = match hex::decode(&opaque_payload_hex) {
+                        Ok(raw) => raw,
+                        Err(_) => return Ok(()),
+                    };
+                    if raw.is_empty() || raw.len() > crate::relay::MAX_RELAY_CELL_BYTES {
+                        return Ok(());
+                    }
+
+                    path.expires_at = Instant::now() + RELAY_CIRCUIT_TTL;
+                    if self.relay_inbox.len() >= MAX_RELAY_INBOX_CELLS {
+                        self.relay_inbox.pop_front();
+                    }
+                    self.relay_inbox.push_back(RelayDeliveredCell {
+                        relay_endpoint: source,
+                        circuit_id,
+                        peer_node_id: path.peer_node_id.clone(),
+                        sequence,
+                        opaque_payload_hex,
+                    });
+
+                    debug!(
+                        relay = %sender_node_id,
+                        peer = %path.peer_node_id,
+                        circuit_id,
+                        sequence,
+                        "opaque relay cell delivered to local inbox"
+                    );
+                }
+            }
+            SecurePayload::RelayClose { circuit_id } => {
+                if let Some((other_endpoint, _)) =
+                    self.relay_manager.close(circuit_id, source, sender_node_id)
+                {
+                    self.send_secure_payload(other_endpoint, SecurePayload::RelayClose { circuit_id })
+                        .await?;
+                } else {
+                    self.relay_paths.remove(&(source, circuit_id));
+                    self.pending_relay_requests.remove(&circuit_id);
+                }
+            }
+            SecurePayload::RelayReject { circuit_id } => {
+                self.pending_relay_requests.remove(&circuit_id);
+                self.relay_paths.remove(&(source, circuit_id));
+                debug!(relay = %sender_node_id, circuit_id, "relay request rejected");
+            }
             SecurePayload::RendezvousOffer {
                 peer_node_id,
                 candidate_endpoint,
@@ -1107,6 +1331,61 @@ impl KonoNode {
                 }
             }
         }
+    }
+
+    async fn flush_relay_requests(&mut self, relay_endpoint: SocketAddr) -> Result<()> {
+        let Some(targets) = self.queued_relays.remove(&relay_endpoint) else {
+            return Ok(());
+        };
+
+        for target_node_id in targets {
+            if !plausible_node_id(&target_node_id) {
+                continue;
+            }
+
+            let circuit_id: u64 = random();
+            self.pending_relay_requests
+                .insert(circuit_id, (relay_endpoint, target_node_id.clone()));
+
+            if let Err(error) = self
+                .send_secure_payload(
+                    relay_endpoint,
+                    SecurePayload::RelayOpen {
+                        circuit_id,
+                        target_node_id: target_node_id.clone(),
+                    },
+                )
+                .await
+            {
+                self.pending_relay_requests.remove(&circuit_id);
+                return Err(error);
+            }
+
+            info!(
+                %relay_endpoint,
+                target = %target_node_id,
+                circuit_id,
+                "requested cooperative relay circuit"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn persist_routing_cache(&self) -> Result<()> {
+        let Some(path) = &self.routing_cache_path else {
+            return Ok(());
+        };
+
+        let mut entries = Vec::new();
+        for endpoint in self.sessions.keys() {
+            let Some(peer) = self.peers.get(endpoint) else {
+                continue;
+            };
+            entries.push(new_cache_entry(peer.node_id.clone(), *endpoint)?);
+        }
+
+        save_routing_hints(path, &entries)
     }
 
     async fn flush_filter_test_request(&mut self, coordinator: SocketAddr) -> Result<()> {
@@ -1731,6 +2010,12 @@ impl KonoNode {
             .retain(|_, last| last.elapsed() < Duration::from_secs(60));
         self.discovery_candidates
             .retain(|_, expires_at| *expires_at > Instant::now());
+        self.relay_paths
+            .retain(|_, path| path.expires_at > Instant::now());
+        let expired_relay = self.relay_manager.expire(Instant::now());
+        if expired_relay > 0 {
+            debug!(expired_relay, "expired idle relay circuits");
+        }
         let expired_dht = self.dht.expire();
         if expired_dht > 0 {
             debug!(expired_dht, "expired stale DHT peer records");
@@ -1773,6 +2058,9 @@ fn local_features() -> Vec<String> {
         "encrypted-dht-lookup".to_owned(),
         "bounded-multihop-dht".to_owned(),
         "k-bucket-routing".to_owned(),
+        "persistent-routing-hints".to_owned(),
+        "cooperative-relay-control".to_owned(),
+        "opaque-relay-cells".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
