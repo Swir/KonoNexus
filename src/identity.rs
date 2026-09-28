@@ -90,12 +90,8 @@ mod tests {
         let message = b"kono-nexus-test";
         let signature = identity.sign(message);
 
-        NodeIdentity::verify_with_public_key(
-            &identity.public_key_bytes(),
-            message,
-            &signature,
-        )
-        .expect("signature should verify");
+        NodeIdentity::verify_with_public_key(&identity.public_key_bytes(), message, &signature)
+            .expect("signature should verify");
     }
 
     #[test]
