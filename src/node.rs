@@ -638,7 +638,9 @@ impl KonoNode {
                 }
 
                 if self.pending_dht_queries.contains(&record_node_id) {
-                    self.activate_dht_record(&record).await?;
+                    if let Some(current) = self.dht.get(&record_node_id).cloned() {
+                        self.activate_dht_record(&current).await?;
+                    }
                 }
             }
             SecurePayload::DhtFind { target_node_id } => {
@@ -691,7 +693,9 @@ impl KonoNode {
                     }
 
                     if exact && self.pending_dht_queries.contains(&target_node_id) {
-                        self.activate_dht_record(&record).await?;
+                        if let Some(current) = self.dht.get(&target_node_id).cloned() {
+                            self.activate_dht_record(&current).await?;
+                        }
                     }
                 }
             }
