@@ -51,17 +51,38 @@ pub fn load_routing_hints(path: &Path) -> Result<Vec<RoutingCacheEntry>> {
 
     let raw = fs::read(path)
         .with_context(|| format!("failed to read routing cache {}", path.display()))?;
-    let cache: RoutingCacheFile =
+    let value: serde_json::Value =
         serde_json::from_slice(&raw).context("failed to decode routing cache")?;
-
-    if cache.version != ROUTING_CACHE_VERSION {
-        return Ok(Vec::new());
-    }
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
 
     let now = unix_time_ms()?;
-    let mut entries = Vec::new();
+    let candidates: Vec<RoutingCacheEntry> = match version as u16 {
+        ROUTING_CACHE_VERSION => {
+            let cache: RoutingCacheFile =
+                serde_json::from_value(value).context("failed to decode routing cache")?;
+            cache.entries
+        }
+        ROUTING_BUCKET_CACHE_VERSION => {
+            let cache: RoutingBucketCacheFile =
+                serde_json::from_value(value).context("failed to decode routing bucket cache")?;
+            cache
+                .entries
+                .into_iter()
+                .map(|entry| RoutingCacheEntry {
+                    node_id: entry.node_id,
+                    endpoint: entry.endpoint,
+                    saved_unix_ms: entry.last_seen_unix_ms,
+                })
+                .collect()
+        }
+        _ => return Ok(Vec::new()),
+    };
 
-    for entry in cache.entries.into_iter().take(MAX_ROUTING_CACHE_ENTRIES) {
+    let mut entries = Vec::new();
+    for entry in candidates.into_iter().take(MAX_ROUTING_CACHE_ENTRIES) {
         if entry.saved_unix_ms > now
             || now.saturating_sub(entry.saved_unix_ms) > ROUTING_CACHE_MAX_AGE_MS
         {
@@ -362,8 +383,12 @@ mod tests {
 
         save_routing_bucket_snapshot(&path, &local, std::slice::from_ref(&entry)).unwrap();
         let loaded = load_routing_bucket_snapshot(&path, &local).unwrap();
+        let legacy_view = load_routing_hints(&path).unwrap();
 
-        assert_eq!(loaded, vec![entry]);
+        assert_eq!(loaded, vec![entry.clone()]);
+        assert_eq!(legacy_view.len(), 1);
+        assert_eq!(legacy_view[0].node_id, entry.node_id);
+        assert_eq!(legacy_view[0].endpoint, entry.endpoint);
         let _ = fs::remove_file(path);
     }
 
