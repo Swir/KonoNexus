@@ -15,6 +15,72 @@ pub const DEFAULT_COOKIE_BUCKET_MS: u64 = 60_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub const SEQUENCE_WINDOW_SIZE: u64 = 128;
+
+#[derive(Debug, Clone, Default)]
+pub struct SequenceWindow {
+    highest: Option<u64>,
+    seen: u128,
+}
+
+impl SequenceWindow {
+    pub fn check(&self, sequence: u64) -> Result<()> {
+        let Some(highest) = self.highest else {
+            return Ok(());
+        };
+
+        if sequence > highest {
+            return Ok(());
+        }
+
+        let offset = highest - sequence;
+        if offset >= SEQUENCE_WINDOW_SIZE {
+            bail!("sequence is older than replay window");
+        }
+
+        let mask = 1_u128 << offset;
+        if self.seen & mask != 0 {
+            bail!("sequence replay detected");
+        }
+
+        Ok(())
+    }
+
+    pub fn record(&mut self, sequence: u64) -> Result<()> {
+        self.check(sequence)?;
+
+        match self.highest {
+            None => {
+                self.highest = Some(sequence);
+                self.seen = 1;
+            }
+            Some(highest) if sequence > highest => {
+                let shift = sequence - highest;
+                self.seen = if shift >= SEQUENCE_WINDOW_SIZE {
+                    1
+                } else {
+                    (self.seen << shift) | 1
+                };
+                self.highest = Some(sequence);
+            }
+            Some(highest) => {
+                let offset = highest - sequence;
+                self.seen |= 1_u128 << offset;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn check_and_record(&mut self, sequence: u64) -> Result<()> {
+        self.record(sequence)
+    }
+
+    pub fn highest(&self) -> Option<u64> {
+        self.highest
+    }
+}
+
 #[derive(Debug)]
 struct PeerWindow {
     nonces: HashSet<u64>,
@@ -200,6 +266,27 @@ mod tests {
 
     fn packet(identity: &NodeIdentity, nonce: u64) -> WireEnvelope {
         WireEnvelope::signed(identity, nonce, MessageBody::Ping { token: nonce }).unwrap()
+    }
+
+    #[test]
+    fn sequence_window_accepts_bounded_reordering_and_rejects_replay() {
+        let mut window = SequenceWindow::default();
+
+        window.record(10).unwrap();
+        window.record(12).unwrap();
+        window.record(11).unwrap();
+
+        assert_eq!(window.highest(), Some(12));
+        assert!(window.record(11).is_err());
+    }
+
+    #[test]
+    fn sequence_window_rejects_frames_older_than_window() {
+        let mut window = SequenceWindow::default();
+        window.record(200).unwrap();
+
+        assert!(window.record(72).is_err());
+        window.record(73).unwrap();
     }
 
     #[test]
