@@ -1,5 +1,6 @@
 use crate::dht::PeerRecord;
 use crate::nat::FilterProbeAuthorization;
+use crate::relay_app::RelayAppFragment;
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -91,6 +92,12 @@ pub enum SecurePayload {
     },
     RelayReject {
         circuit_id: u64,
+    },
+    RelayAppFragment {
+        fragment: RelayAppFragment,
+    },
+    RelayAppAck {
+        message_id: u64,
     },
 }
 
