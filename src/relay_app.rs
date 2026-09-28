@@ -12,7 +12,11 @@ pub const MAX_RELAY_APP_INBOUND_ASSEMBLIES: usize = 64;
 pub const MAX_RELAY_APP_INBOUND_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RELAY_APP_COMPLETED_MESSAGES: usize = 128;
 pub const MAX_RELAY_APP_COMPLETED_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RELAY_APP_DELIVERED_IDS: usize = 1_024;
+pub const MAX_RELAY_APP_RETRANSMISSIONS: u8 = 4;
+pub const RELAY_APP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 pub const RELAY_APP_REASSEMBLY_TTL: Duration = Duration::from_secs(30);
+pub const RELAY_APP_DELIVERED_TTL: Duration = Duration::from_secs(120);
 pub const RELAY_APP_OUTBOUND_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +41,13 @@ pub struct RelayAppOutboundFragment {
     pub fragment: RelayAppFragment,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayAppReceiveStatus {
+    Pending,
+    Completed,
+    DuplicateCompleted,
+}
+
 #[derive(Debug)]
 struct OutboundMessage {
     peer_node_id: String,
@@ -45,6 +56,8 @@ struct OutboundMessage {
     fragment_count: u16,
     next_fragment_index: u16,
     awaiting_ack: bool,
+    retransmissions: u8,
+    retry_at: Option<Instant>,
     created_at: Instant,
 }
 
@@ -56,12 +69,20 @@ struct InboundAssembly {
     expires_at: Instant,
 }
 
+#[derive(Debug)]
+struct DeliveredRecord {
+    total_len: usize,
+    fragment_count: u16,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Default)]
 pub struct RelayAppManager {
     outbound: VecDeque<OutboundMessage>,
     outbound_bytes: usize,
     inbound: HashMap<(String, u64), InboundAssembly>,
     inbound_reserved_bytes: usize,
+    delivered: HashMap<(String, u64), DeliveredRecord>,
     completed: VecDeque<RelayAppMessage>,
     completed_bytes: usize,
 }
@@ -102,6 +123,8 @@ impl RelayAppManager {
             fragment_count,
             next_fragment_index: 0,
             awaiting_ack: false,
+            retransmissions: 0,
+            retry_at: None,
             created_at: now,
         });
 
@@ -136,7 +159,12 @@ impl RelayAppManager {
         })
     }
 
-    pub fn mark_fragment_sent(&mut self, message_id: u64, fragment_index: u16) -> Result<()> {
+    pub fn mark_fragment_sent(
+        &mut self,
+        message_id: u64,
+        fragment_index: u16,
+        now: Instant,
+    ) -> Result<()> {
         let message = self
             .outbound
             .iter_mut()
@@ -151,17 +179,50 @@ impl RelayAppManager {
             .next_fragment_index
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("relay application fragment index overflow"))?;
+
         if message.next_fragment_index >= message.fragment_count {
             message.awaiting_ack = true;
+            message.retry_at = Some(now + RELAY_APP_ACK_TIMEOUT);
         }
+
         Ok(())
+    }
+
+    pub fn prepare_retransmissions(&mut self, now: Instant) -> (usize, usize) {
+        let mut restarted = 0_usize;
+        let mut drop_indices = Vec::new();
+
+        for (index, message) in self.outbound.iter_mut().enumerate() {
+            if !message.awaiting_ack
+                || !message.retry_at.is_some_and(|retry_at| retry_at <= now)
+            {
+                continue;
+            }
+
+            if message.retransmissions >= MAX_RELAY_APP_RETRANSMISSIONS {
+                drop_indices.push(index);
+                continue;
+            }
+
+            message.retransmissions += 1;
+            message.next_fragment_index = 0;
+            message.awaiting_ack = false;
+            message.retry_at = None;
+            restarted += 1;
+        }
+
+        for index in drop_indices.iter().rev().copied() {
+            if let Some(message) = self.outbound.remove(index) {
+                self.outbound_bytes = self.outbound_bytes.saturating_sub(message.data.len());
+            }
+        }
+
+        (restarted, drop_indices.len())
     }
 
     pub fn acknowledge(&mut self, peer_node_id: &str, message_id: u64) -> bool {
         let Some(index) = self.outbound.iter().position(|message| {
-            message.message_id == message_id
-                && message.peer_node_id == peer_node_id
-                && message.awaiting_ack
+            message.message_id == message_id && message.peer_node_id == peer_node_id
         }) else {
             return false;
         };
@@ -170,6 +231,7 @@ impl RelayAppManager {
             self.outbound_bytes = self.outbound_bytes.saturating_sub(message.data.len());
             return true;
         }
+
         false
     }
 
@@ -178,10 +240,21 @@ impl RelayAppManager {
         peer_node_id: &str,
         fragment: RelayAppFragment,
         now: Instant,
-    ) -> Result<bool> {
+    ) -> Result<RelayAppReceiveStatus> {
         validate_fragment(&fragment)?;
+        self.expire_delivered(now);
+
         let total_len = fragment.total_len as usize;
         let key = (peer_node_id.to_owned(), fragment.message_id);
+
+        if let Some(delivered) = self.delivered.get(&key) {
+            if delivered.total_len != total_len
+                || delivered.fragment_count != fragment.fragment_count
+            {
+                bail!("relay application replay metadata does not match delivered message");
+            }
+            return Ok(RelayAppReceiveStatus::DuplicateCompleted);
+        }
 
         if !self.inbound.contains_key(&key) {
             if self.inbound.len() >= MAX_RELAY_APP_INBOUND_ASSEMBLIES
@@ -220,7 +293,7 @@ impl RelayAppManager {
             hex::decode(&fragment.data_hex).context("relay application fragment is not hex")?;
 
         match &assembly.fragments[index] {
-            Some(existing) if existing == &data => return Ok(false),
+            Some(existing) if existing == &data => return Ok(RelayAppReceiveStatus::Pending),
             Some(_) => bail!("relay application duplicate fragment content mismatch"),
             None => {
                 assembly.fragments[index] = Some(data);
@@ -229,7 +302,7 @@ impl RelayAppManager {
         }
 
         if assembly.received_count != assembly.fragments.len() {
-            return Ok(false);
+            return Ok(RelayAppReceiveStatus::Pending);
         }
 
         let assembly = self
@@ -241,15 +314,24 @@ impl RelayAppManager {
             .saturating_sub(assembly.total_len);
 
         let mut data = Vec::with_capacity(assembly.total_len);
-        for fragment in assembly.fragments {
-            let fragment =
-                fragment.ok_or_else(|| anyhow::anyhow!("relay application fragment missing"))?;
-            data.extend_from_slice(&fragment);
+        for fragment_data in assembly.fragments {
+            let fragment_data = fragment_data
+                .ok_or_else(|| anyhow::anyhow!("relay application fragment missing"))?;
+            data.extend_from_slice(&fragment_data);
         }
 
         if data.len() != assembly.total_len {
             bail!("relay application reassembled length mismatch");
         }
+
+        self.insert_delivered(
+            key,
+            DeliveredRecord {
+                total_len: assembly.total_len,
+                fragment_count: fragment.fragment_count,
+                expires_at: now + RELAY_APP_DELIVERED_TTL,
+            },
+        );
 
         self.push_completed(RelayAppMessage {
             peer_node_id: peer_node_id.to_owned(),
@@ -257,7 +339,7 @@ impl RelayAppManager {
             data,
         });
 
-        Ok(true)
+        Ok(RelayAppReceiveStatus::Completed)
     }
 
     pub fn take_completed(&mut self) -> Vec<RelayAppMessage> {
@@ -276,6 +358,8 @@ impl RelayAppManager {
     }
 
     pub fn expire(&mut self, now: Instant) -> (usize, usize) {
+        self.expire_delivered(now);
+
         let expired_inbound: Vec<(String, u64)> = self
             .inbound
             .iter()
@@ -314,6 +398,27 @@ impl RelayAppManager {
 
     pub fn outbound_bytes(&self) -> usize {
         self.outbound_bytes
+    }
+
+    fn insert_delivered(&mut self, key: (String, u64), record: DeliveredRecord) {
+        if !self.delivered.contains_key(&key) && self.delivered.len() >= MAX_RELAY_APP_DELIVERED_IDS
+        {
+            if let Some(oldest) = self
+                .delivered
+                .iter()
+                .min_by_key(|(_, record)| record.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.delivered.remove(&oldest);
+            }
+        }
+
+        self.delivered.insert(key, record);
+    }
+
+    fn expire_delivered(&mut self, now: Instant) {
+        self.delivered
+            .retain(|_, delivered| delivered.expires_at > now);
     }
 
     fn push_completed(&mut self, message: RelayAppMessage) {
@@ -377,6 +482,36 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    fn drain_one_pass(
+        sender: &mut RelayAppManager,
+        receiver: &mut RelayAppManager,
+        ready: &HashSet<String>,
+        now: Instant,
+        drop_index: Option<u16>,
+    ) -> Option<u64> {
+        let mut completed_message = None;
+
+        while let Some(outbound) = sender.peek_next(ready) {
+            let fragment_index = outbound.fragment.fragment_index;
+            let message_id = outbound.fragment.message_id;
+
+            if drop_index != Some(fragment_index) {
+                let status = receiver
+                    .accept_fragment("peer-a", outbound.fragment.clone(), now)
+                    .unwrap();
+                if status == RelayAppReceiveStatus::Completed {
+                    completed_message = Some(message_id);
+                }
+            }
+
+            sender
+                .mark_fragment_sent(message_id, fragment_index, now)
+                .unwrap();
+        }
+
+        completed_message
+    }
+
     #[test]
     fn fragments_reassemble_and_ack_releases_backpressure() {
         let now = Instant::now();
@@ -386,18 +521,8 @@ mod tests {
         let message_id = sender.queue("peer-b".into(), data.clone(), now).unwrap();
         let ready = HashSet::from(["peer-b".to_owned()]);
 
-        while let Some(outbound) = sender.peek_next(&ready) {
-            let fragment_index = outbound.fragment.fragment_index;
-            let completed = receiver
-                .accept_fragment("peer-a", outbound.fragment.clone(), now)
-                .unwrap();
-            sender
-                .mark_fragment_sent(message_id, fragment_index)
-                .unwrap();
-            if completed {
-                break;
-            }
-        }
+        let completed_id = drain_one_pass(&mut sender, &mut receiver, &ready, now, None);
+        assert_eq!(completed_id, Some(message_id));
 
         let completed = receiver.take_completed();
         assert_eq!(completed.len(), 1);
@@ -406,6 +531,103 @@ mod tests {
         assert!(sender.acknowledge("peer-b", message_id));
         assert_eq!(sender.outbound_message_count(), 0);
         assert_eq!(sender.outbound_bytes(), 0);
+    }
+
+    #[test]
+    fn missing_fragment_is_recovered_by_bounded_retransmission() {
+        let now = Instant::now();
+        let data = vec![0x33; RELAY_APP_FRAGMENT_BYTES * 2 + 11];
+        let mut sender = RelayAppManager::default();
+        let mut receiver = RelayAppManager::default();
+        let message_id = sender.queue("peer-b".into(), data.clone(), now).unwrap();
+        let ready = HashSet::from(["peer-b".to_owned()]);
+
+        assert_eq!(
+            drain_one_pass(&mut sender, &mut receiver, &ready, now, Some(1)),
+            None
+        );
+        assert!(receiver.take_completed().is_empty());
+
+        let retry_at = now + RELAY_APP_ACK_TIMEOUT;
+        assert_eq!(sender.prepare_retransmissions(retry_at), (1, 0));
+        assert_eq!(
+            drain_one_pass(&mut sender, &mut receiver, &ready, retry_at, None),
+            Some(message_id)
+        );
+
+        let completed = receiver.take_completed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].data, data);
+    }
+
+    #[test]
+    fn lost_ack_retransmission_does_not_redeliver_message() {
+        let now = Instant::now();
+        let data = vec![0x44; RELAY_APP_FRAGMENT_BYTES + 7];
+        let mut sender = RelayAppManager::default();
+        let mut receiver = RelayAppManager::default();
+        let message_id = sender.queue("peer-b".into(), data, now).unwrap();
+        let ready = HashSet::from(["peer-b".to_owned()]);
+
+        assert_eq!(
+            drain_one_pass(&mut sender, &mut receiver, &ready, now, None),
+            Some(message_id)
+        );
+        assert_eq!(receiver.take_completed().len(), 1);
+
+        let retry_at = now + RELAY_APP_ACK_TIMEOUT;
+        assert_eq!(sender.prepare_retransmissions(retry_at), (1, 0));
+
+        let outbound = sender.peek_next(&ready).unwrap();
+        assert_eq!(
+            receiver
+                .accept_fragment("peer-a", outbound.fragment.clone(), retry_at)
+                .unwrap(),
+            RelayAppReceiveStatus::DuplicateCompleted
+        );
+        sender
+            .mark_fragment_sent(
+                message_id,
+                outbound.fragment.fragment_index,
+                retry_at,
+            )
+            .unwrap();
+
+        assert!(receiver.take_completed().is_empty());
+        assert!(sender.acknowledge("peer-b", message_id));
+        assert_eq!(sender.outbound_message_count(), 0);
+    }
+
+    #[test]
+    fn retransmissions_stop_after_bounded_retry_count() {
+        let now = Instant::now();
+        let mut sender = RelayAppManager::default();
+        let ready = HashSet::from(["peer-b".to_owned()]);
+        sender.queue("peer-b".into(), vec![1_u8; 32], now).unwrap();
+
+        let mut current = now;
+        for retry in 0..=MAX_RELAY_APP_RETRANSMISSIONS {
+            while let Some(outbound) = sender.peek_next(&ready) {
+                sender
+                    .mark_fragment_sent(
+                        outbound.fragment.message_id,
+                        outbound.fragment.fragment_index,
+                        current,
+                    )
+                    .unwrap();
+            }
+
+            current += RELAY_APP_ACK_TIMEOUT;
+            let (_, dropped) = sender.prepare_retransmissions(current);
+
+            if retry < MAX_RELAY_APP_RETRANSMISSIONS {
+                assert_eq!(dropped, 0);
+            } else {
+                assert_eq!(dropped, 1);
+            }
+        }
+
+        assert_eq!(sender.outbound_message_count(), 0);
     }
 
     #[test]
@@ -446,7 +668,10 @@ mod tests {
             total_len: (RELAY_APP_FRAGMENT_BYTES + 1) as u32,
             data_hex: hex::encode(vec![3_u8; RELAY_APP_FRAGMENT_BYTES]),
         };
-        manager.accept_fragment("peer", fragment, now).unwrap();
+        assert_eq!(
+            manager.accept_fragment("peer", fragment, now).unwrap(),
+            RelayAppReceiveStatus::Pending
+        );
 
         let (inbound, outbound) =
             manager.expire(now + RELAY_APP_OUTBOUND_TTL + Duration::from_secs(1));
