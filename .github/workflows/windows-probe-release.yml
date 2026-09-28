@@ -36,7 +36,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\kononexus_probe.exe dist\kononexus_probe.exe
           @"
-          KonoNexus 0.1.0-alpha.15 Windows x64 test probe
+          KonoNexus 0.1.0-alpha.15.1 Windows x64 test probe
 
           This package is for controlled external testing.
           The executable is unsigned, so Windows may show a SmartScreen prompt.
@@ -47,16 +47,16 @@ jobs:
           Test procedure:
           https://github.com/Swir/KonoNexus/blob/main/docs/TESTING.md
           "@ | Set-Content -Encoding UTF8 dist\README-TEST.txt
-          Compress-Archive -Path dist\kononexus_probe.exe,dist\README-TEST.txt -DestinationPath KonoNexus-alpha.15-Windows-x64.zip -Force
+          Compress-Archive -Path dist\kononexus_probe.exe,dist\README-TEST.txt -DestinationPath KonoNexus-alpha.15.1-Windows-x64.zip -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KonoNexus-alpha.15-Windows-x64
+          name: KonoNexus-alpha.15.1-Windows-x64
           path: |
             dist/kononexus_probe.exe
             dist/README-TEST.txt
-            KonoNexus-alpha.15-Windows-x64.zip
+            KonoNexus-alpha.15.1-Windows-x64.zip
           if-no-files-found: error
 
       - name: Publish prerelease assets
@@ -64,9 +64,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "v0.1.0-alpha.15-test"
+          $tag = "v0.1.0-alpha.15.1-test"
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target "$env:GITHUB_SHA" --title "KonoNexus 0.1.0-alpha.15 Testing Candidate" --notes "Windows x64 probe build for controlled multi-PC testing. This is a prerelease/testing candidate, not a stable production release." --prerelease
+            gh release create $tag --target "$env:GITHUB_SHA" --title "KonoNexus 0.1.0-alpha.15.1 Testing Candidate" --notes "Windows x64 probe build for controlled multi-PC testing. This is a prerelease/testing candidate, not a stable production release." --prerelease
           }
-          gh release upload $tag dist\kononexus_probe.exe KonoNexus-alpha.15-Windows-x64.zip --clobber
+          gh release upload $tag dist\kononexus_probe.exe KonoNexus-alpha.15.1-Windows-x64.zip --clobber
