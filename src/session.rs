@@ -598,9 +598,7 @@ mod tests {
     #[test]
     fn session_slot_accepts_old_inflight_frames_during_rekey_grace() {
         let (mut old_a, old_b) = session_pair();
-        let inflight = old_a
-            .encrypt(&SecurePayload::Ping { token: 77 })
-            .unwrap();
+        let inflight = old_a.encrypt(&SecurePayload::Ping { token: 77 }).unwrap();
 
         let pending = PendingHandshake::new("node-b".to_owned());
         let rekey_id = pending.handshake_id();
@@ -612,12 +610,8 @@ mod tests {
         let now = Instant::now();
         let mut slot_a = SessionSlot::new(old_a);
         let mut slot_b = SessionSlot::new(old_b);
-        slot_a
-            .rotate(new_a, now, Duration::from_secs(30))
-            .unwrap();
-        slot_b
-            .rotate(new_b, now, Duration::from_secs(30))
-            .unwrap();
+        slot_a.rotate(new_a, now, Duration::from_secs(30)).unwrap();
+        slot_b.rotate(new_b, now, Duration::from_secs(30)).unwrap();
 
         assert_eq!(
             slot_b
@@ -631,9 +625,7 @@ mod tests {
             SecurePayload::Ping { token: 77 }
         );
 
-        let new_frame = slot_a
-            .encrypt(&SecurePayload::Ping { token: 88 })
-            .unwrap();
+        let new_frame = slot_a.encrypt(&SecurePayload::Ping { token: 88 }).unwrap();
         assert_eq!(
             slot_b
                 .decrypt(
