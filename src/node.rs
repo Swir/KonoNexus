@@ -6,13 +6,16 @@ use crate::identity::NodeIdentity;
 use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
+use crate::relay::{RelayManager, RELAY_CIRCUIT_TTL};
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
+use crate::routing_cache::{load_routing_hints, new_cache_entry, save_routing_hints};
 use crate::security::{CookieGuard, ReplayGuard};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{Context, Result};
 use rand::random;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -28,6 +31,7 @@ const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
+const MAX_RELAY_INBOX_CELLS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -66,6 +70,21 @@ struct ReverseDhtRoute {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct RelayPath {
+    peer_node_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayDeliveredCell {
+    pub relay_endpoint: SocketAddr,
+    pub circuit_id: u64,
+    pub peer_node_id: String,
+    pub sequence: u64,
+    pub opaque_payload_hex: String,
+}
+
 pub struct KonoNode {
     identity: NodeIdentity,
     socket: Arc<UdpSocket>,
@@ -94,6 +113,12 @@ pub struct KonoNode {
     last_dht_query_start: HashMap<String, Instant>,
     last_dht_forward: HashMap<SocketAddr, Instant>,
     discovery_candidates: HashMap<SocketAddr, Instant>,
+    routing_cache_path: Option<PathBuf>,
+    relay_manager: RelayManager,
+    queued_relays: HashMap<SocketAddr, Vec<String>>,
+    pending_relay_requests: HashMap<u64, (SocketAddr, String)>,
+    relay_paths: HashMap<(SocketAddr, u64), RelayPath>,
+    relay_inbox: VecDeque<RelayDeliveredCell>,
     hello_interval: Duration,
 }
 
@@ -137,6 +162,12 @@ impl KonoNode {
             last_dht_query_start: HashMap::new(),
             last_dht_forward: HashMap::new(),
             discovery_candidates: HashMap::new(),
+            routing_cache_path: None,
+            relay_manager: RelayManager::default(),
+            queued_relays: HashMap::new(),
+            pending_relay_requests: HashMap::new(),
+            relay_paths: HashMap::new(),
+            relay_inbox: VecDeque::new(),
             hello_interval,
         })
     }
@@ -157,6 +188,35 @@ impl KonoNode {
 
     pub fn queue_filter_test(&mut self, coordinator: SocketAddr) {
         self.queued_filter_tests.insert(coordinator);
+    }
+
+    pub fn queue_relay(&mut self, relay_endpoint: SocketAddr, target_node_id: String) {
+        self.queued_relays
+            .entry(relay_endpoint)
+            .or_default()
+            .push(target_node_id);
+    }
+
+    pub fn configure_routing_cache(&mut self, path: PathBuf) -> Result<usize> {
+        let hints = load_routing_hints(&path)?;
+        let mut loaded = 0_usize;
+
+        for hint in hints {
+            let Ok(endpoint) = hint.endpoint.parse::<SocketAddr>() else {
+                continue;
+            };
+            if !self.bootstrap_peers.contains(&endpoint) {
+                self.bootstrap_peers.push(endpoint);
+                loaded += 1;
+            }
+        }
+
+        self.routing_cache_path = Some(path);
+        Ok(loaded)
+    }
+
+    pub fn take_relay_cells(&mut self) -> Vec<RelayDeliveredCell> {
+        self.relay_inbox.drain(..).collect()
     }
 
     pub fn node_id(&self) -> String {
