@@ -284,8 +284,9 @@ impl KonoNode {
         let before = self.peers.len();
         self.peers
             .retain(|_, peer| peer.last_seen.elapsed() <= max_age);
-        self.cookie_cache
-            .retain(|endpoint, _| self.bootstrap_peers.contains(endpoint) || self.peers.contains_key(endpoint));
+        self.cookie_cache.retain(|endpoint, _| {
+            self.bootstrap_peers.contains(endpoint) || self.peers.contains_key(endpoint)
+        });
 
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
