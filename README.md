@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha — protocol foundation**. The current implementation provides persistent cryptographic node identities, signed UDP discovery packets, peer tracking, ping/pong health checks, and bootstrap-by-peer-address. End-to-end application payload encryption, NAT traversal, DHT routing, multi-hop relay, and store-and-forward are intentionally not claimed as complete yet.
+> Status: **0.1.0-alpha.2 — protocol foundation**. The current implementation provides persistent cryptographic node identities, signed UDP discovery packets, bounded replay protection, bounded peer tracking, ping/pong health checks, and bootstrap-by-peer-address. End-to-end application payload encryption, NAT traversal, DHT routing, multi-hop relay, and store-and-forward are intentionally not claimed as complete yet.
 
 ## Principles
 
@@ -31,7 +31,7 @@ Node A                        Node B
   |<--------------------------->|
 ```
 
-Each installation creates and stores an Ed25519 identity key. KNP envelopes are signed and verified before a peer is accepted.
+Each installation creates and stores an Ed25519 identity key. KNP envelopes are signed and verified before a peer is accepted. Freshness checks reject packets outside a two-minute clock window, while a bounded per-identity nonce cache rejects recent duplicate packets without allowing replay state to grow without limit.
 
 ## Quick start
 
@@ -68,7 +68,9 @@ Set `RUST_LOG=debug` for verbose diagnostics.
 - [x] Peer table and health timestamps
 - [x] Signed PING / PONG
 - [x] CI: formatting, Clippy, tests
-- [ ] Replay window and anti-amplification cookies
+- [x] Bounded replay window and timestamp freshness checks
+- [x] Bounded peer table / replay-state memory
+- [ ] Anti-amplification cookies
 - [ ] Encrypted session handshake
 - [ ] Automatic NAT type detection
 - [ ] UDP hole punching

@@ -30,15 +30,15 @@ KonoNexus should assume that the public Internet and arbitrary relay nodes are h
 - explicit protocol version,
 - datagram size ceiling,
 - unverified packets rejected before peer acceptance.
+- bounded timestamp/nonce replay protection,
+- bounded replay-state identities and bounded live peer table.
 
 ## Required before production
 
-- bounded replay cache and timestamp policy,
 - anti-amplification challenge/cookie before expensive responses,
 - authenticated ephemeral key agreement,
 - AEAD framing with monotonically checked sequence numbers,
 - rate limits per endpoint and identity,
-- peer-table size limits and eviction rules,
 - secure key-file permissions on each supported OS,
 - DHT record signatures and expiry,
 - Sybil resistance / routing diversity,

@@ -41,6 +41,12 @@ Fields:
 
 A receiver MUST verify that the NodeID matches the included public key and MUST verify the signature before accepting the sender into its peer table.
 
+### Freshness and duplicate suppression
+
+After signature validation, the current alpha implementation applies a bounded replay guard. Packets more than 120 seconds away from the receiver clock are rejected. For each recently observed NodeID, the receiver remembers up to 128 nonces and rejects a duplicate nonce. Replay state tracks at most 2048 identities and evicts the least-recently-seen identity when full. The live peer table is independently capped at 2048 endpoints.
+
+These limits are defensive alpha defaults, not frozen KNP/1 constants.
+
 ## 4. Control messages
 
 ### HELLO
@@ -98,6 +104,10 @@ Future routing records will be keyed by NodeID rather than address. The route se
 
 Relay nodes MUST NOT need application plaintext.
 
-## 9. Versioning
+## 9. Resource bounds
+
+KNP implementations MUST bound untrusted state derived from remote traffic. The reference alpha now bounds both replay state and the live peer table. Future DHT, relay, and mailbox structures will require their own explicit quotas and expiry policies.
+
+## 10. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Before a stable specification, capability negotiation will allow compatible extensions without silently changing security semantics.

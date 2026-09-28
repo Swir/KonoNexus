@@ -1,5 +1,6 @@
 use crate::identity::NodeIdentity;
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
+use crate::security::ReplayGuard;
 use anyhow::{Context, Result};
 use rand::random;
 use std::collections::HashMap;
@@ -9,6 +10,8 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time;
 use tracing::{debug, info, warn};
+
+const MAX_PEERS: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -25,6 +28,7 @@ pub struct KonoNode {
     socket: Arc<UdpSocket>,
     bootstrap_peers: Vec<SocketAddr>,
     peers: HashMap<SocketAddr, PeerInfo>,
+    replay_guard: ReplayGuard,
     hello_interval: Duration,
 }
 
@@ -44,6 +48,7 @@ impl KonoNode {
             socket: Arc::new(socket),
             bootstrap_peers,
             peers: HashMap::new(),
+            replay_guard: ReplayGuard::default(),
             hello_interval,
         })
     }
@@ -105,6 +110,7 @@ impl KonoNode {
     async fn handle_datagram(&mut self, bytes: &[u8], source: SocketAddr) -> Result<()> {
         let envelope = WireEnvelope::decode(bytes)?;
         envelope.verify()?;
+        self.replay_guard.check_and_record(&envelope)?;
 
         if envelope.sender_node_id == self.node_id() {
             return Ok(());
@@ -154,6 +160,17 @@ impl KonoNode {
     }
 
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
+        if !self.peers.contains_key(&source) && self.peers.len() >= MAX_PEERS {
+            if let Some(oldest) = self
+                .peers
+                .iter()
+                .min_by_key(|(_, peer)| peer.last_seen)
+                .map(|(endpoint, _)| *endpoint)
+            {
+                self.peers.remove(&oldest);
+            }
+        }
+
         let now = Instant::now();
         self.peers
             .entry(source)
