@@ -40,6 +40,10 @@ const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
 const RELAY_APP_BURST_PER_TICK: usize = 4;
 const MAX_RELAY_APP_HANDLE_CAPACITY: usize = 1_024;
+const SESSION_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SESSION_HANDSHAKE_MAX_ATTEMPTS: u8 = 4;
+const SESSION_RESPONDER_ACK_TTL: Duration = Duration::from_secs(10);
+const MAX_SESSION_RESPONDER_ACKS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -92,6 +96,23 @@ impl RelayAppHandle {
     }
 }
 
+struct PendingSessionAttempt {
+    pending: PendingHandshake,
+    handshake_id: u64,
+    peer_node_id: String,
+    ephemeral_public_key: String,
+    attempts: u8,
+    next_retry_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ResponderSessionAck {
+    peer_node_id: String,
+    initiator_public_key: String,
+    responder_public_key: String,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct PendingFilterProbe {
     expected_helper_node_id: String,
@@ -141,7 +162,8 @@ pub struct KonoNode {
     cookie_cache: HashMap<SocketAddr, String>,
     replay_guard: ReplayGuard,
     cookie_guard: CookieGuard,
-    pending_sessions: HashMap<SocketAddr, PendingHandshake>,
+    pending_sessions: HashMap<SocketAddr, PendingSessionAttempt>,
+    responder_session_acks: HashMap<(SocketAddr, u64), ResponderSessionAck>,
     sessions: HashMap<SocketAddr, SecureSession>,
     nat_profile: NatProfile,
     pending_punches: HashMap<u64, PunchSchedule>,
@@ -198,6 +220,7 @@ impl KonoNode {
             replay_guard: ReplayGuard::default(),
             cookie_guard: CookieGuard::default(),
             pending_sessions: HashMap::new(),
+            responder_session_acks: HashMap::new(),
             sessions: HashMap::new(),
             nat_profile: NatProfile::default(),
             pending_punches: HashMap::new(),
@@ -387,6 +410,7 @@ impl KonoNode {
                     self.flush_relay_app_failures();
                 }
                 _ = rendezvous_ticker.tick() => {
+                    self.drive_session_handshakes().await;
                     self.drive_auto_rendezvous().await;
                     self.drive_dht_queries().await;
                     self.flush_relay_app_events();
@@ -525,6 +549,30 @@ impl KonoNode {
                     return Ok(());
                 }
 
+                let ack_key = (source, handshake_id);
+                if let Some(cached) = self.responder_session_acks.get(&ack_key).cloned() {
+                    if cached.expires_at > Instant::now()
+                        && cached.peer_node_id == sender_node_id
+                        && cached.initiator_public_key == ephemeral_public_key
+                    {
+                        self.send(
+                            source,
+                            MessageBody::SessionAck {
+                                handshake_id,
+                                ephemeral_public_key: cached.responder_public_key,
+                            },
+                        )
+                        .await?;
+                        debug!(
+                            peer = %sender_node_id,
+                            %source,
+                            handshake_id,
+                            "re-sent cached session ack"
+                        );
+                        return Ok(());
+                    }
+                }
+
                 self.pending_sessions.remove(&source);
                 let (session, responder_public_key) = respond_handshake(
                     &local_node_id,
@@ -533,6 +581,27 @@ impl KonoNode {
                     &ephemeral_public_key,
                 )?;
                 let session_id = session.session_id().to_owned();
+
+                if self.responder_session_acks.len() >= MAX_SESSION_RESPONDER_ACKS {
+                    if let Some(oldest) = self
+                        .responder_session_acks
+                        .iter()
+                        .min_by_key(|(_, state)| state.expires_at)
+                        .map(|(key, _)| *key)
+                    {
+                        self.responder_session_acks.remove(&oldest);
+                    }
+                }
+
+                self.responder_session_acks.insert(
+                    ack_key,
+                    ResponderSessionAck {
+                        peer_node_id: sender_node_id.clone(),
+                        initiator_public_key: ephemeral_public_key.clone(),
+                        responder_public_key: responder_public_key.clone(),
+                        expires_at: Instant::now() + SESSION_RESPONDER_ACK_TTL,
+                    },
+                );
 
                 self.send(
                     source,
@@ -562,20 +631,22 @@ impl KonoNode {
                 handshake_id,
                 ephemeral_public_key,
             } => {
-                let valid_pending = self.pending_sessions.get(&source).is_some_and(|pending| {
-                    pending.handshake_id() == handshake_id
-                        && pending.peer_node_id() == sender_node_id
+                let valid_pending = self.pending_sessions.get(&source).is_some_and(|attempt| {
+                    attempt.handshake_id == handshake_id
+                        && attempt.peer_node_id == sender_node_id
                 });
                 if !valid_pending {
                     debug!(%source, handshake_id, "ignoring unexpected session ack");
                     return Ok(());
                 }
 
-                let pending = self
+                let attempt = self
                     .pending_sessions
                     .remove(&source)
                     .expect("pending session checked above");
-                let mut session = pending.complete(&self.node_id(), &ephemeral_public_key)?;
+                let mut session = attempt
+                    .pending
+                    .complete(&self.node_id(), &ephemeral_public_key)?;
                 let session_id = session.session_id().to_owned();
                 let frame = session.encrypt(&SecurePayload::Ping { token: random() })?;
                 self.sessions.insert(source, session);
@@ -2376,6 +2447,69 @@ impl KonoNode {
         }
     }
 
+    async fn drive_session_handshakes(&mut self) {
+        let now = Instant::now();
+        self.responder_session_acks
+            .retain(|_, state| state.expires_at > now);
+
+        let due: Vec<SocketAddr> = self
+            .pending_sessions
+            .iter()
+            .filter(|(_, attempt)| attempt.next_retry_at <= now)
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+
+        for endpoint in due {
+            let Some(attempt) = self.pending_sessions.get_mut(&endpoint) else {
+                continue;
+            };
+
+            if attempt.attempts >= SESSION_HANDSHAKE_MAX_ATTEMPTS {
+                let peer = attempt.peer_node_id.clone();
+                self.pending_sessions.remove(&endpoint);
+                debug!(
+                    %endpoint,
+                    peer = %peer,
+                    "session handshake retries exhausted"
+                );
+                continue;
+            }
+
+            let handshake_id = attempt.handshake_id;
+            let ephemeral_public_key = attempt.ephemeral_public_key.clone();
+            let peer_node_id = attempt.peer_node_id.clone();
+            attempt.attempts += 1;
+            attempt.next_retry_at = now + SESSION_HANDSHAKE_RETRY_DELAY;
+            let attempt_number = attempt.attempts;
+
+            if let Err(error) = self
+                .send(
+                    endpoint,
+                    MessageBody::SessionInit {
+                        handshake_id,
+                        ephemeral_public_key,
+                    },
+                )
+                .await
+            {
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    attempt = attempt_number,
+                    %error,
+                    "session handshake retransmission failed"
+                );
+            } else {
+                debug!(
+                    %endpoint,
+                    peer = %peer_node_id,
+                    attempt = attempt_number,
+                    "retransmitted session init"
+                );
+            }
+        }
+    }
+
     async fn maybe_start_session(&mut self, target: SocketAddr, peer_node_id: &str) -> Result<()> {
         if self.sessions.contains_key(&target) || self.pending_sessions.contains_key(&target) {
             return Ok(());
@@ -2384,7 +2518,18 @@ impl KonoNode {
         let pending = PendingHandshake::new(peer_node_id.to_owned());
         let handshake_id = pending.handshake_id();
         let ephemeral_public_key = pending.public_key_hex();
-        self.pending_sessions.insert(target, pending);
+
+        self.pending_sessions.insert(
+            target,
+            PendingSessionAttempt {
+                pending,
+                handshake_id,
+                peer_node_id: peer_node_id.to_owned(),
+                ephemeral_public_key: ephemeral_public_key.clone(),
+                attempts: 1,
+                next_retry_at: Instant::now() + SESSION_HANDSHAKE_RETRY_DELAY,
+            },
+        );
 
         if let Err(error) = self
             .send(
@@ -2446,6 +2591,8 @@ impl KonoNode {
             self.peers.remove(&previous_endpoint);
             self.cookie_cache.remove(&previous_endpoint);
             self.pending_sessions.remove(&previous_endpoint);
+            self.responder_session_acks
+                .retain(|(endpoint, _), _| *endpoint != previous_endpoint);
             self.sessions.remove(&previous_endpoint);
             self.routing.remove_endpoint(previous_endpoint);
         }
@@ -2454,6 +2601,8 @@ impl KonoNode {
             if existing.node_id != envelope.sender_node_id {
                 self.sessions.remove(&source);
                 self.pending_sessions.remove(&source);
+                self.responder_session_acks
+                    .retain(|(endpoint, _), _| *endpoint != source);
                 self.routing.remove_endpoint(source);
             }
         }
@@ -2497,6 +2646,8 @@ impl KonoNode {
             self.peers.remove(&endpoint);
             self.cookie_cache.remove(&endpoint);
             self.pending_sessions.remove(&endpoint);
+            self.responder_session_acks
+                .retain(|(ack_endpoint, _), _| *ack_endpoint != endpoint);
             self.sessions.remove(&endpoint);
             self.routing.remove_endpoint(endpoint);
         }
@@ -2617,6 +2768,7 @@ fn local_features() -> Vec<String> {
         "replay-guard".to_owned(),
         "cookie-challenge".to_owned(),
         "x25519-hkdf-session".to_owned(),
+        "session-handshake-retry".to_owned(),
         "chacha20poly1305-aead".to_owned(),
         "nat-observation".to_owned(),
         "decentralized-rendezvous".to_owned(),
