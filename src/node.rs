@@ -1039,18 +1039,16 @@ impl KonoNode {
                     return Ok(());
                 }
 
-                let origin_valid = self
-                    .pending_relay_requests
-                    .remove(&circuit_id)
-                    .is_some_and(|(relay_endpoint, requested_peer)| {
+                let origin_valid = self.pending_relay_requests.remove(&circuit_id).is_some_and(
+                    |(relay_endpoint, requested_peer)| {
                         relay_endpoint == source && requested_peer == peer_node_id
-                    });
+                    },
+                );
                 let target_valid = self
                     .pending_relay_accepts
                     .remove(&(source, circuit_id))
                     .is_some_and(|pending| {
-                        pending.expires_at > Instant::now()
-                            && pending.peer_node_id == peer_node_id
+                        pending.expires_at > Instant::now() && pending.peer_node_id == peer_node_id
                     });
 
                 if !origin_valid && !target_valid {
