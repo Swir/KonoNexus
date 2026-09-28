@@ -31,7 +31,8 @@ pub use relay::{
     MAX_RELAY_CIRCUITS_PER_NODE, RELAY_CIRCUIT_TTL, RELAY_RATE_WINDOW,
 };
 pub use relay_app::{
-    RelayAppDeliveryFailure, RelayAppFailureReason, RelayAppFragment, RelayAppManager,
+    RelayAppDeliveryFailure, RelayAppDeliveryReceipt, RelayAppFailureReason, RelayAppFragment,
+    RelayAppManager,
     RelayAppMessage, RelayAppOutboundFragment, RelayAppReceiveStatus, MAX_RELAY_APP_MESSAGE_BYTES,
     MAX_RELAY_APP_OUTBOUND_BYTES, MAX_RELAY_APP_OUTBOUND_MESSAGES, MAX_RELAY_APP_RETRANSMISSIONS,
     RELAY_APP_ACK_TIMEOUT, RELAY_APP_FRAGMENT_BYTES,
