@@ -1,4 +1,7 @@
-use crate::dht::{endpoint_publishable, DhtTable, PeerRecord, DHT_RESPONSE_LIMIT};
+use crate::dht::{
+    endpoint_publishable, DhtTable, PeerRecord, RoutingTable, DHT_MAX_HOPS, DHT_QUERY_FANOUT,
+    DHT_QUERY_RETRY_DELAY, DHT_QUERY_TIMEOUT, DHT_RESPONSE_LIMIT,
+};
 use crate::identity::NodeIdentity;
 use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
@@ -23,6 +26,8 @@ const RENDEZVOUS_REQUEST_COOLDOWN: Duration = Duration::from_secs(1);
 const FILTER_TEST_REQUEST_COOLDOWN: Duration = Duration::from_secs(10);
 const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
+const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
+const MAX_SEEN_DHT_QUERIES: usize = 2_048;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -49,6 +54,18 @@ struct PendingFilterConsent {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveDhtQuery {
+    target_node_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ReverseDhtRoute {
+    previous_endpoint: SocketAddr,
+    expires_at: Instant,
+}
+
 pub struct KonoNode {
     identity: NodeIdentity,
     socket: Arc<UdpSocket>,
@@ -69,7 +86,13 @@ pub struct KonoNode {
     last_rendezvous_request: HashMap<SocketAddr, Instant>,
     last_filter_test_request: HashMap<SocketAddr, Instant>,
     dht: DhtTable,
+    routing: RoutingTable,
     pending_dht_queries: HashSet<String>,
+    active_dht_queries: HashMap<u64, ActiveDhtQuery>,
+    seen_dht_queries: HashMap<(String, u64), Instant>,
+    reverse_dht_routes: HashMap<(String, u64), ReverseDhtRoute>,
+    last_dht_query_start: HashMap<String, Instant>,
+    last_dht_forward: HashMap<SocketAddr, Instant>,
     discovery_candidates: HashMap<SocketAddr, Instant>,
     hello_interval: Duration,
 }
@@ -81,6 +104,7 @@ impl KonoNode {
         bootstrap_peers: Vec<SocketAddr>,
         hello_interval: Duration,
     ) -> Result<Self> {
+        let local_node_id = identity.node_id();
         let socket = UdpSocket::bind(bind_addr)
             .await
             .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
@@ -105,7 +129,13 @@ impl KonoNode {
             last_rendezvous_request: HashMap::new(),
             last_filter_test_request: HashMap::new(),
             dht: DhtTable::default(),
+            routing: RoutingTable::new(&local_node_id),
             pending_dht_queries: HashSet::new(),
+            active_dht_queries: HashMap::new(),
+            seen_dht_queries: HashMap::new(),
+            reverse_dht_routes: HashMap::new(),
+            last_dht_query_start: HashMap::new(),
+            last_dht_forward: HashMap::new(),
             discovery_candidates: HashMap::new(),
             hello_interval,
         })
@@ -198,6 +228,7 @@ impl KonoNode {
                 }
                 _ = rendezvous_ticker.tick() => {
                     self.drive_auto_rendezvous().await;
+                    self.drive_dht_queries().await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("shutdown requested");
@@ -336,6 +367,8 @@ impl KonoNode {
                 )
                 .await?;
                 self.sessions.insert(source, session);
+                self.routing
+                    .observe(sender_node_id.clone(), source, Instant::now());
 
                 info!(
                     peer = %sender_node_id,
@@ -643,14 +676,58 @@ impl KonoNode {
                     }
                 }
             }
-            SecurePayload::DhtFind { target_node_id } => {
+            SecurePayload::DhtFind {
+                query_id,
+                origin_node_id,
+                target_node_id,
+                hops_remaining,
+            } => {
+                if hops_remaining > DHT_MAX_HOPS
+                    || !plausible_node_id(&origin_node_id)
+                    || !plausible_node_id(&target_node_id)
+                {
+                    return Ok(());
+                }
+
+                let now = Instant::now();
+                self.seen_dht_queries
+                    .retain(|_, expires_at| *expires_at > now);
+                self.reverse_dht_routes
+                    .retain(|_, route| route.expires_at > now);
+
+                let query_key = (origin_node_id.clone(), query_id);
+                if self
+                    .seen_dht_queries
+                    .get(&query_key)
+                    .is_some_and(|expires_at| *expires_at > now)
+                    || self.seen_dht_queries.len() >= MAX_SEEN_DHT_QUERIES
+                {
+                    return Ok(());
+                }
+
+                self.seen_dht_queries
+                    .insert(query_key.clone(), now + DHT_QUERY_TIMEOUT);
+
+                if origin_node_id != self.node_id() {
+                    self.reverse_dht_routes.insert(
+                        query_key.clone(),
+                        ReverseDhtRoute {
+                            previous_endpoint: source,
+                            expires_at: now + DHT_QUERY_TIMEOUT,
+                        },
+                    );
+                }
+
                 let mut records = Vec::new();
+                let mut exact_found = false;
 
                 if target_node_id == self.node_id() {
                     if let Some(record) = self.build_own_dht_record()? {
+                        exact_found = true;
                         records.push(record);
                     }
                 } else if let Some(record) = self.dht.get(&target_node_id) {
+                    exact_found = true;
                     records.push(record.clone());
                 }
 
@@ -667,34 +744,101 @@ impl KonoNode {
                 self.send_secure_payload(
                     source,
                     SecurePayload::DhtNodes {
-                        target_node_id,
+                        query_id,
+                        origin_node_id: origin_node_id.clone(),
+                        target_node_id: target_node_id.clone(),
                         records,
                     },
                 )
                 .await?;
+
+                let can_forward = self
+                    .last_dht_forward
+                    .get(&source)
+                    .is_none_or(|last| now.duration_since(*last) >= DHT_FORWARD_COOLDOWN);
+
+                if !exact_found && hops_remaining > 0 && can_forward {
+                    self.last_dht_forward.insert(source, now);
+                    let mut forwarded = 0_usize;
+
+                    for candidate in self
+                        .routing
+                        .nearest(&target_node_id, DHT_QUERY_FANOUT + 2)
+                    {
+                        if candidate.endpoint == source
+                            || candidate.node_id == origin_node_id
+                            || !self.sessions.contains_key(&candidate.endpoint)
+                        {
+                            continue;
+                        }
+
+                        self.send_secure_payload(
+                            candidate.endpoint,
+                            SecurePayload::DhtFind {
+                                query_id,
+                                origin_node_id: origin_node_id.clone(),
+                                target_node_id: target_node_id.clone(),
+                                hops_remaining: hops_remaining - 1,
+                            },
+                        )
+                        .await?;
+
+                        forwarded += 1;
+                        if forwarded >= DHT_QUERY_FANOUT {
+                            break;
+                        }
+                    }
+                }
             }
             SecurePayload::DhtNodes {
+                query_id,
+                origin_node_id,
                 target_node_id,
                 records,
             } => {
-                if records.len() > DHT_RESPONSE_LIMIT {
+                if records.len() > DHT_RESPONSE_LIMIT
+                    || !plausible_node_id(&origin_node_id)
+                    || !plausible_node_id(&target_node_id)
+                {
                     debug!(
                         peer = %sender_node_id,
                         count = records.len(),
-                        "rejected oversized DHT response"
+                        "rejected invalid DHT response"
                     );
                     return Ok(());
                 }
 
-                for record in records {
-                    let exact = record.node_id == target_node_id;
+                for record in &records {
                     if self.dht.upsert(record.clone()).is_err() {
                         continue;
                     }
+                }
 
-                    if exact && self.pending_dht_queries.contains(&target_node_id) {
+                if origin_node_id == self.node_id() {
+                    if self.pending_dht_queries.contains(&target_node_id) {
                         if let Some(current) = self.dht.get(&target_node_id).cloned() {
+                            self.active_dht_queries.remove(&query_id);
                             self.activate_dht_record(&current).await?;
+                        }
+                    }
+                } else {
+                    let query_key = (origin_node_id.clone(), query_id);
+                    let reverse = self.reverse_dht_routes.get(&query_key).cloned();
+                    if let Some(reverse) = reverse {
+                        if reverse.expires_at > Instant::now()
+                            && reverse.previous_endpoint != source
+                            && self.sessions.contains_key(&reverse.previous_endpoint)
+                        {
+                            self.send_secure_payload(
+                                reverse.previous_endpoint,
+                                SecurePayload::DhtNodes {
+                                    query_id,
+                                    origin_node_id,
+                                    target_node_id,
+                                    records,
+                                },
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1096,6 +1240,112 @@ impl KonoNode {
         Ok(())
     }
 
+    async fn drive_dht_queries(&mut self) {
+        let now = Instant::now();
+
+        self.active_dht_queries
+            .retain(|_, query| query.expires_at > now);
+        self.seen_dht_queries
+            .retain(|_, expires_at| *expires_at > now);
+        self.reverse_dht_routes
+            .retain(|_, route| route.expires_at > now);
+
+        let targets: Vec<String> = self.pending_dht_queries.iter().cloned().collect();
+        for target_node_id in targets {
+            if self.peer_endpoint_by_node_id(&target_node_id).is_some() {
+                self.pending_dht_queries.remove(&target_node_id);
+                continue;
+            }
+
+            if let Some(record) = self.dht.get(&target_node_id).cloned() {
+                if let Err(error) = self.activate_dht_record(&record).await {
+                    debug!(target = %target_node_id, %error, "cached exact DHT activation failed");
+                }
+                continue;
+            }
+
+            if self
+                .active_dht_queries
+                .values()
+                .any(|query| query.target_node_id == target_node_id)
+            {
+                continue;
+            }
+
+            if self
+                .last_dht_query_start
+                .get(&target_node_id)
+                .is_some_and(|last| now.duration_since(*last) < DHT_QUERY_RETRY_DELAY)
+            {
+                continue;
+            }
+
+            let candidates = self.routing.nearest(&target_node_id, DHT_QUERY_FANOUT);
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let query_id: u64 = random();
+            let origin_node_id = self.node_id();
+            let query_key = (origin_node_id.clone(), query_id);
+
+            self.active_dht_queries.insert(
+                query_id,
+                ActiveDhtQuery {
+                    target_node_id: target_node_id.clone(),
+                    expires_at: now + DHT_QUERY_TIMEOUT,
+                },
+            );
+            self.seen_dht_queries
+                .insert(query_key, now + DHT_QUERY_TIMEOUT);
+            self.last_dht_query_start
+                .insert(target_node_id.clone(), now);
+
+            let mut sent = 0_usize;
+            for candidate in candidates {
+                if !self.sessions.contains_key(&candidate.endpoint) {
+                    continue;
+                }
+
+                match self
+                    .send_secure_payload(
+                        candidate.endpoint,
+                        SecurePayload::DhtFind {
+                            query_id,
+                            origin_node_id: origin_node_id.clone(),
+                            target_node_id: target_node_id.clone(),
+                            hops_remaining: DHT_MAX_HOPS,
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => sent += 1,
+                    Err(error) => {
+                        debug!(
+                            peer = %candidate.node_id,
+                            endpoint = %candidate.endpoint,
+                            target = %target_node_id,
+                            %error,
+                            "multi-hop DHT query send failed"
+                        );
+                    }
+                }
+            }
+
+            if sent == 0 {
+                self.active_dht_queries.remove(&query_id);
+            } else {
+                debug!(
+                    query_id,
+                    target = %target_node_id,
+                    fanout = sent,
+                    max_hops = DHT_MAX_HOPS,
+                    "started bounded multi-hop DHT query"
+                );
+            }
+        }
+    }
+
     fn build_own_dht_record(&self) -> Result<Option<PeerRecord>> {
         let Some(endpoint) = self.nat_profile.preferred_endpoint() else {
             return Ok(None);
@@ -1113,15 +1363,8 @@ impl KonoNode {
                 .await?;
         }
 
-        let targets: Vec<String> = self.pending_dht_queries.iter().cloned().collect();
-        for target_node_id in targets {
-            self.send_secure_payload(
-                peer,
-                SecurePayload::DhtFind {
-                    target_node_id: target_node_id.clone(),
-                },
-            )
-            .await?;
+        for target_node_id in self.pending_dht_queries.clone() {
+            self.last_dht_query_start.remove(&target_node_id);
         }
 
         Ok(())
@@ -1307,12 +1550,14 @@ impl KonoNode {
             self.cookie_cache.remove(&previous_endpoint);
             self.pending_sessions.remove(&previous_endpoint);
             self.sessions.remove(&previous_endpoint);
+            self.routing.remove_endpoint(previous_endpoint);
         }
 
         if let Some(existing) = self.peers.get(&source) {
             if existing.node_id != envelope.sender_node_id {
                 self.sessions.remove(&source);
                 self.pending_sessions.remove(&source);
+                self.routing.remove_endpoint(source);
             }
         }
 
@@ -1322,6 +1567,9 @@ impl KonoNode {
 
         self.discovery_candidates.remove(&source);
         self.pending_dht_queries.remove(&envelope.sender_node_id);
+        self.active_dht_queries
+            .retain(|_, query| query.target_node_id != envelope.sender_node_id);
+        self.last_dht_query_start.remove(&envelope.sender_node_id);
         self.auto_rendezvous.remove(&envelope.sender_node_id);
 
         let now = Instant::now();
@@ -1353,6 +1601,7 @@ impl KonoNode {
             self.cookie_cache.remove(&endpoint);
             self.pending_sessions.remove(&endpoint);
             self.sessions.remove(&endpoint);
+            self.routing.remove_endpoint(endpoint);
         }
     }
 
@@ -1413,6 +1662,9 @@ impl KonoNode {
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
         self.sessions
             .retain(|endpoint, _| self.peers.contains_key(endpoint));
+        let active_session_endpoints: HashSet<SocketAddr> =
+            self.sessions.keys().copied().collect();
+        self.routing.retain_endpoints(&active_session_endpoints);
         self.pending_filter_probes
             .retain(|_, pending| pending.expires_at > Instant::now());
         self.pending_filter_consents
@@ -1444,6 +1696,12 @@ impl KonoNode {
     }
 }
 
+fn plausible_node_id(node_id: &str) -> bool {
+    node_id.len() == 44
+        && node_id.starts_with("knp1")
+        && node_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn local_features() -> Vec<String> {
     vec![
         "knp/1".to_owned(),
@@ -1457,6 +1715,8 @@ fn local_features() -> Vec<String> {
         "auto-rendezvous-selection".to_owned(),
         "signed-dht-records".to_owned(),
         "encrypted-dht-lookup".to_owned(),
+        "bounded-multihop-dht".to_owned(),
+        "k-bucket-routing".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
