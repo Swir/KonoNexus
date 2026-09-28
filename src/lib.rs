@@ -26,8 +26,9 @@ pub use node::{KonoNode, PeerInfo, RelayAppHandle};
 pub use protocol::{MessageBody, WireEnvelope, KNP_VERSION};
 pub use punch::{PunchSchedule, PUNCH_AUTH_TTL, PUNCH_MAX_ATTEMPTS, PUNCH_START_DELAY};
 pub use relay::{
-    RelayCircuit, RelayCircuitState, RelayForward, RelayManager, MAX_RELAY_CELL_BYTES,
-    MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL,
+    RelayCircuit, RelayCircuitState, RelayForward, RelayManager, MAX_RELAY_BYTES_PER_SECOND,
+    MAX_RELAY_CELL_BYTES, MAX_RELAY_CELLS_PER_SECOND, MAX_RELAY_CIRCUITS,
+    MAX_RELAY_CIRCUITS_PER_NODE, RELAY_CIRCUIT_TTL, RELAY_RATE_WINDOW,
 };
 pub use relay_app::{
     RelayAppFragment, RelayAppManager, RelayAppMessage, RelayAppOutboundFragment,
