@@ -376,10 +376,7 @@ mod tests {
         let message_id = sender.queue("peer-b".into(), data.clone(), now).unwrap();
         let ready = HashSet::from(["peer-b".to_owned()]);
 
-        loop {
-            let Some(outbound) = sender.peek_next(&ready) else {
-                break;
-            };
+        while let Some(outbound) = sender.peek_next(&ready) {
             let fragment_index = outbound.fragment.fragment_index;
             let completed = receiver
                 .accept_fragment("peer-a", outbound.fragment.clone(), now)
