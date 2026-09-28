@@ -4,6 +4,15 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added Ed25519-signed short-lived DHT peer records with NodeID/public-key binding.
+- Added a bounded 4,096-record DHT-style table with expiry and rollback rejection.
+- Added encrypted `DhtStore`, `DhtFind`, and `DhtNodes` control messages.
+- Added bounded nearest-record responses using XOR distance over SHA-256(NodeID).
+- Added exact-match DHT discovery for pending `--connect-node` targets while refusing to auto-dial arbitrary nearest gossip records.
+- Added temporary DHT discovery candidates that still pass through normal HELLO/cookie/session admission.
+- Added DHT endpoint publishability checks and unit coverage for tampering, rollback, bounds, and unsafe/local endpoints.
+- Bumped the implementation package to 0.1.0-alpha.7.
+
 - Added automatic bounded rendezvous coordinator selection across existing encrypted peers.
 - Added explicit rendezvous-miss responses and automatic retry/cooldown behavior.
 - Added per-requester rendezvous and filtering-test cooldowns.
