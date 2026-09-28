@@ -1,6 +1,4 @@
-use crate::identity::{
-    node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN,
-};
+use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,8 +86,7 @@ impl WireEnvelope {
             bail!("sender node id does not match sender public key");
         }
 
-        let signature_raw =
-            hex::decode(&self.signature).context("signature is not valid hex")?;
+        let signature_raw = hex::decode(&self.signature).context("signature is not valid hex")?;
         let signature: [u8; SIGNATURE_LEN] = signature_raw
             .try_into()
             .map_err(|_| anyhow!("signature must be 64 bytes"))?;
@@ -140,12 +137,8 @@ mod tests {
     #[test]
     fn signed_envelope_verifies() {
         let identity = NodeIdentity::generate();
-        let envelope = WireEnvelope::signed(
-            &identity,
-            7,
-            MessageBody::Ping { token: 42 },
-        )
-        .expect("signing should work");
+        let envelope = WireEnvelope::signed(&identity, 7, MessageBody::Ping { token: 42 })
+            .expect("signing should work");
 
         envelope.verify().expect("envelope should verify");
     }
@@ -153,12 +146,8 @@ mod tests {
     #[test]
     fn tampering_breaks_signature() {
         let identity = NodeIdentity::generate();
-        let mut envelope = WireEnvelope::signed(
-            &identity,
-            7,
-            MessageBody::Ping { token: 42 },
-        )
-        .expect("signing should work");
+        let mut envelope = WireEnvelope::signed(&identity, 7, MessageBody::Ping { token: 42 })
+            .expect("signing should work");
 
         envelope.body = MessageBody::Ping { token: 43 };
         assert!(envelope.verify().is_err());
