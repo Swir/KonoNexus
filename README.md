@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.8 — bounded multi-hop DHT**. KNP now maintains an in-memory 256-bucket routing table for encrypted peers and can recursively forward DHT lookups through the live mesh with loop suppression, reverse response paths, bounded fanout and bounded hop count. Exact signed target records may still trigger normal HELLO/cookie/session establishment; arbitrary nearest-record gossip is never auto-dialed. Persistent buckets, endpoint attestations, cooperative relay, and broad real-world NAT validation are still not claimed complete.
+> Status: **0.1.0-alpha.9 — persistent routing hints + cooperative relay foundation**. KNP now persists bounded routing hints from previously authenticated encrypted peers and can restore them after restart as untrusted bootstrap hints that must pass the complete HELLO/cookie/identity/session flow again. It also has a bounded single-relay circuit protocol with explicit OPEN/OFFER/ACCEPT/READY control and opaque relay cells. A production end-to-end Konofix payload channel over relay is not yet claimed complete.
 
 ## Principles
 
@@ -83,8 +83,12 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Signed bounded DHT peer records and encrypted exact lookup
 - [x] Bounded recursive multi-hop DHT over encrypted peers
 - [x] In-memory k-bucket-style routing table
-- [ ] Persistent routing buckets and large-mesh convergence
-- [ ] Cooperative multi-hop relay fallback
+- [x] Persistent authenticated-peer routing hints across restarts
+- [ ] Persistent full k-bucket state and large-mesh convergence
+- [x] Single-hop cooperative relay circuit/control foundation
+- [x] Bounded opaque relay cell forwarding
+- [ ] End-to-end inner session over relay
+- [ ] Multi-hop relay/path selection fallback
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
@@ -152,3 +156,22 @@ A lookup is recursive but deliberately bounded:
 - intermediate nodes keep a short-lived reverse route so encrypted `DHT_NODES` results can travel back toward the origin.
 
 The lookup walks only existing encrypted mesh edges. It does **not** open connections to arbitrary nearest records returned by gossip. A new outbound discovery attempt still requires an exact, valid signed record for the NodeID the local application explicitly requested.
+
+
+### Persistent routing hints
+
+Alpha.9 writes a small `routing-cache.json` next to `identity.key` by default. Only peers that currently have an authenticated encrypted KNP session are saved. Cached entries are capped, age-limited, validated when loaded, and are treated only as bootstrap hints after restart. They never bypass signature checks, endpoint cookies, peer admission, or the X25519 encrypted-session handshake.
+
+The cache contains peer NodeIDs and endpoints, so it is metadata rather than secret key material. Operators can override its path with `--routing-cache`.
+
+### Cooperative relay foundation
+
+A node may request a relay circuit with:
+
+```bash
+cargo run -- --peer RELAY_IP:47000 --relay-via RELAY_IP:47000=TARGET_KNP_NODE_ID
+```
+
+The relay must already have encrypted KNP sessions with both endpoints. Circuit setup follows `OPEN → OFFER → ACCEPT → READY`. The relay stores at most 256 circuits, expires idle circuits after 120 seconds, validates endpoint identity on both sides, and rejects sequence rollback/replay.
+
+Relay data is carried as `RelayCell` with at most 8 KiB of **opaque bytes** per cell. The relay forwards those bytes without interpreting their application meaning. This is the transport foundation only: KonoNexus does not yet claim that arbitrary Konofix messages are end-to-end encrypted across the relay path until an inner end-to-end session is layered inside those opaque cells.
