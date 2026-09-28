@@ -33,6 +33,18 @@ struct Args {
     )]
     rendezvous: Vec<RendezvousSpec>,
 
+    #[arg(
+        long = "connect-node",
+        help = "Automatically try encrypted peers as rendezvous coordinators for this target NodeID"
+    )]
+    connect_nodes: Vec<String>,
+
+    #[arg(
+        long = "filter-test",
+        help = "Run one consent-based NAT filtering evidence test through this coordinator"
+    )]
+    filter_tests: Vec<SocketAddr>,
+
     #[arg(long)]
     identity: Option<PathBuf>,
 
@@ -71,6 +83,14 @@ async fn main() -> Result<()> {
 
     for request in args.rendezvous {
         node.queue_rendezvous(request.coordinator, request.target_node_id);
+    }
+    for target_node_id in args.connect_nodes {
+        if !target_node_id.trim().is_empty() {
+            node.queue_auto_rendezvous(target_node_id);
+        }
+    }
+    for coordinator in args.filter_tests {
+        node.queue_filter_test(coordinator);
     }
 
     node.run().await
