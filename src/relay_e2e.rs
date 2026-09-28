@@ -65,16 +65,17 @@ impl RelayE2eInitiator {
         let sender_node_id = identity.node_id();
         let sender_public_key = identity.public_key_hex();
 
-        let signature = sign_handshake(
-            identity,
-            "init",
+        let init_fields = UnsignedRelayHandshake {
+            context: RELAY_E2E_CONTEXT,
+            kind: "init",
             circuit_id,
-            &sender_node_id,
-            &sender_public_key,
-            &peer_node_id,
+            sender_node_id: &sender_node_id,
+            sender_public_key: &sender_public_key,
+            recipient_node_id: &peer_node_id,
             handshake_id,
-            &ephemeral_public_key,
-        )?;
+            ephemeral_public_key: &ephemeral_public_key,
+        };
+        let signature = sign_handshake(identity, &init_fields)?;
 
         let packet = RelayInnerPacket::SessionInit {
             circuit_id,
@@ -119,16 +120,17 @@ impl RelayE2eInitiator {
             bail!("relay inner ack does not match pending handshake");
         }
 
-        verify_handshake(
-            "ack",
+        let ack_fields = UnsignedRelayHandshake {
+            context: RELAY_E2E_CONTEXT,
+            kind: "ack",
             circuit_id,
-            &sender_node_id,
-            &sender_public_key,
-            &recipient_node_id,
+            sender_node_id: &sender_node_id,
+            sender_public_key: &sender_public_key,
+            recipient_node_id: &recipient_node_id,
             handshake_id,
-            &ephemeral_public_key,
-            &signature,
-        )?;
+            ephemeral_public_key: &ephemeral_public_key,
+        };
+        verify_handshake(&ack_fields, &signature)?;
 
         self.pending
             .complete(&identity.node_id(), &ephemeral_public_key)
@@ -162,16 +164,17 @@ pub fn accept_relay_init(
         bail!("relay inner init does not match relay path");
     }
 
-    verify_handshake(
-        "init",
-        packet_circuit_id,
-        &sender_node_id,
-        &sender_public_key,
-        &recipient_node_id,
+    let init_fields = UnsignedRelayHandshake {
+        context: RELAY_E2E_CONTEXT,
+        kind: "init",
+        circuit_id: packet_circuit_id,
+        sender_node_id: &sender_node_id,
+        sender_public_key: &sender_public_key,
+        recipient_node_id: &recipient_node_id,
         handshake_id,
-        &ephemeral_public_key,
-        &signature,
-    )?;
+        ephemeral_public_key: &ephemeral_public_key,
+    };
+    verify_handshake(&init_fields, &signature)?;
 
     let (session, responder_public_key) = respond_handshake(
         &identity.node_id(),
@@ -182,16 +185,17 @@ pub fn accept_relay_init(
 
     let local_node_id = identity.node_id();
     let local_public_key = identity.public_key_hex();
-    let ack_signature = sign_handshake(
-        identity,
-        "ack",
+    let ack_fields = UnsignedRelayHandshake {
+        context: RELAY_E2E_CONTEXT,
+        kind: "ack",
         circuit_id,
-        &local_node_id,
-        &local_public_key,
-        &sender_node_id,
+        sender_node_id: &local_node_id,
+        sender_public_key: &local_public_key,
+        recipient_node_id: &sender_node_id,
         handshake_id,
-        &responder_public_key,
-    )?;
+        ephemeral_public_key: &responder_public_key,
+    };
+    let ack_signature = sign_handshake(identity, &ack_fields)?;
 
     let ack = RelayInnerPacket::SessionAck {
         circuit_id,
@@ -242,83 +246,33 @@ pub fn packet_kind(encoded: &[u8]) -> Result<&'static str> {
 
 fn sign_handshake(
     identity: &NodeIdentity,
-    kind: &'static str,
-    circuit_id: u64,
-    sender_node_id: &str,
-    sender_public_key: &str,
-    recipient_node_id: &str,
-    handshake_id: u64,
-    ephemeral_public_key: &str,
+    fields: &UnsignedRelayHandshake<'_>,
 ) -> Result<String> {
-    let bytes = handshake_bytes(
-        kind,
-        circuit_id,
-        sender_node_id,
-        sender_public_key,
-        recipient_node_id,
-        handshake_id,
-        ephemeral_public_key,
-    )?;
+    let bytes =
+        serde_json::to_vec(fields).context("failed to serialize relay inner handshake")?;
     Ok(hex::encode(identity.sign(&bytes)))
 }
 
-fn verify_handshake(
-    kind: &'static str,
-    circuit_id: u64,
-    sender_node_id: &str,
-    sender_public_key: &str,
-    recipient_node_id: &str,
-    handshake_id: u64,
-    ephemeral_public_key: &str,
-    signature: &str,
-) -> Result<()> {
-    let raw_public =
-        hex::decode(sender_public_key).context("relay inner sender public key is not valid hex")?;
+fn verify_handshake(fields: &UnsignedRelayHandshake<'_>, signature: &str) -> Result<()> {
+    let raw_public = hex::decode(fields.sender_public_key)
+        .context("relay inner sender public key is not valid hex")?;
     let public_key: [u8; PUBLIC_KEY_LEN] = raw_public
         .try_into()
         .map_err(|_| anyhow!("relay inner public key must be 32 bytes"))?;
 
-    if node_id_from_public_key(&public_key) != sender_node_id {
+    if node_id_from_public_key(&public_key) != fields.sender_node_id {
         bail!("relay inner NodeID/public-key mismatch");
     }
 
-    let raw_signature = hex::decode(signature).context("relay inner signature is not valid hex")?;
+    let raw_signature =
+        hex::decode(signature).context("relay inner signature is not valid hex")?;
     let signature: [u8; SIGNATURE_LEN] = raw_signature
         .try_into()
         .map_err(|_| anyhow!("relay inner signature must be 64 bytes"))?;
 
-    let bytes = handshake_bytes(
-        kind,
-        circuit_id,
-        sender_node_id,
-        sender_public_key,
-        recipient_node_id,
-        handshake_id,
-        ephemeral_public_key,
-    )?;
+    let bytes =
+        serde_json::to_vec(fields).context("failed to serialize relay inner handshake")?;
     NodeIdentity::verify_with_public_key(&public_key, &bytes, &signature)
-}
-
-fn handshake_bytes(
-    kind: &'static str,
-    circuit_id: u64,
-    sender_node_id: &str,
-    sender_public_key: &str,
-    recipient_node_id: &str,
-    handshake_id: u64,
-    ephemeral_public_key: &str,
-) -> Result<Vec<u8>> {
-    serde_json::to_vec(&UnsignedRelayHandshake {
-        context: RELAY_E2E_CONTEXT,
-        kind,
-        circuit_id,
-        sender_node_id,
-        sender_public_key,
-        recipient_node_id,
-        handshake_id,
-        ephemeral_public_key,
-    })
-    .context("failed to serialize relay inner handshake")
 }
 
 fn encode_packet(packet: &RelayInnerPacket) -> Result<Vec<u8>> {
