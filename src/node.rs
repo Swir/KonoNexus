@@ -298,6 +298,7 @@ pub struct KonoNode {
     relay_app_receipt_tx: Option<mpsc::Sender<RelayAppDeliveryReceipt>>,
     relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
+    local_test_mode: bool,
     hello_interval: Duration,
 }
 
@@ -364,8 +365,13 @@ impl KonoNode {
             relay_app_receipt_tx: None,
             relay_app_failure_tx: None,
             punch_relay_candidates: HashMap::new(),
+            local_test_mode: false,
             hello_interval,
         })
+    }
+
+    pub fn set_local_test_mode(&mut self, enabled: bool) {
+        self.local_test_mode = enabled;
     }
 
     pub fn queue_rendezvous(&mut self, coordinator: SocketAddr, target_node_id: String) {
@@ -1653,7 +1659,7 @@ impl KonoNode {
                     }
                 };
 
-                if !PunchSchedule::candidate_allowed(candidate) {
+                if !self.rendezvous_candidate_allowed(candidate) {
                     warn!(
                         %candidate,
                         coordinator = %sender_node_id,
@@ -2809,6 +2815,11 @@ impl KonoNode {
         Ok(())
     }
 
+    fn rendezvous_candidate_allowed(&self, endpoint: SocketAddr) -> bool {
+        PunchSchedule::candidate_allowed(endpoint)
+            || (self.local_test_mode && endpoint.port() != 0 && endpoint.ip().is_loopback())
+    }
+
     fn authorize_punch(&self, token: u64, sender_node_id: &str) -> bool {
         self.pending_punches
             .get(&token)
@@ -3772,6 +3783,28 @@ fn local_features() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_test_mode_allows_loopback_rendezvous_only_when_enabled() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        let loopback: SocketAddr = "127.0.0.1:47000".parse().unwrap();
+        assert!(!node.rendezvous_candidate_allowed(loopback));
+
+        node.set_local_test_mode(true);
+        assert!(node.rendezvous_candidate_allowed(loopback));
+        assert!(!node.rendezvous_candidate_allowed(
+            "0.0.0.0:47000".parse().unwrap()
+        ));
+    }
 
     #[test]
     fn application_transport_prefers_direct_and_falls_back_to_relay() {
