@@ -312,6 +312,35 @@ mod tests {
     }
 
     #[test]
+    fn maximum_app_fragment_fits_relay_cell_budget() {
+        use crate::relay_app::{RelayAppFragment, RELAY_APP_FRAGMENT_BYTES};
+
+        let (mut a, mut b) = establish();
+        let fragment = RelayAppFragment {
+            message_id: 55,
+            fragment_index: 0,
+            fragment_count: 1,
+            total_len: RELAY_APP_FRAGMENT_BYTES as u32,
+            data_hex: hex::encode(vec![0x42_u8; RELAY_APP_FRAGMENT_BYTES]),
+        };
+
+        let encoded = encode_relay_payload(
+            &mut a,
+            &SecurePayload::RelayAppFragment {
+                fragment: fragment.clone(),
+            },
+        )
+        .expect("maximum relay app fragment should fit");
+
+        assert!(encoded.len() <= MAX_RELAY_CELL_BYTES);
+        let decoded = decode_relay_payload(&mut b, &encoded).unwrap();
+        assert_eq!(
+            decoded,
+            SecurePayload::RelayAppFragment { fragment }
+        );
+    }
+
+    #[test]
     fn relay_inner_handshake_is_bound_to_circuit() {
         let a = NodeIdentity::generate();
         let b = NodeIdentity::generate();
