@@ -4,7 +4,7 @@
 
 The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
 
-> Status: **0.1.0-alpha.7 — signed DHT discovery foundation**. KNP now exchanges short-lived Ed25519-signed peer records over encrypted sessions, keeps a bounded DHT-style record table, answers bounded nearest-record queries, and can use an exact signed record for a requested NodeID to begin normal HELLO/cookie/session establishment. Iterative multi-hop DHT walking, persistent routing buckets, cooperative relay, and broad real-world NAT validation are still not claimed complete.
+> Status: **0.1.0-alpha.8 — bounded multi-hop DHT**. KNP now maintains an in-memory 256-bucket routing table for encrypted peers and can recursively forward DHT lookups through the live mesh with loop suppression, reverse response paths, bounded fanout and bounded hop count. Exact signed target records may still trigger normal HELLO/cookie/session establishment; arbitrary nearest-record gossip is never auto-dialed. Persistent buckets, endpoint attestations, cooperative relay, and broad real-world NAT validation are still not claimed complete.
 
 ## Principles
 
@@ -81,7 +81,9 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Bounded automatic selection of encrypted rendezvous peers
 - [ ] IPv6 direct-path preference
 - [x] Signed bounded DHT peer records and encrypted exact lookup
-- [ ] Iterative multi-hop DHT routing buckets and global convergence
+- [x] Bounded recursive multi-hop DHT over encrypted peers
+- [x] In-memory k-bucket-style routing table
+- [ ] Persistent routing buckets and large-mesh convergence
 - [ ] Cooperative multi-hop relay fallback
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
@@ -134,3 +136,19 @@ DHT control messages travel inside the existing encrypted KNP session:
 The local table is bounded to 4,096 records and responses to at most 8 records. Records expire automatically. KNP may cache nearest records, but it **does not automatically dial arbitrary nearest nodes**. A new network connection is attempted only from an exact valid record for a NodeID that the local user/application is already trying to reach.
 
 This is the DHT foundation, not yet a complete Kademlia implementation. Multi-hop iterative lookups, persistent k-buckets, endpoint attestations, and convergence testing across a large mesh remain future work.
+
+
+### Bounded multi-hop DHT
+
+Alpha.8 adds an in-memory 256-bucket routing table populated only by peers that already completed an encrypted KNP session. Each bucket stores at most 8 active peers and refreshes/evicts by last-seen time.
+
+A lookup is recursive but deliberately bounded:
+
+- fanout: at most 2 encrypted peers per hop,
+- depth: at most 3 hops,
+- query timeout: 8 seconds,
+- retry delay: 5 seconds,
+- duplicate queries are suppressed with a bounded seen-query cache,
+- intermediate nodes keep a short-lived reverse route so encrypted `DHT_NODES` results can travel back toward the origin.
+
+The lookup walks only existing encrypted mesh edges. It does **not** open connections to arbitrary nearest records returned by gossip. A new outbound discovery attempt still requires an exact, valid signed record for the NodeID the local application explicitly requested.
