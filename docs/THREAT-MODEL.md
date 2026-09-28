@@ -18,6 +18,9 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - bounded seven-probe punch bursts with deterministic five-second expiry,
 - bounded pending-punch state (128 schedules),
 - rejection of loopback/unspecified/multicast/broadcast rendezvous targets,
+- bounded automatic rendezvous coordinator attempts and per-requester coordinator cooldown,
+- consent-based third-peer filtering probes with Ed25519 authorization bound to endpoint, helper and token,
+- target-side verification that a coordinator proposal matches that coordinator's previously observed endpoint,
 - session keys zeroized when sessions are dropped.
 
 ## NAT/rendezvous threats considered
@@ -38,15 +41,15 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 
 - timed hole punching is implemented but has not yet been validated across a wide NAT matrix,
 - no port-prediction or safe alternate-candidate strategy exists,
-- NAT mapping evidence does not yet characterize filtering behavior,
+- positive endpoint-independent filtering evidence is supported, but negative results remain intentionally inconclusive,
 - session receive ordering remains strict,
 - session key rotation is not implemented,
 - no independent security audit has been completed.
 
 ## Required before production
 
-- per-peer rate limiting of rendezvous requests beyond the global pending-state bound,
-- wider NAT/filtering matrix validation,
+- stronger long-window per-peer rendezvous/filter-test rate limits,
+- wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
 - bounded sliding anti-replay windows for UDP reordering,
 - handshake retransmission and session key rotation,
 - DHT signature/expiry rules and Sybil mitigation,
