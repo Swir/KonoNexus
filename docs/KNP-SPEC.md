@@ -4,9 +4,9 @@ Status: **Draft 0.1 / experimental**
 
 ## 1. Current scope
 
-KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, and an experimental peer-coordinated UDP rendezvous primitive.
+KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
 
-Automatic global peer discovery, robust NAT/filtering classification, production-grade hole punching, DHT routing, and cooperative relay are not complete.
+Iterative global DHT routing, persistent routing buckets, robust NAT/filtering classification, and cooperative relay are not complete.
 
 ## 2. Identity and signed envelope
 
@@ -113,6 +113,29 @@ A token alone is insufficient: the punch sender must also prove possession of th
 5. cooperative encrypted relay fallback,
 6. route scoring and KonoMind optimization.
 
-## 13. Versioning
+## 13. Signed DHT discovery foundation
+
+A peer record contains NodeID and Ed25519 public key, up to four public socket endpoints, a time-based sequence/issue timestamp, an expiry timestamp, and an Ed25519 signature over the complete unsigned record.
+
+The default lifetime is ten minutes and the maximum accepted lifetime is thirty minutes. Endpoints with port zero, loopback, private/link-local, multicast, broadcast, unspecified, IPv6 unique-local, or IPv6 link-local addresses are not publishable through the global DHT record format.
+
+The local DHT table stores at most 4,096 records. A newer valid sequence replaces an older record for the same NodeID; rollback records are ignored. Expired records are removed.
+
+DHT control travels inside encrypted SecurePayload messages: `DhtStore` carries one signed record, `DhtFind` carries a requested NodeID, and `DhtNodes` carries that target plus at most eight records. Responses return an exact record first when available and then a bounded nearest-record set ordered by XOR distance over SHA-256(NodeID).
+
+Nearest records may be cached for future answers, but the current implementation does not automatically dial them. Only an exact valid record matching a locally pending NodeID lookup can create temporary discovery candidates. Those candidates still pass through signed HELLO, anti-amplification cookie, peer admission, and encrypted-session handshake.
+
+This deliberately avoids turning untrusted nearest-record gossip into automatic outbound connection scanning.
+
+## 14. Remaining DHT work
+
+- iterative multi-hop lookup across newly learned routing peers,
+- persistent k-bucket-like routing state,
+- endpoint ownership/observation attestations,
+- replication/refresh strategy,
+- Sybil-resistant routing diversity,
+- large-mesh convergence and churn testing.
+
+## 15. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
