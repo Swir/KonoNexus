@@ -334,10 +334,7 @@ mod tests {
 
         assert!(encoded.len() <= MAX_RELAY_CELL_BYTES);
         let decoded = decode_relay_payload(&mut b, &encoded).unwrap();
-        assert_eq!(
-            decoded,
-            SecurePayload::RelayAppFragment { fragment }
-        );
+        assert_eq!(decoded, SecurePayload::RelayAppFragment { fragment });
     }
 
     #[test]
