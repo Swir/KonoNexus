@@ -81,9 +81,8 @@ pub fn save_routing_hints(path: &Path, entries: &[RoutingCacheEntry]) -> Result<
             .cmp(&right.node_id)
             .then(left.endpoint.cmp(&right.endpoint))
     });
-    entries.dedup_by(|left, right| {
-        left.node_id == right.node_id && left.endpoint == right.endpoint
-    });
+    entries
+        .dedup_by(|left, right| left.node_id == right.node_id && left.endpoint == right.endpoint);
 
     let encoded = serde_json::to_vec_pretty(&RoutingCacheFile {
         version: ROUTING_CACHE_VERSION,
@@ -95,8 +94,7 @@ pub fn save_routing_hints(path: &Path, entries: &[RoutingCacheEntry]) -> Result<
     fs::write(&temp_path, encoded)
         .with_context(|| format!("failed to write {}", temp_path.display()))?;
     if path.exists() {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
+        fs::remove_file(path).with_context(|| format!("failed to replace {}", path.display()))?;
     }
     fs::rename(&temp_path, path)
         .with_context(|| format!("failed to commit routing cache {}", path.display()))?;
@@ -118,9 +116,7 @@ fn cache_endpoint_allowed(endpoint: SocketAddr) -> bool {
     }
 
     match endpoint.ip() {
-        IpAddr::V4(ip) => {
-            !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
-        }
+        IpAddr::V4(ip) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
         IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
     }
 }
