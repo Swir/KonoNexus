@@ -1,5 +1,6 @@
 pub mod dht;
 pub mod identity;
+pub mod konofix_sdk;
 pub mod konomind;
 pub mod nat;
 pub mod node;
@@ -18,6 +19,7 @@ pub use dht::{
     DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
 };
 pub use identity::NodeIdentity;
+pub use konofix_sdk::{KonofixSdkConfig, KonofixTransport};
 pub use konomind::{
     KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
 };
