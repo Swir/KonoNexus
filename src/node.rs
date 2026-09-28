@@ -7,6 +7,7 @@ use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehav
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
+use crate::relay_app::{RelayAppManager, RelayAppMessage};
 use crate::relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, packet_kind, RelayE2eInitiator,
 };
@@ -16,7 +17,7 @@ use crate::security::{CookieGuard, ReplayGuard};
 use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SecureSession};
 use anyhow::{anyhow, Context, Result};
 use rand::random;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
+const RELAY_APP_BURST_PER_TICK: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -86,15 +88,6 @@ struct PendingRelayAccept {
     expires_at: Instant,
 }
 
-#[derive(Debug, Clone)]
-pub struct RelayDeliveredCell {
-    pub relay_endpoint: SocketAddr,
-    pub circuit_id: u64,
-    pub peer_node_id: String,
-    pub sequence: u64,
-    pub opaque_payload_hex: String,
-}
-
 pub struct KonoNode {
     identity: NodeIdentity,
     socket: Arc<UdpSocket>,
@@ -131,8 +124,8 @@ pub struct KonoNode {
     relay_paths: HashMap<(SocketAddr, u64), RelayPath>,
     relay_e2e_pending: HashMap<(SocketAddr, u64), RelayE2eInitiator>,
     relay_e2e_sessions: HashMap<(SocketAddr, u64), SecureSession>,
+    relay_app: RelayAppManager,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
-    relay_inbox: VecDeque<RelayDeliveredCell>,
     hello_interval: Duration,
 }
 
@@ -184,8 +177,8 @@ impl KonoNode {
             relay_paths: HashMap::new(),
             relay_e2e_pending: HashMap::new(),
             relay_e2e_sessions: HashMap::new(),
+            relay_app: RelayAppManager::default(),
             punch_relay_candidates: HashMap::new(),
-            relay_inbox: VecDeque::new(),
             hello_interval,
         })
     }
@@ -233,8 +226,19 @@ impl KonoNode {
         Ok(loaded)
     }
 
-    pub fn take_relay_cells(&mut self) -> Vec<RelayDeliveredCell> {
-        self.relay_inbox.drain(..).collect()
+    pub fn queue_relay_app_message(
+        &mut self,
+        peer_node_id: String,
+        data: Vec<u8>,
+    ) -> Result<u64> {
+        if !plausible_node_id(&peer_node_id) || peer_node_id == self.node_id() {
+            return Err(anyhow!("invalid relay application peer NodeID"));
+        }
+        self.relay_app.queue(peer_node_id, data, Instant::now())
+    }
+
+    pub fn take_relay_app_messages(&mut self) -> Vec<RelayAppMessage> {
+        self.relay_app.take_completed()
     }
 
     pub fn node_id(&self) -> String {
@@ -306,6 +310,7 @@ impl KonoNode {
                 }
                 _ = punch_ticker.tick() => {
                     self.drive_punch_attempts().await;
+                    self.drive_relay_app().await;
                 }
                 _ = rendezvous_ticker.tick() => {
                     self.drive_auto_rendezvous().await;
@@ -739,6 +744,12 @@ impl KonoNode {
                 debug!(
                     coordinator = %sender_node_id,
                     "filtering test unavailable from this coordinator"
+                );
+            }
+            SecurePayload::RelayAppFragment { .. } | SecurePayload::RelayAppAck { .. } => {
+                debug!(
+                    peer = %sender_node_id,
+                    "ignored relay application payload outside relay E2E session"
                 );
             }
             SecurePayload::DhtStore { record } => {
@@ -1584,6 +1595,38 @@ impl KonoNode {
                             "relay E2E pong received"
                         );
                     }
+                    SecurePayload::RelayAppFragment { fragment } => {
+                        let message_id = fragment.message_id;
+                        let completed = self
+                            .relay_app
+                            .accept_fragment(peer_node_id, fragment, Instant::now())?;
+
+                        if completed {
+                            let ack = {
+                                let session = self
+                                    .relay_e2e_sessions
+                                    .get_mut(&key)
+                                    .ok_or_else(|| anyhow!("relay E2E session disappeared"))?;
+                                encode_relay_payload(
+                                    session,
+                                    &SecurePayload::RelayAppAck { message_id },
+                                )?
+                            };
+                            self.send_relay_inner(relay_endpoint, circuit_id, ack)
+                                .await?;
+                        }
+                    }
+                    SecurePayload::RelayAppAck { message_id } => {
+                        if self.relay_app.acknowledge(peer_node_id, message_id) {
+                            debug!(
+                                %relay_endpoint,
+                                peer = %peer_node_id,
+                                circuit_id,
+                                message_id,
+                                "relay application message acknowledged"
+                            );
+                        }
+                    }
                     _ => {
                         debug!(
                             %relay_endpoint,
@@ -1598,6 +1641,98 @@ impl KonoNode {
         }
 
         Ok(())
+    }
+
+    async fn drive_relay_app(&mut self) {
+        let now = Instant::now();
+        let (expired_inbound, expired_outbound) = self.relay_app.expire(now);
+        if expired_inbound > 0 || expired_outbound > 0 {
+            debug!(
+                expired_inbound,
+                expired_outbound,
+                "expired stale relay application queue state"
+            );
+        }
+
+        let ready_peers: HashSet<String> = self
+            .relay_e2e_sessions
+            .keys()
+            .filter_map(|key| {
+                let path = self.relay_paths.get(key)?;
+                if path.expires_at <= now {
+                    return None;
+                }
+                Some(path.peer_node_id.clone())
+            })
+            .collect();
+
+        for _ in 0..RELAY_APP_BURST_PER_TICK {
+            let Some(outbound) = self.relay_app.peek_next(&ready_peers) else {
+                break;
+            };
+
+            let Some((relay_endpoint, circuit_id)) =
+                self.relay_e2e_path_for_peer(&outbound.peer_node_id)
+            else {
+                break;
+            };
+
+            let encoded = {
+                let Some(session) = self
+                    .relay_e2e_sessions
+                    .get_mut(&(relay_endpoint, circuit_id))
+                else {
+                    break;
+                };
+
+                match encode_relay_payload(
+                    session,
+                    &SecurePayload::RelayAppFragment {
+                        fragment: outbound.fragment.clone(),
+                    },
+                ) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        debug!(
+                            peer = %outbound.peer_node_id,
+                            %error,
+                            "relay application fragment encryption failed"
+                        );
+                        break;
+                    }
+                }
+            };
+
+            if let Err(error) = self
+                .send_relay_inner(relay_endpoint, circuit_id, encoded)
+                .await
+            {
+                debug!(
+                    peer = %outbound.peer_node_id,
+                    %relay_endpoint,
+                    circuit_id,
+                    %error,
+                    "relay application fragment send failed"
+                );
+                break;
+            }
+
+            if let Err(error) = self.relay_app.mark_fragment_sent(
+                outbound.fragment.message_id,
+                outbound.fragment.fragment_index,
+            ) {
+                debug!(%error, "relay application queue state update failed");
+                break;
+            }
+        }
+    }
+
+    fn relay_e2e_path_for_peer(&self, peer_node_id: &str) -> Option<(SocketAddr, u64)> {
+        let now = Instant::now();
+        self.relay_e2e_sessions.keys().find_map(|key| {
+            let path = self.relay_paths.get(key)?;
+            (path.peer_node_id == peer_node_id && path.expires_at > now).then_some(*key)
+        })
     }
 
     fn persist_routing_cache(&self) -> Result<()> {
@@ -2339,6 +2474,8 @@ fn local_features() -> Vec<String> {
         "cooperative-relay-control".to_owned(),
         "opaque-relay-cells".to_owned(),
         "relay-e2e-session".to_owned(),
+        "relay-app-fragmentation".to_owned(),
+        "relay-app-backpressure".to_owned(),
         "punch-to-relay-fallback".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
