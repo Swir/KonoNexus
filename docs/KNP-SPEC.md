@@ -71,28 +71,48 @@ A rendezvous offer creates a bounded local punch schedule instead of sending onl
 
 The implementation deliberately sends only to the coordinator-observed candidate. It does not spray adjacent ports. Rendezvous candidates with port 0, loopback, unspecified, multicast, or IPv4 broadcast addresses are rejected locally.
 
-## 8. Current limitations of punching
+## 8. Automatic rendezvous selection
 
-The burst improves timing tolerance but does not yet implement port prediction, alternate candidate sets, filtering-behavior probes, ICE-like candidate prioritization, or automatic rendezvous selection.
+A node may request a target NodeID without naming a coordinator. KNP considers only peers with established encrypted sessions, prefers IPv6 and longer-lived peers deterministically, and tries at most three different coordinators per round. A negative coordinator response accelerates trying the next candidate. An unsuccessful punch resumes coordinator selection after the punch authorization expires.
+
+The bounded selector does not discover new peers by itself; DHT discovery is still required for a truly global rendezvous pool.
+
+## 9. Consent-based filtering evidence
+
+KNP can gather positive evidence for endpoint-independent inbound filtering using a third helper peer.
+
+1. The tested node asks coordinator C for a filtering test.
+2. C selects helper H only if H has an encrypted session with C and C observes H on a different IP from the tested node.
+3. C proposes H and the tested node's C-observed endpoint.
+4. The tested node rejects the proposal unless that endpoint exactly matches its existing observation attributed to C and unless it has no existing direct relationship with H.
+5. The tested node creates an Ed25519-signed, short-lived authorization binding its NodeID/public key, target endpoint, H's NodeID, and a random probe token.
+6. C verifies the consent against its pending proposal and forwards it to H.
+7. H independently verifies the signature, NodeID binding, expiry, helper identity, and target endpoint before sending one signed direct FILTER_PROBE.
+8. The tested node counts evidence only if the arriving probe carries the expected signed H identity and token.
+
+A successful probe is positive evidence that an independent endpoint reached the mapping. A timeout is only inconclusive; packet loss or helper reachability can cause false negatives.
+
+## 10. Current limitations
+
+The punch burst still does not implement port prediction or broad ICE-like candidate prioritization. Filtering evidence currently proves only successful independent-endpoint reachability; it does not infer a restrictive filtering class from non-arrival.
 
 Destination-specific/symmetric NAT mappings may therefore still fail. Cooperative relay remains the planned fallback.
 
-## 9. Security properties of rendezvous
+## 11. Security properties of rendezvous
 
 Rendezvous control data is sent inside the existing AEAD session to the coordinator. Direct punch packets remain signed outer KNP messages so that a peer can authenticate a previously unseen direct source endpoint before a direct encrypted session exists.
 
 A token alone is insufficient: the punch sender must also prove possession of the Ed25519 identity corresponding to the NodeID named in the encrypted rendezvous offer.
 
-## 10. Planned next stages
+## 12. Planned next stages
 
-1. richer mapping/filtering tests,
-2. automatic rendezvous peer selection,
-3. IPv6 direct-path preference,
-4. safe multi-candidate/path prioritization,
-5. DHT-based peer discovery,
-6. cooperative encrypted relay fallback,
-7. route scoring and KonoMind optimization.
+1. broader filtering-behavior validation,
+2. IPv6 direct-path preference,
+3. safe multi-candidate/path prioritization,
+4. DHT-based peer discovery,
+5. cooperative encrypted relay fallback,
+6. route scoring and KonoMind optimization.
 
-## 11. Versioning
+## 13. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
