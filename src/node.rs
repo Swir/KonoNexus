@@ -632,8 +632,7 @@ impl KonoNode {
                 ephemeral_public_key,
             } => {
                 let valid_pending = self.pending_sessions.get(&source).is_some_and(|attempt| {
-                    attempt.handshake_id == handshake_id
-                        && attempt.peer_node_id == sender_node_id
+                    attempt.handshake_id == handshake_id && attempt.peer_node_id == sender_node_id
                 });
                 if !valid_pending {
                     debug!(%source, handshake_id, "ignoring unexpected session ack");
@@ -1778,7 +1777,7 @@ impl KonoNode {
 
                         if status == RelayAppReceiveStatus::Completed {
                             self.flush_relay_app_events();
-                    self.flush_relay_app_failures();
+                            self.flush_relay_app_failures();
                         }
                     }
                     SecurePayload::RelayAppAck { message_id } => {
