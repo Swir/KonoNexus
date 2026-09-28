@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
+use std::time::{Duration, Instant};
 
 const SESSION_CONTEXT: &[u8] = b"knp-session-v1";
 const SESSION_KEY_INFO: &[u8] = b"knp-session-directional-keys-v1";
