@@ -1606,9 +1606,7 @@ impl KonoNode {
                 self.relay_e2e_sessions.remove(&(source, circuit_id));
                 self.pending_relay_e2e_rekeys.remove(&(source, circuit_id));
                 self.responder_relay_e2e_rekey_acks
-                    .retain(|(endpoint, cid, _), _| {
-                        *endpoint != source || *cid != circuit_id
-                    });
+                    .retain(|(endpoint, cid, _), _| *endpoint != source || *cid != circuit_id);
                 self.last_relay_e2e_rekey.remove(&(source, circuit_id));
 
                 if let Some((relay_endpoint, target_node_id)) = rejected {
