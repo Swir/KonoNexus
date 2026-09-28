@@ -560,6 +560,7 @@ impl KonoNode {
                     .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
                 self.pending_punches.remove(&punch_token);
+                self.punch_relay_candidates.remove(&punch_token);
                 self.auto_rendezvous.remove(&sender_node_id);
 
                 self.send(
@@ -612,6 +613,7 @@ impl KonoNode {
                     .map_or(0, PunchSchedule::attempts_sent);
                 self.record_peer(&envelope, source);
                 self.pending_punches.remove(&punch_token);
+                self.punch_relay_candidates.remove(&punch_token);
 
                 info!(
                     peer = %sender_node_id,
@@ -1071,14 +1073,25 @@ impl KonoNode {
                     RelayPath {
                         peer_node_id: peer_node_id.clone(),
                         expires_at: Instant::now() + RELAY_CIRCUIT_TTL,
+                        next_send_sequence: 0,
+                        highest_receive_sequence: None,
                     },
                 );
+
+                let local_node_id = self.node_id();
+                if local_node_id.as_str() < peer_node_id.as_str() {
+                    let (pending, init) =
+                        RelayE2eInitiator::begin(&self.identity, circuit_id, peer_node_id.clone())?;
+                    self.relay_e2e_pending
+                        .insert((source, circuit_id), pending);
+                    self.send_relay_inner(source, circuit_id, init).await?;
+                }
 
                 info!(
                     relay = %sender_node_id,
                     peer = %peer_node_id,
                     circuit_id,
-                    "relay path ready for opaque end-to-end cells"
+                    "relay path ready; end-to-end inner handshake started"
                 );
             }
             SecurePayload::RelayCell {
@@ -1110,11 +1123,23 @@ impl KonoNode {
                             debug!(circuit_id, %error, "relay cell rejected");
                         }
                     }
-                } else if let Some(path) = self.relay_paths.get_mut(&(source, circuit_id)) {
-                    if path.expires_at <= Instant::now() {
-                        self.relay_paths.remove(&(source, circuit_id));
-                        return Ok(());
-                    }
+                } else if self.relay_paths.contains_key(&(source, circuit_id)) {
+                    let peer_node_id = {
+                        let Some(path) = self.relay_paths.get_mut(&(source, circuit_id)) else {
+                            return Ok(());
+                        };
+                        if path.expires_at <= Instant::now()
+                            || path
+                                .highest_receive_sequence
+                                .is_some_and(|highest| sequence <= highest)
+                        {
+                            return Ok(());
+                        }
+
+                        path.highest_receive_sequence = Some(sequence);
+                        path.expires_at = Instant::now() + RELAY_CIRCUIT_TTL;
+                        path.peer_node_id.clone()
+                    };
 
                     let raw = match hex::decode(&opaque_payload_hex) {
                         Ok(raw) => raw,
@@ -1124,25 +1149,18 @@ impl KonoNode {
                         return Ok(());
                     }
 
-                    path.expires_at = Instant::now() + RELAY_CIRCUIT_TTL;
-                    if self.relay_inbox.len() >= MAX_RELAY_INBOX_CELLS {
-                        self.relay_inbox.pop_front();
+                    if let Err(error) = self
+                        .handle_relay_inner(source, circuit_id, &peer_node_id, &raw)
+                        .await
+                    {
+                        debug!(
+                            relay = %sender_node_id,
+                            peer = %peer_node_id,
+                            circuit_id,
+                            %error,
+                            "relay inner packet rejected"
+                        );
                     }
-                    self.relay_inbox.push_back(RelayDeliveredCell {
-                        relay_endpoint: source,
-                        circuit_id,
-                        peer_node_id: path.peer_node_id.clone(),
-                        sequence,
-                        opaque_payload_hex,
-                    });
-
-                    debug!(
-                        relay = %sender_node_id,
-                        peer = %path.peer_node_id,
-                        circuit_id,
-                        sequence,
-                        "opaque relay cell delivered to local inbox"
-                    );
                 }
             }
             SecurePayload::RelayClose { circuit_id } => {
@@ -1156,6 +1174,8 @@ impl KonoNode {
                     .await?;
                 } else {
                     self.relay_paths.remove(&(source, circuit_id));
+                    self.relay_e2e_pending.remove(&(source, circuit_id));
+                    self.relay_e2e_sessions.remove(&(source, circuit_id));
                     self.pending_relay_requests.remove(&circuit_id);
                     self.pending_relay_accepts.remove(&(source, circuit_id));
                 }
@@ -1164,6 +1184,8 @@ impl KonoNode {
                 self.pending_relay_requests.remove(&circuit_id);
                 self.pending_relay_accepts.remove(&(source, circuit_id));
                 self.relay_paths.remove(&(source, circuit_id));
+                self.relay_e2e_pending.remove(&(source, circuit_id));
+                self.relay_e2e_sessions.remove(&(source, circuit_id));
                 debug!(relay = %sender_node_id, circuit_id, "relay request rejected");
             }
             SecurePayload::RendezvousOffer {
@@ -1205,6 +1227,7 @@ impl KonoNode {
                     punch_token,
                     PunchSchedule::new(peer_node_id.clone(), candidate, Instant::now()),
                 );
+                self.punch_relay_candidates.insert(punch_token, source);
 
                 info!(
                     peer = %peer_node_id,
@@ -1381,34 +1404,196 @@ impl KonoNode {
         };
 
         for target_node_id in targets {
-            if !plausible_node_id(&target_node_id) {
-                continue;
+            self.start_relay_request(relay_endpoint, &target_node_id)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn start_relay_request(
+        &mut self,
+        relay_endpoint: SocketAddr,
+        target_node_id: &str,
+    ) -> Result<Option<u64>> {
+        if !plausible_node_id(target_node_id)
+            || target_node_id == self.node_id()
+            || !self.sessions.contains_key(&relay_endpoint)
+        {
+            return Ok(None);
+        }
+
+        if self.relay_paths.iter().any(|((endpoint, _), path)| {
+            *endpoint == relay_endpoint
+                && path.peer_node_id == target_node_id
+                && path.expires_at > Instant::now()
+        }) || self.pending_relay_requests.values().any(|(endpoint, peer)| {
+            *endpoint == relay_endpoint && peer == target_node_id
+        }) {
+            return Ok(None);
+        }
+
+        let mut circuit_id: u64 = random();
+        while self.pending_relay_requests.contains_key(&circuit_id) {
+            circuit_id = random();
+        }
+
+        self.pending_relay_requests
+            .insert(circuit_id, (relay_endpoint, target_node_id.to_owned()));
+
+        if let Err(error) = self
+            .send_secure_payload(
+                relay_endpoint,
+                SecurePayload::RelayOpen {
+                    circuit_id,
+                    target_node_id: target_node_id.to_owned(),
+                },
+            )
+            .await
+        {
+            self.pending_relay_requests.remove(&circuit_id);
+            return Err(error);
+        }
+
+        info!(
+            %relay_endpoint,
+            target = %target_node_id,
+            circuit_id,
+            "requested cooperative relay circuit"
+        );
+
+        Ok(Some(circuit_id))
+    }
+
+    async fn send_relay_inner(
+        &mut self,
+        relay_endpoint: SocketAddr,
+        circuit_id: u64,
+        encoded: Vec<u8>,
+    ) -> Result<()> {
+        if encoded.is_empty() || encoded.len() > crate::relay::MAX_RELAY_CELL_BYTES {
+            return Err(anyhow!("relay inner packet size is invalid"));
+        }
+
+        let sequence = {
+            let path = self
+                .relay_paths
+                .get_mut(&(relay_endpoint, circuit_id))
+                .ok_or_else(|| anyhow!("relay path not found"))?;
+
+            if path.expires_at <= Instant::now() {
+                return Err(anyhow!("relay path expired"));
             }
 
-            let circuit_id: u64 = random();
-            self.pending_relay_requests
-                .insert(circuit_id, (relay_endpoint, target_node_id.clone()));
+            let sequence = path.next_send_sequence;
+            path.next_send_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("relay transport sequence exhausted"))?;
+            path.expires_at = Instant::now() + RELAY_CIRCUIT_TTL;
+            sequence
+        };
 
-            if let Err(error) = self
-                .send_secure_payload(
-                    relay_endpoint,
-                    SecurePayload::RelayOpen {
-                        circuit_id,
-                        target_node_id: target_node_id.clone(),
-                    },
-                )
-                .await
-            {
-                self.pending_relay_requests.remove(&circuit_id);
-                return Err(error);
-            }
-
-            info!(
-                %relay_endpoint,
-                target = %target_node_id,
+        self.send_secure_payload(
+            relay_endpoint,
+            SecurePayload::RelayCell {
                 circuit_id,
-                "requested cooperative relay circuit"
-            );
+                sequence,
+                opaque_payload_hex: hex::encode(encoded),
+            },
+        )
+        .await
+    }
+
+    async fn handle_relay_inner(
+        &mut self,
+        relay_endpoint: SocketAddr,
+        circuit_id: u64,
+        peer_node_id: &str,
+        encoded: &[u8],
+    ) -> Result<()> {
+        let key = (relay_endpoint, circuit_id);
+
+        match packet_kind(encoded)? {
+            "init" => {
+                if self.relay_e2e_sessions.contains_key(&key) {
+                    return Ok(());
+                }
+
+                let (session, ack) =
+                    accept_relay_init(&self.identity, circuit_id, peer_node_id, encoded)?;
+                let session_id = session.session_id().to_owned();
+                self.relay_e2e_sessions.insert(key, session);
+                self.send_relay_inner(relay_endpoint, circuit_id, ack).await?;
+
+                info!(
+                    %relay_endpoint,
+                    peer = %peer_node_id,
+                    circuit_id,
+                    %session_id,
+                    "relay inner end-to-end session established as responder"
+                );
+            }
+            "ack" => {
+                let Some(pending) = self.relay_e2e_pending.remove(&key) else {
+                    return Ok(());
+                };
+                let mut session = pending.complete(&self.identity, encoded)?;
+                let session_id = session.session_id().to_owned();
+                let ping_token: u64 = random();
+                let ping =
+                    encode_relay_payload(&mut session, &SecurePayload::Ping { token: ping_token })?;
+                self.relay_e2e_sessions.insert(key, session);
+                self.send_relay_inner(relay_endpoint, circuit_id, ping)
+                    .await?;
+
+                info!(
+                    %relay_endpoint,
+                    peer = %peer_node_id,
+                    circuit_id,
+                    %session_id,
+                    "relay inner end-to-end session established as initiator"
+                );
+            }
+            "data" => {
+                let payload = {
+                    let Some(session) = self.relay_e2e_sessions.get_mut(&key) else {
+                        return Ok(());
+                    };
+                    decode_relay_payload(session, encoded)?
+                };
+
+                match payload {
+                    SecurePayload::Ping { token } => {
+                        let pong = {
+                            let session = self
+                                .relay_e2e_sessions
+                                .get_mut(&key)
+                                .ok_or_else(|| anyhow!("relay E2E session disappeared"))?;
+                            encode_relay_payload(session, &SecurePayload::Pong { token })?
+                        };
+                        self.send_relay_inner(relay_endpoint, circuit_id, pong)
+                            .await?;
+                    }
+                    SecurePayload::Pong { token } => {
+                        debug!(
+                            %relay_endpoint,
+                            peer = %peer_node_id,
+                            circuit_id,
+                            token,
+                            "relay E2E pong received"
+                        );
+                    }
+                    _ => {
+                        debug!(
+                            %relay_endpoint,
+                            peer = %peer_node_id,
+                            circuit_id,
+                            "ignored unsupported relay inner secure payload"
+                        );
+                    }
+                }
+            }
+            _ => return Err(anyhow!("unknown relay inner packet kind")),
         }
 
         Ok(())
@@ -2054,6 +2239,10 @@ impl KonoNode {
             .retain(|_, expires_at| *expires_at > Instant::now());
         self.relay_paths
             .retain(|_, path| path.expires_at > Instant::now());
+        self.relay_e2e_pending
+            .retain(|key, _| self.relay_paths.contains_key(key));
+        self.relay_e2e_sessions
+            .retain(|key, _| self.relay_paths.contains_key(key));
         self.pending_relay_accepts
             .retain(|_, pending| pending.expires_at > Instant::now());
         let expired_relay = self.relay_manager.expire(Instant::now());
@@ -2105,6 +2294,8 @@ fn local_features() -> Vec<String> {
         "persistent-routing-hints".to_owned(),
         "cooperative-relay-control".to_owned(),
         "opaque-relay-cells".to_owned(),
+        "relay-e2e-session".to_owned(),
+        "punch-to-relay-fallback".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
