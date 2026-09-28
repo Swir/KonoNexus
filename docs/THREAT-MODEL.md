@@ -25,6 +25,8 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - bounded DHT table (4,096) and response size (8), TTL limits, and rollback rejection,
 - DHT endpoints restricted to publishable public addresses,
 - automatic dialing only for exact records matching a locally pending NodeID lookup, never arbitrary nearest-record gossip,
+- in-memory 256-bucket routing state populated only by authenticated encrypted peers,
+- recursive DHT lookup limited to fanout 2 and 3 hops with duplicate-query suppression, short-lived reverse routes, forwarding cooldown, and bounded query state,
 - session keys zeroized when sessions are dropped.
 
 ## NAT/rendezvous threats considered
@@ -49,7 +51,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - session receive ordering remains strict,
 - session key rotation is not implemented,
 - DHT endpoint records are self-asserted by their owning NodeID and are not yet independently endpoint-attested,
-- iterative DHT routing and Sybil resistance are not yet implemented,
+- recursive DHT routing exists, but bucket persistence, endpoint attestations, and Sybil resistance are not yet implemented,
 - no independent security audit has been completed.
 
 ## Required before production
@@ -58,7 +60,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
 - bounded sliding anti-replay windows for UDP reordering,
 - handshake retransmission and session key rotation,
-- independent endpoint attestations for DHT records, persistent bucket rules, and Sybil mitigation,
+- independent endpoint attestations for DHT records, persistent bucket storage, stronger query rate limits, and Sybil mitigation,
 - relay abuse controls,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
