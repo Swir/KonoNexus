@@ -2028,14 +2028,57 @@ impl KonoNode {
 
         for token in expired {
             if let Some(schedule) = self.pending_punches.remove(&token) {
-                if let Some(state) = self.auto_rendezvous.get_mut(schedule.expected_node_id()) {
-                    state.hurry(Instant::now());
+                let target_node_id = schedule.expected_node_id().to_owned();
+                let relay_candidate = self.punch_relay_candidates.remove(&token);
+                let local_node_id = self.node_id();
+                let mut relay_started = false;
+
+                if local_node_id.as_str() < target_node_id.as_str()
+                    && self.peer_endpoint_by_node_id(&target_node_id).is_none()
+                {
+                    if let Some(relay_endpoint) = relay_candidate {
+                        if self.sessions.contains_key(&relay_endpoint) {
+                            match self
+                                .start_relay_request(relay_endpoint, &target_node_id)
+                                .await
+                            {
+                                Ok(Some(circuit_id)) => {
+                                    relay_started = true;
+                                    info!(
+                                        %relay_endpoint,
+                                        target = %target_node_id,
+                                        circuit_id,
+                                        "hole punch failed; automatic relay fallback started"
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    debug!(
+                                        %relay_endpoint,
+                                        target = %target_node_id,
+                                        %error,
+                                        "automatic relay fallback failed to start"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
+
+                if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
+                    if relay_started {
+                        state.defer(Instant::now(), Duration::from_secs(10));
+                    } else {
+                        state.hurry(Instant::now());
+                    }
+                }
+
                 info!(
-                    peer = %schedule.expected_node_id(),
+                    peer = %target_node_id,
                     candidate = %schedule.candidate_endpoint(),
                     punch_token = token,
                     attempts = schedule.attempts_sent(),
+                    relay_started,
                     "UDP punch burst expired without direct-path confirmation"
                 );
             }
