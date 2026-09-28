@@ -265,6 +265,16 @@ impl RelayAppManager {
         self.completed.drain(..).collect()
     }
 
+    pub fn peek_completed(&self) -> Option<RelayAppMessage> {
+        self.completed.front().cloned()
+    }
+
+    pub fn pop_completed(&mut self) -> Option<RelayAppMessage> {
+        let message = self.completed.pop_front()?;
+        self.completed_bytes = self.completed_bytes.saturating_sub(message.data.len());
+        Some(message)
+    }
+
     pub fn expire(&mut self, now: Instant) -> (usize, usize) {
         let expired_inbound: Vec<(String, u64)> = self
             .inbound
