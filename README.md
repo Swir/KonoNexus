@@ -100,7 +100,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Sliding 128-sequence anti-replay windows with UDP reordering tolerance
 - [x] Bounded alternate relay selection across up to 3 encrypted peers
 - [x] Live RelayApp direct↔relay migration with direct preference
-- [ ] Multi-relay routing and full control-plane path migration
+- [x] Multi-relay routing and full control-plane path migration
 - [ ] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
@@ -237,6 +237,10 @@ Alpha.13 retransmits the same `SESSION_INIT` after a one-second timeout, up to f
 
 When direct UDP punching fails, the preferred relay remains the rendezvous coordinator that helped produce the punch candidate. If that relay is gone, cannot open the target, or rejects the circuit, the lower-NodeID endpoint can try other already-authenticated encrypted peers. Alpha.13 tries at most three distinct relay candidates in a 30-second fallback state, never repeats the same candidate, and stops as soon as a direct or relay path to the target becomes active.
 
+
+### Bounded multi-relay control-plane migration
+
+Application traffic now uses a bounded control-plane selector across confirmed direct KNP sessions and already-established relay E2E circuits. Direct transport preempts relay; otherwise relay selection is deterministic and sticky, considers at most three established circuits, and can migrate to another existing relay after close/reject/send failure. The selector does not probe arbitrary ports or create new unauthenticated paths. See [docs/CONTROL-PLANE-ROUTING.md](docs/CONTROL-PLANE-ROUTING.md) for the invariants and test scope.
 
 ### Direct and relay-inner session key rotation
 
