@@ -11,6 +11,7 @@ pub mod relay;
 pub mod relay_app;
 pub mod relay_e2e;
 pub mod rendezvous;
+pub mod route;
 pub mod routing_cache;
 pub mod security;
 pub mod session;
@@ -49,6 +50,7 @@ pub use relay_e2e::{
     RelayInnerPacket, MAX_RELAY_INNER_PACKET_BYTES,
 };
 pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
+pub use route::{ControlRoute, RelayRouteCandidate, RouteController, RouteDecision, MAX_RELAY_ROUTE_CANDIDATES};
 pub use routing_cache::{
     load_routing_bucket_snapshot, load_routing_hints, new_bucket_cache_entry, new_cache_entry,
     save_routing_bucket_snapshot, save_routing_hints, RoutingBucketCacheEntry, RoutingCacheEntry,
