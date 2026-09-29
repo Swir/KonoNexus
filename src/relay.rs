@@ -312,7 +312,8 @@ impl RelayManager {
         }
 
         let (max_cells, max_bytes) = self.adaptive_limits(source_node_id, now);
-        let forward_result = {
+        let mut quota_exceeded = false;
+        let forward_result: Result<RelayForward> = (|| {
             let circuit = self
                 .circuits
                 .get_mut(&circuit_id)
@@ -345,7 +346,10 @@ impl RelayManager {
                 bail!("relay cell source does not match circuit");
             };
 
-            rate_window.consume(raw.len(), now, max_cells, max_bytes)?;
+            if let Err(error) = rate_window.consume(raw.len(), now, max_cells, max_bytes) {
+                quota_exceeded = true;
+                return Err(error);
+            }
             receive_window.check_and_record(sequence)?;
             circuit.expires_at = now + RELAY_CIRCUIT_TTL;
 
@@ -356,22 +360,10 @@ impl RelayManager {
                 sequence,
                 opaque_payload_hex,
             })
-        };
+        })();
 
-        if forward_result.is_err() {
-            let quota_exceeded = self.circuits.get(&circuit_id).is_some_and(|circuit| {
-                let rate_window = if source_node_id == circuit.origin_node_id {
-                    Some(&circuit.origin_rate)
-                } else if source_node_id == circuit.target_node_id {
-                    Some(&circuit.target_rate)
-                } else {
-                    None
-                };
-                rate_window.is_some_and(|rate| rate.cells >= max_cells || rate.bytes >= max_bytes)
-            });
-            if quota_exceeded {
-                self.record_abuse_violation(source_node_id, now);
-            }
+        if quota_exceeded {
+            self.record_abuse_violation(source_node_id, now);
         }
 
         forward_result
