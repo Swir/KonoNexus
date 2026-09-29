@@ -16,6 +16,7 @@ use crate::relay_e2e::{
     packet_kind, RelayE2eInitiator,
 };
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
+use crate::route::{ControlRoute, RelayRouteCandidate, RouteController};
 use crate::routing_cache::{
     load_routing_bucket_snapshot, new_bucket_cache_entry, save_routing_bucket_snapshot,
     MAX_ROUTING_BOOTSTRAP_HINTS,
@@ -290,27 +291,6 @@ struct AutoRelayFallback {
     expires_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppTransport {
-    Direct(SocketAddr),
-    Relay {
-        relay_endpoint: SocketAddr,
-        circuit_id: u64,
-    },
-}
-
-fn preferred_app_transport(
-    direct: Option<SocketAddr>,
-    relay: Option<(SocketAddr, u64)>,
-) -> Option<AppTransport> {
-    direct.map(AppTransport::Direct).or_else(|| {
-        relay.map(|(relay_endpoint, circuit_id)| AppTransport::Relay {
-            relay_endpoint,
-            circuit_id,
-        })
-    })
-}
-
 pub struct KonoNode {
     identity: NodeIdentity,
     socket: Arc<UdpSocket>,
@@ -362,6 +342,7 @@ pub struct KonoNode {
     relay_app_event_tx: Option<mpsc::Sender<RelayAppMessage>>,
     relay_app_receipt_tx: Option<mpsc::Sender<RelayAppDeliveryReceipt>>,
     relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
+    route_controller: RouteController,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
     diagnostics: Option<Arc<RwLock<NetworkDiagnostics>>>,
     local_test_mode: bool,
@@ -431,6 +412,7 @@ impl KonoNode {
             relay_app_event_tx: None,
             relay_app_receipt_tx: None,
             relay_app_failure_tx: None,
+            route_controller: RouteController::default(),
             punch_relay_candidates: HashMap::new(),
             diagnostics: None,
             local_test_mode: false,
@@ -1694,34 +1676,49 @@ impl KonoNode {
                         SecurePayload::RelayClose { circuit_id },
                     )
                     .await?;
-                } else {
-                    self.relay_paths.remove(&(source, circuit_id));
-                    self.relay_e2e_pending.remove(&(source, circuit_id));
-                    self.relay_e2e_sessions.remove(&(source, circuit_id));
-                    self.pending_relay_e2e_rekeys.remove(&(source, circuit_id));
-                    self.responder_relay_e2e_rekey_acks
-                        .retain(|(endpoint, cid, _), _| *endpoint != source || *cid != circuit_id);
-                    self.last_relay_e2e_rekey.remove(&(source, circuit_id));
-                    self.pending_relay_requests.remove(&circuit_id);
-                    self.pending_relay_accepts.remove(&(source, circuit_id));
+                } else if let Some(peer_node_id) =
+                    self.remove_client_relay_path((source, circuit_id))
+                {
+                    if self.direct_app_endpoint_for_peer(&peer_node_id).is_none() {
+                        self.schedule_auto_relay_failover(
+                            peer_node_id.clone(),
+                            source,
+                            Instant::now(),
+                        );
+                    }
+
+                    info!(
+                        relay = %sender_node_id,
+                        peer = %peer_node_id,
+                        circuit_id,
+                        "relay path closed; bounded failover scheduled"
+                    );
                 }
             }
             SecurePayload::RelayReject { circuit_id } => {
-                let rejected = self.pending_relay_requests.remove(&circuit_id);
-                self.pending_relay_accepts.remove(&(source, circuit_id));
-                self.relay_paths.remove(&(source, circuit_id));
-                self.relay_e2e_pending.remove(&(source, circuit_id));
-                self.relay_e2e_sessions.remove(&(source, circuit_id));
-                self.pending_relay_e2e_rekeys.remove(&(source, circuit_id));
-                self.responder_relay_e2e_rekey_acks
-                    .retain(|(endpoint, cid, _), _| *endpoint != source || *cid != circuit_id);
-                self.last_relay_e2e_rekey.remove(&(source, circuit_id));
+                let rejected = self.pending_relay_requests.get(&circuit_id).cloned();
+                let removed_peer = self.remove_client_relay_path((source, circuit_id));
 
                 if let Some((relay_endpoint, target_node_id)) = rejected {
                     if relay_endpoint == source {
                         if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
+                            state.tried.insert(source);
                             state.next_attempt_at = Instant::now();
+                        } else {
+                            self.schedule_auto_relay_failover(
+                                target_node_id,
+                                source,
+                                Instant::now(),
+                            );
                         }
+                    }
+                } else if let Some(peer_node_id) = removed_peer {
+                    if self.direct_app_endpoint_for_peer(&peer_node_id).is_none() {
+                        self.schedule_auto_relay_failover(
+                            peer_node_id,
+                            source,
+                            Instant::now(),
+                        );
                     }
                 }
 
@@ -2350,31 +2347,114 @@ impl KonoNode {
         payload: SecurePayload,
     ) -> Result<bool> {
         let direct = self.direct_app_endpoint_for_peer(peer_node_id);
-        let relay = self.relay_e2e_path_for_peer(peer_node_id);
+        let relay_candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
+        let Some(decision) = self.route_controller.select(
+            peer_node_id,
+            direct,
+            relay_candidates.iter().copied(),
+        ) else {
+            return Ok(false);
+        };
 
-        match preferred_app_transport(direct, relay) {
-            Some(AppTransport::Direct(endpoint)) => {
+        if decision.changed {
+            info!(
+                peer = %peer_node_id,
+                generation = decision.generation,
+                route = ?decision.route,
+                "application control-plane route migrated"
+            );
+        }
+
+        match decision.route {
+            ControlRoute::Direct(endpoint) => {
                 self.send_secure_payload(endpoint, payload).await?;
                 Ok(true)
             }
-            Some(AppTransport::Relay {
+            ControlRoute::Relay {
                 relay_endpoint,
                 circuit_id,
-            }) => {
+            } => {
                 let encoded = {
                     let Some(session) = self
                         .relay_e2e_sessions
                         .get_mut(&(relay_endpoint, circuit_id))
                     else {
+                        self.route_controller.invalidate_relay(
+                            peer_node_id,
+                            relay_endpoint,
+                            circuit_id,
+                        );
                         return Ok(false);
                     };
-                    encode_relay_payload(session, &payload)?
+                    encode_relay_payload(session, &payload.clone())?
                 };
-                self.send_relay_inner(relay_endpoint, circuit_id, encoded)
-                    .await?;
-                Ok(true)
+
+                match self
+                    .send_relay_inner(relay_endpoint, circuit_id, encoded)
+                    .await
+                {
+                    Ok(()) => Ok(true),
+                    Err(primary_error) => {
+                        let failed_peer =
+                            self.remove_client_relay_path((relay_endpoint, circuit_id));
+                        if let Some(failed_peer) = failed_peer {
+                            self.schedule_auto_relay_failover(
+                                failed_peer,
+                                relay_endpoint,
+                                Instant::now(),
+                            );
+                        }
+
+                        let direct = self.direct_app_endpoint_for_peer(peer_node_id);
+                        let alternates = self.relay_e2e_candidates_for_peer(peer_node_id);
+                        let Some(failover) = self.route_controller.select(
+                            peer_node_id,
+                            direct,
+                            alternates.iter().copied(),
+                        ) else {
+                            return Err(primary_error);
+                        };
+
+                        if failover.changed {
+                            info!(
+                                peer = %peer_node_id,
+                                generation = failover.generation,
+                                route = ?failover.route,
+                                failed_relay = %relay_endpoint,
+                                "application control-plane failover selected"
+                            );
+                        }
+
+                        match failover.route {
+                            ControlRoute::Direct(endpoint) => {
+                                self.send_secure_payload(endpoint, payload).await?;
+                                Ok(true)
+                            }
+                            ControlRoute::Relay {
+                                relay_endpoint: alternate_endpoint,
+                                circuit_id: alternate_circuit_id,
+                            } => {
+                                let encoded = {
+                                    let Some(session) = self
+                                        .relay_e2e_sessions
+                                        .get_mut(&(alternate_endpoint, alternate_circuit_id))
+                                    else {
+                                        return Err(primary_error);
+                                    };
+                                    encode_relay_payload(session, &payload)?
+                                };
+                                self.send_relay_inner(
+                                    alternate_endpoint,
+                                    alternate_circuit_id,
+                                    encoded,
+                                )
+                                .await?;
+                                Ok(true)
+                            }
+                        }
+                    }
+                }
             }
-            None => Ok(false),
         }
     }
 
@@ -2601,12 +2681,62 @@ impl KonoNode {
         }
     }
 
-    fn relay_e2e_path_for_peer(&self, peer_node_id: &str) -> Option<(SocketAddr, u64)> {
+    fn relay_e2e_candidates_for_peer(
+        &self,
+        peer_node_id: &str,
+    ) -> Vec<RelayRouteCandidate> {
         let now = Instant::now();
-        self.relay_e2e_sessions.keys().find_map(|key| {
-            let path = self.relay_paths.get(key)?;
-            (path.peer_node_id == peer_node_id && path.expires_at > now).then_some(*key)
-        })
+        self.relay_e2e_sessions
+            .keys()
+            .filter_map(|(relay_endpoint, circuit_id)| {
+                let path = self.relay_paths.get(&(*relay_endpoint, *circuit_id))?;
+                (path.peer_node_id == peer_node_id && path.expires_at > now).then_some(
+                    RelayRouteCandidate::new(*relay_endpoint, *circuit_id),
+                )
+            })
+            .collect()
+    }
+
+    fn relay_e2e_path_for_peer(&self, peer_node_id: &str) -> Option<(SocketAddr, u64)> {
+        let mut candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
+        candidates.sort_by_key(|candidate| {
+            (
+                if candidate.relay_endpoint.is_ipv6() {
+                    0_u8
+                } else {
+                    1_u8
+                },
+                candidate.relay_endpoint,
+                candidate.circuit_id,
+            )
+        });
+        candidates
+            .first()
+            .map(|candidate| (candidate.relay_endpoint, candidate.circuit_id))
+    }
+
+    fn remove_client_relay_path(&mut self, key: (SocketAddr, u64)) -> Option<String> {
+        let peer_node_id = self
+            .relay_paths
+            .remove(&key)
+            .map(|path| path.peer_node_id);
+        self.relay_e2e_pending.remove(&key);
+        self.relay_e2e_sessions.remove(&key);
+        self.pending_relay_e2e_rekeys.remove(&key);
+        self.responder_relay_e2e_rekey_acks
+            .retain(|(endpoint, circuit_id, _), _| {
+                *endpoint != key.0 || *circuit_id != key.1
+            });
+        self.last_relay_e2e_rekey.remove(&key);
+        self.pending_relay_requests.remove(&key.1);
+        self.pending_relay_accepts.remove(&key);
+
+        if let Some(peer_node_id) = peer_node_id.as_deref() {
+            self.route_controller
+                .invalidate_relay(peer_node_id, key.0, key.1);
+        }
+
+        peer_node_id
     }
 
     fn persist_routing_cache(&self) -> Result<()> {
@@ -3108,6 +3238,19 @@ impl KonoNode {
                 next_attempt_at: now,
                 expires_at: now + AUTO_RELAY_STATE_TTL,
             });
+    }
+
+    fn schedule_auto_relay_failover(
+        &mut self,
+        target_node_id: String,
+        failed_relay: SocketAddr,
+        now: Instant,
+    ) {
+        self.schedule_auto_relay_fallback(target_node_id.clone(), None, now);
+        if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
+            state.tried.insert(failed_relay);
+            state.next_attempt_at = now;
+        }
     }
 
     async fn drive_auto_relay_fallbacks(&mut self) {
@@ -3949,6 +4092,7 @@ fn local_features() -> Vec<String> {
         "direct-relay-app-migration".to_owned(),
         "punch-to-relay-fallback".to_owned(),
         "multi-candidate-relay-fallback".to_owned(),
+        "multi-relay-control-plane".to_owned(),
         "consent-filter-probe".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
@@ -3980,22 +4124,4 @@ mod tests {
         assert!(!node.rendezvous_candidate_allowed("0.0.0.0:47000".parse().unwrap()));
     }
 
-    #[test]
-    fn application_transport_prefers_direct_and_falls_back_to_relay() {
-        let direct: SocketAddr = "203.0.113.1:47000".parse().unwrap();
-        let relay: SocketAddr = "198.51.100.2:47000".parse().unwrap();
-
-        assert_eq!(
-            preferred_app_transport(Some(direct), Some((relay, 7))),
-            Some(AppTransport::Direct(direct))
-        );
-        assert_eq!(
-            preferred_app_transport(None, Some((relay, 7))),
-            Some(AppTransport::Relay {
-                relay_endpoint: relay,
-                circuit_id: 7,
-            })
-        );
-        assert_eq!(preferred_app_transport(None, None), None);
-    }
 }
