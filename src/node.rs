@@ -1714,11 +1714,7 @@ impl KonoNode {
                     }
                 } else if let Some(peer_node_id) = removed_peer {
                     if self.direct_app_endpoint_for_peer(&peer_node_id).is_none() {
-                        self.schedule_auto_relay_failover(
-                            peer_node_id,
-                            source,
-                            Instant::now(),
-                        );
+                        self.schedule_auto_relay_failover(peer_node_id, source, Instant::now());
                     }
                 }
 
@@ -2348,11 +2344,10 @@ impl KonoNode {
     ) -> Result<bool> {
         let direct = self.direct_app_endpoint_for_peer(peer_node_id);
         let relay_candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
-        let Some(decision) = self.route_controller.select(
-            peer_node_id,
-            direct,
-            relay_candidates.iter().copied(),
-        ) else {
+        let Some(decision) =
+            self.route_controller
+                .select(peer_node_id, direct, relay_candidates.iter().copied())
+        else {
             return Ok(false);
         };
 
@@ -2687,9 +2682,8 @@ impl KonoNode {
             .keys()
             .filter_map(|(relay_endpoint, circuit_id)| {
                 let path = self.relay_paths.get(&(*relay_endpoint, *circuit_id))?;
-                (path.peer_node_id == peer_node_id && path.expires_at > now).then_some(
-                    RelayRouteCandidate::new(*relay_endpoint, *circuit_id),
-                )
+                (path.peer_node_id == peer_node_id && path.expires_at > now)
+                    .then_some(RelayRouteCandidate::new(*relay_endpoint, *circuit_id))
             })
             .collect()
     }
@@ -2713,17 +2707,12 @@ impl KonoNode {
     }
 
     fn remove_client_relay_path(&mut self, key: (SocketAddr, u64)) -> Option<String> {
-        let peer_node_id = self
-            .relay_paths
-            .remove(&key)
-            .map(|path| path.peer_node_id);
+        let peer_node_id = self.relay_paths.remove(&key).map(|path| path.peer_node_id);
         self.relay_e2e_pending.remove(&key);
         self.relay_e2e_sessions.remove(&key);
         self.pending_relay_e2e_rekeys.remove(&key);
         self.responder_relay_e2e_rekey_acks
-            .retain(|(endpoint, circuit_id, _), _| {
-                *endpoint != key.0 || *circuit_id != key.1
-            });
+            .retain(|(endpoint, circuit_id, _), _| *endpoint != key.0 || *circuit_id != key.1);
         self.last_relay_e2e_rekey.remove(&key);
         self.pending_relay_requests.remove(&key.1);
         self.pending_relay_accepts.remove(&key);
