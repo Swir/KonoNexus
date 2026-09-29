@@ -16,7 +16,9 @@ use crate::relay_e2e::{
     packet_kind, RelayE2eInitiator,
 };
 use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
-use crate::route::{ControlRoute, RelayRouteCandidate, RouteController};
+use crate::route::{
+    ControlRoute, RelayRouteCandidate, RouteController, MAX_RELAY_ROUTE_CANDIDATES,
+};
 use crate::routing_cache::{
     load_routing_bucket_snapshot, new_bucket_cache_entry, save_routing_bucket_snapshot,
     MAX_ROUTING_BOOTSTRAP_HINTS,
@@ -2342,110 +2344,84 @@ impl KonoNode {
         peer_node_id: &str,
         payload: SecurePayload,
     ) -> Result<bool> {
-        let direct = self.direct_app_endpoint_for_peer(peer_node_id);
-        let relay_candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
-        let Some(decision) =
-            self.route_controller
-                .select(peer_node_id, direct, relay_candidates.iter().copied())
-        else {
-            return Ok(false);
-        };
+        let mut relay_attempts = 0_usize;
+        let mut last_relay_error = None;
 
-        if decision.changed {
-            info!(
-                peer = %peer_node_id,
-                generation = decision.generation,
-                route = ?decision.route,
-                "application control-plane route migrated"
-            );
-        }
-
-        match decision.route {
-            ControlRoute::Direct(endpoint) => {
-                self.send_secure_payload(endpoint, payload).await?;
-                Ok(true)
-            }
-            ControlRoute::Relay {
-                relay_endpoint,
-                circuit_id,
-            } => {
-                let encoded = {
-                    let Some(session) = self
-                        .relay_e2e_sessions
-                        .get_mut(&(relay_endpoint, circuit_id))
-                    else {
-                        self.route_controller.invalidate_relay(
-                            peer_node_id,
-                            relay_endpoint,
-                            circuit_id,
-                        );
-                        return Ok(false);
-                    };
-                    encode_relay_payload(session, &payload)?
+        loop {
+            let direct = self.direct_app_endpoint_for_peer(peer_node_id);
+            let relay_candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
+            let Some(decision) =
+                self.route_controller
+                    .select(peer_node_id, direct, relay_candidates.iter().copied())
+            else {
+                return match last_relay_error {
+                    Some(error) => Err(error),
+                    None => Ok(false),
                 };
+            };
 
-                match self
-                    .send_relay_inner(relay_endpoint, circuit_id, encoded)
-                    .await
-                {
-                    Ok(()) => Ok(true),
-                    Err(primary_error) => {
-                        let failed_peer =
-                            self.remove_client_relay_path((relay_endpoint, circuit_id));
-                        if let Some(failed_peer) = failed_peer {
-                            self.schedule_auto_relay_failover(
-                                failed_peer,
-                                relay_endpoint,
-                                Instant::now(),
-                            );
-                        }
+            if decision.changed {
+                info!(
+                    peer = %peer_node_id,
+                    generation = decision.generation,
+                    route = ?decision.route,
+                    "application control-plane route migrated"
+                );
+            }
 
-                        let direct = self.direct_app_endpoint_for_peer(peer_node_id);
-                        let alternates = self.relay_e2e_candidates_for_peer(peer_node_id);
-                        let Some(failover) = self.route_controller.select(
-                            peer_node_id,
-                            direct,
-                            alternates.iter().copied(),
-                        ) else {
-                            return Err(primary_error);
+            match decision.route {
+                ControlRoute::Direct(endpoint) => {
+                    self.send_secure_payload(endpoint, payload).await?;
+                    return Ok(true);
+                }
+                ControlRoute::Relay {
+                    relay_endpoint,
+                    circuit_id,
+                } => {
+                    if relay_attempts >= MAX_RELAY_ROUTE_CANDIDATES {
+                        return match last_relay_error {
+                            Some(error) => Err(error),
+                            None => Ok(false),
                         };
+                    }
+                    relay_attempts = relay_attempts.saturating_add(1);
 
-                        if failover.changed {
-                            info!(
+                    let encoded = {
+                        let Some(session) = self
+                            .relay_e2e_sessions
+                            .get_mut(&(relay_endpoint, circuit_id))
+                        else {
+                            self.remove_client_relay_path((relay_endpoint, circuit_id));
+                            continue;
+                        };
+                        encode_relay_payload(session, &payload)?
+                    };
+
+                    match self
+                        .send_relay_inner(relay_endpoint, circuit_id, encoded)
+                        .await
+                    {
+                        Ok(()) => return Ok(true),
+                        Err(error) => {
+                            let failed_peer =
+                                self.remove_client_relay_path((relay_endpoint, circuit_id));
+                            if let Some(failed_peer) = failed_peer {
+                                self.schedule_auto_relay_failover(
+                                    failed_peer,
+                                    relay_endpoint,
+                                    Instant::now(),
+                                );
+                            }
+
+                            debug!(
                                 peer = %peer_node_id,
-                                generation = failover.generation,
-                                route = ?failover.route,
                                 failed_relay = %relay_endpoint,
-                                "application control-plane failover selected"
+                                circuit_id,
+                                relay_attempts,
+                                %error,
+                                "application relay send failed; trying next bounded route"
                             );
-                        }
-
-                        match failover.route {
-                            ControlRoute::Direct(endpoint) => {
-                                self.send_secure_payload(endpoint, payload).await?;
-                                Ok(true)
-                            }
-                            ControlRoute::Relay {
-                                relay_endpoint: alternate_endpoint,
-                                circuit_id: alternate_circuit_id,
-                            } => {
-                                let encoded = {
-                                    let Some(session) = self
-                                        .relay_e2e_sessions
-                                        .get_mut(&(alternate_endpoint, alternate_circuit_id))
-                                    else {
-                                        return Err(primary_error);
-                                    };
-                                    encode_relay_payload(session, &payload)?
-                                };
-                                self.send_relay_inner(
-                                    alternate_endpoint,
-                                    alternate_circuit_id,
-                                    encoded,
-                                )
-                                .await?;
-                                Ok(true)
-                            }
+                            last_relay_error = Some(error);
                         }
                     }
                 }
