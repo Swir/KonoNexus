@@ -2350,10 +2350,11 @@ impl KonoNode {
         loop {
             let direct = self.direct_app_endpoint_for_peer(peer_node_id);
             let relay_candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
-            let Some(decision) =
-                self.route_controller
-                    .select(peer_node_id, direct, relay_candidates.iter().copied())
-            else {
+            let Some(decision) = self.route_controller.select(
+                peer_node_id,
+                direct,
+                relay_candidates.iter().copied(),
+            ) else {
                 return match last_relay_error {
                     Some(error) => Err(error),
                     None => Ok(false),
