@@ -192,9 +192,7 @@ impl RelayManager {
     fn record_abuse_violation(&mut self, node_id: &str, now: Instant) {
         self.prune_abuse_state(now);
 
-        if !self.abuse.contains_key(node_id)
-            && self.abuse.len() >= MAX_RELAY_ABUSE_TRACKED_NODES
-        {
+        if !self.abuse.contains_key(node_id) && self.abuse.len() >= MAX_RELAY_ABUSE_TRACKED_NODES {
             if let Some(oldest) = self
                 .abuse
                 .iter()
@@ -369,9 +367,7 @@ impl RelayManager {
                 } else {
                     None
                 };
-                rate_window.is_some_and(|rate| {
-                    rate.cells >= max_cells || rate.bytes >= max_bytes
-                })
+                rate_window.is_some_and(|rate| rate.cells >= max_cells || rate.bytes >= max_bytes)
             });
             if quota_exceeded {
                 self.record_abuse_violation(source_node_id, now);
@@ -583,14 +579,7 @@ mod tests {
                 .unwrap();
         }
         assert!(relay
-            .forward(
-                id,
-                origin,
-                "knp1origin",
-                2_000,
-                "aa".into(),
-                penalized_now,
-            )
+            .forward(id, origin, "knp1origin", 2_000, "aa".into(), penalized_now,)
             .is_err());
     }
 
@@ -602,7 +591,10 @@ mod tests {
         for _ in 0..RELAY_ABUSE_VIOLATIONS_PER_LEVEL {
             relay.record_abuse_violation("knp1noisy", now);
         }
-        assert_eq!(relay.adaptive_limits("knp1noisy", now).0, MAX_RELAY_CELLS_PER_SECOND / 2);
+        assert_eq!(
+            relay.adaptive_limits("knp1noisy", now).0,
+            MAX_RELAY_CELLS_PER_SECOND / 2
+        );
 
         let recovered = now + RELAY_ABUSE_DECAY;
         assert_eq!(
