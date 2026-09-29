@@ -43,7 +43,7 @@ pub struct RouteDecision {
 
 #[derive(Debug, Clone, Copy)]
 struct ActiveRoute {
-    route: ControlRoute,
+    route: Option<ControlRoute>,
     generation: u64,
 }
 
@@ -80,7 +80,7 @@ impl RouteController {
         let desired = if let Some(endpoint) = direct {
             Some(ControlRoute::Direct(endpoint))
         } else {
-            let current = self.active.get(peer_node_id).map(|active| active.route);
+            let current = self.active.get(peer_node_id).and_then(|active| active.route);
             current
                 .and_then(|route| match route {
                     ControlRoute::Relay {
@@ -96,12 +96,16 @@ impl RouteController {
         };
 
         let Some(route) = desired else {
-            self.active.remove(peer_node_id);
+            if let Some(active) = self.active.get_mut(peer_node_id) {
+                if active.route.take().is_some() {
+                    active.generation = active.generation.saturating_add(1);
+                }
+            }
             return None;
         };
 
         match self.active.get(peer_node_id).copied() {
-            Some(active) if active.route == route => Some(RouteDecision {
+            Some(active) if active.route == Some(route) => Some(RouteDecision {
                 route,
                 generation: active.generation,
                 changed: false,
@@ -110,7 +114,7 @@ impl RouteController {
                 let generation = active.generation.saturating_add(1);
                 self.active.insert(
                     peer_node_id.to_owned(),
-                    ActiveRoute { route, generation },
+                    ActiveRoute { route: Some(route), generation },
                 );
                 Some(RouteDecision {
                     route,
@@ -122,7 +126,7 @@ impl RouteController {
                 self.active.insert(
                     peer_node_id.to_owned(),
                     ActiveRoute {
-                        route,
+                        route: Some(route),
                         generation: 1,
                     },
                 );
@@ -143,13 +147,16 @@ impl RouteController {
     ) -> bool {
         let matches = self.active.get(peer_node_id).is_some_and(|active| {
             active.route
-                == ControlRoute::Relay {
+                == Some(ControlRoute::Relay {
                     relay_endpoint,
                     circuit_id,
-                }
+                })
         });
         if matches {
-            self.active.remove(peer_node_id);
+            if let Some(active) = self.active.get_mut(peer_node_id) {
+                active.route = None;
+                active.generation = active.generation.saturating_add(1);
+            }
         }
         matches
     }
@@ -159,7 +166,7 @@ impl RouteController {
     }
 
     pub fn active_route(&self, peer_node_id: &str) -> Option<ControlRoute> {
-        self.active.get(peer_node_id).map(|active| active.route)
+        self.active.get(peer_node_id).and_then(|active| active.route)
     }
 }
 
@@ -241,7 +248,7 @@ mod tests {
             .select(peer, None, [secondary])
             .expect("secondary relay should be selected");
         assert_eq!(failover.route, secondary.route());
-        assert_eq!(failover.generation, 1);
+        assert_eq!(failover.generation, 3);
         assert!(failover.changed);
     }
 
@@ -278,7 +285,9 @@ mod tests {
         controller
             .select(peer, None, [candidate])
             .expect("relay route should be selected");
-        assert!(controller.select(peer, None, []).is_none());
+        assert!(controller
+            .select(peer, None, std::iter::empty::<RelayRouteCandidate>())
+            .is_none());
         assert!(controller.active_route(peer).is_none());
     }
 }
