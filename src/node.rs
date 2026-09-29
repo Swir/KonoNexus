@@ -2386,7 +2386,7 @@ impl KonoNode {
                         );
                         return Ok(false);
                     };
-                    encode_relay_payload(session, &payload.clone())?
+                    encode_relay_payload(session, &payload)?
                 };
 
                 match self
@@ -2681,10 +2681,7 @@ impl KonoNode {
         }
     }
 
-    fn relay_e2e_candidates_for_peer(
-        &self,
-        peer_node_id: &str,
-    ) -> Vec<RelayRouteCandidate> {
+    fn relay_e2e_candidates_for_peer(&self, peer_node_id: &str) -> Vec<RelayRouteCandidate> {
         let now = Instant::now();
         self.relay_e2e_sessions
             .keys()
@@ -4123,5 +4120,4 @@ mod tests {
         assert!(node.rendezvous_candidate_allowed(loopback));
         assert!(!node.rendezvous_candidate_allowed("0.0.0.0:47000".parse().unwrap()));
     }
-
 }

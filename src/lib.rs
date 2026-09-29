@@ -50,7 +50,10 @@ pub use relay_e2e::{
     RelayInnerPacket, MAX_RELAY_INNER_PACKET_BYTES,
 };
 pub use rendezvous::{AutoRendezvousState, CoordinatorCandidate};
-pub use route::{ControlRoute, RelayRouteCandidate, RouteController, RouteDecision, MAX_RELAY_ROUTE_CANDIDATES};
+pub use route::{
+    ControlRoute, RelayRouteCandidate, RouteController, RouteDecision,
+    MAX_RELAY_ROUTE_CANDIDATES,
+};
 pub use routing_cache::{
     load_routing_bucket_snapshot, load_routing_hints, new_bucket_cache_entry, new_cache_entry,
     save_routing_bucket_snapshot, save_routing_hints, RoutingBucketCacheEntry, RoutingCacheEntry,
