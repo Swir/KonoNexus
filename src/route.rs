@@ -260,6 +260,38 @@ mod tests {
     }
 
     #[test]
+    fn relay_failover_walks_three_existing_circuits_in_order() {
+        let mut controller = RouteController::default();
+        let peer = "knp1peer";
+        let primary = relay("127.0.0.10:47000", 1);
+        let secondary = relay("127.0.0.11:47000", 2);
+        let tertiary = relay("127.0.0.12:47000", 3);
+
+        let first = controller
+            .select(peer, None, [tertiary, secondary, primary])
+            .expect("primary relay should be selected");
+        assert_eq!(first.route, primary.route());
+
+        assert!(controller.invalidate_relay(peer, primary.relay_endpoint, primary.circuit_id));
+        let second = controller
+            .select(peer, None, [tertiary, secondary])
+            .expect("secondary relay should be selected");
+        assert_eq!(second.route, secondary.route());
+
+        assert!(controller.invalidate_relay(peer, secondary.relay_endpoint, secondary.circuit_id));
+        let third = controller
+            .select(peer, None, [tertiary])
+            .expect("tertiary relay should be selected");
+        assert_eq!(third.route, tertiary.route());
+
+        assert!(controller.invalidate_relay(peer, tertiary.relay_endpoint, tertiary.circuit_id));
+        assert!(controller
+            .select(peer, None, std::iter::empty::<RelayRouteCandidate>())
+            .is_none());
+        assert!(controller.active_route(peer).is_none());
+    }
+
+    #[test]
     fn selection_considers_at_most_three_established_relay_candidates() {
         let mut controller = RouteController::default();
         let peer = "knp1peer";
