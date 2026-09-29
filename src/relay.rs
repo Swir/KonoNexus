@@ -11,6 +11,11 @@ pub const MAX_RELAY_CELLS_PER_SECOND: usize = 128;
 pub const MAX_RELAY_BYTES_PER_SECOND: usize = 256 * 1024;
 pub const RELAY_CIRCUIT_TTL: Duration = Duration::from_secs(120);
 pub const RELAY_RATE_WINDOW: Duration = Duration::from_secs(1);
+pub const RELAY_ABUSE_WINDOW: Duration = Duration::from_secs(60);
+pub const RELAY_ABUSE_DECAY: Duration = Duration::from_secs(120);
+pub const MAX_RELAY_ABUSE_TRACKED_NODES: usize = 2_048;
+pub const MAX_RELAY_ABUSE_PENALTY_LEVEL: u8 = 3;
+pub const RELAY_ABUSE_VIOLATIONS_PER_LEVEL: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayCircuitState {
@@ -34,22 +39,85 @@ impl RelayRateWindow {
         }
     }
 
-    fn consume(&mut self, bytes: usize, now: Instant) -> Result<()> {
+    fn consume(
+        &mut self,
+        bytes: usize,
+        now: Instant,
+        max_cells: usize,
+        max_bytes: usize,
+    ) -> Result<()> {
         if now.duration_since(self.started_at) >= RELAY_RATE_WINDOW {
             self.started_at = now;
             self.cells = 0;
             self.bytes = 0;
         }
 
-        if self.cells >= MAX_RELAY_CELLS_PER_SECOND
-            || self.bytes.saturating_add(bytes) > MAX_RELAY_BYTES_PER_SECOND
-        {
+        if self.cells >= max_cells || self.bytes.saturating_add(bytes) > max_bytes {
             bail!("relay circuit rate quota exceeded");
         }
 
         self.cells += 1;
         self.bytes += bytes;
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RelayAbuseState {
+    window_started_at: Instant,
+    last_violation_at: Instant,
+    violations: usize,
+    penalty_level: u8,
+}
+
+impl RelayAbuseState {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            last_violation_at: now,
+            violations: 0,
+            penalty_level: 0,
+        }
+    }
+
+    fn refresh(&mut self, now: Instant) {
+        if now.duration_since(self.window_started_at) >= RELAY_ABUSE_WINDOW {
+            self.window_started_at = now;
+            self.violations = 0;
+        }
+
+        if self.penalty_level == 0 {
+            return;
+        }
+
+        let quiet_for = now.duration_since(self.last_violation_at);
+        let decay_steps = quiet_for.as_secs() / RELAY_ABUSE_DECAY.as_secs();
+        if decay_steps == 0 {
+            return;
+        }
+
+        self.penalty_level = self
+            .penalty_level
+            .saturating_sub(decay_steps.min(u64::from(u8::MAX)) as u8);
+        self.last_violation_at += RELAY_ABUSE_DECAY * decay_steps.min(u32::MAX as u64) as u32;
+        if self.penalty_level == 0 {
+            self.violations = 0;
+            self.window_started_at = now;
+        }
+    }
+
+    fn record_violation(&mut self, now: Instant) {
+        self.refresh(now);
+        if now.duration_since(self.window_started_at) >= RELAY_ABUSE_WINDOW {
+            self.window_started_at = now;
+            self.violations = 0;
+        }
+        self.last_violation_at = now;
+        self.violations = self.violations.saturating_add(1);
+
+        let desired_level = (self.violations / RELAY_ABUSE_VIOLATIONS_PER_LEVEL)
+            .min(usize::from(MAX_RELAY_ABUSE_PENALTY_LEVEL)) as u8;
+        self.penalty_level = self.penalty_level.max(desired_level);
     }
 }
 
@@ -80,9 +148,69 @@ pub struct RelayForward {
 #[derive(Debug, Default)]
 pub struct RelayManager {
     circuits: HashMap<u64, RelayCircuit>,
+    abuse: HashMap<String, RelayAbuseState>,
 }
 
 impl RelayManager {
+    fn prune_abuse_state(&mut self, now: Instant) {
+        self.abuse.retain(|_, state| {
+            state.refresh(now);
+            state.penalty_level > 0
+                || now.duration_since(state.last_violation_at) < RELAY_ABUSE_DECAY
+        });
+
+        while self.abuse.len() > MAX_RELAY_ABUSE_TRACKED_NODES {
+            let Some(oldest) = self
+                .abuse
+                .iter()
+                .min_by_key(|(_, state)| state.last_violation_at)
+                .map(|(node_id, _)| node_id.clone())
+            else {
+                break;
+            };
+            self.abuse.remove(&oldest);
+        }
+    }
+
+    fn adaptive_limits(&mut self, node_id: &str, now: Instant) -> (usize, usize) {
+        self.prune_abuse_state(now);
+        let penalty = self
+            .abuse
+            .get_mut(node_id)
+            .map(|state| {
+                state.refresh(now);
+                state.penalty_level
+            })
+            .unwrap_or(0);
+        let divisor = 1_usize << usize::from(penalty);
+        (
+            (MAX_RELAY_CELLS_PER_SECOND / divisor).max(1),
+            (MAX_RELAY_BYTES_PER_SECOND / divisor).max(MAX_RELAY_CELL_BYTES),
+        )
+    }
+
+    fn record_abuse_violation(&mut self, node_id: &str, now: Instant) {
+        self.prune_abuse_state(now);
+
+        if !self.abuse.contains_key(node_id)
+            && self.abuse.len() >= MAX_RELAY_ABUSE_TRACKED_NODES
+        {
+            if let Some(oldest) = self
+                .abuse
+                .iter()
+                .min_by_key(|(_, state)| state.last_violation_at)
+                .map(|(node_id, _)| node_id.clone())
+            {
+                self.abuse.remove(&oldest);
+            }
+        }
+
+        self.abuse
+            .entry(node_id.to_owned())
+            .or_insert_with(|| RelayAbuseState::new(now))
+            .record_violation(now);
+    }
+
     pub fn open(
         &mut self,
         circuit_id: u64,
@@ -185,49 +313,72 @@ impl RelayManager {
             bail!("relay payload size is invalid");
         }
 
-        let circuit = self
-            .circuits
-            .get_mut(&circuit_id)
-            .ok_or_else(|| anyhow::anyhow!("relay circuit not found"))?;
+        let (max_cells, max_bytes) = self.adaptive_limits(source_node_id, now);
+        let forward_result = {
+            let circuit = self
+                .circuits
+                .get_mut(&circuit_id)
+                .ok_or_else(|| anyhow::anyhow!("relay circuit not found"))?;
 
-        if circuit.expires_at <= now || circuit.state != RelayCircuitState::Active {
-            bail!("relay circuit is not active");
-        }
+            if circuit.expires_at <= now || circuit.state != RelayCircuitState::Active {
+                bail!("relay circuit is not active");
+            }
 
-        let (destination, peer_node_id, receive_window, rate_window) = if source_endpoint
-            == circuit.origin_endpoint
-            && source_node_id == circuit.origin_node_id
-        {
-            (
-                circuit.target_endpoint,
-                circuit.target_node_id.clone(),
-                &mut circuit.origin_window,
-                &mut circuit.origin_rate,
-            )
-        } else if source_endpoint == circuit.target_endpoint
-            && source_node_id == circuit.target_node_id
-        {
-            (
-                circuit.origin_endpoint,
-                circuit.origin_node_id.clone(),
-                &mut circuit.target_window,
-                &mut circuit.target_rate,
-            )
-        } else {
-            bail!("relay cell source does not match circuit");
+            let (destination, peer_node_id, receive_window, rate_window) = if source_endpoint
+                == circuit.origin_endpoint
+                && source_node_id == circuit.origin_node_id
+            {
+                (
+                    circuit.target_endpoint,
+                    circuit.target_node_id.clone(),
+                    &mut circuit.origin_window,
+                    &mut circuit.origin_rate,
+                )
+            } else if source_endpoint == circuit.target_endpoint
+                && source_node_id == circuit.target_node_id
+            {
+                (
+                    circuit.origin_endpoint,
+                    circuit.origin_node_id.clone(),
+                    &mut circuit.target_window,
+                    &mut circuit.target_rate,
+                )
+            } else {
+                bail!("relay cell source does not match circuit");
+            };
+
+            rate_window.consume(raw.len(), now, max_cells, max_bytes)?;
+            receive_window.check_and_record(sequence)?;
+            circuit.expires_at = now + RELAY_CIRCUIT_TTL;
+
+            Ok(RelayForward {
+                destination,
+                peer_node_id,
+                circuit_id,
+                sequence,
+                opaque_payload_hex,
+            })
         };
 
-        rate_window.consume(raw.len(), now)?;
-        receive_window.check_and_record(sequence)?;
-        circuit.expires_at = now + RELAY_CIRCUIT_TTL;
+        if forward_result.is_err() {
+            let quota_exceeded = self.circuits.get(&circuit_id).is_some_and(|circuit| {
+                let rate_window = if source_node_id == circuit.origin_node_id {
+                    Some(&circuit.origin_rate)
+                } else if source_node_id == circuit.target_node_id {
+                    Some(&circuit.target_rate)
+                } else {
+                    None
+                };
+                rate_window.is_some_and(|rate| {
+                    rate.cells >= max_cells || rate.bytes >= max_bytes
+                })
+            });
+            if quota_exceeded {
+                self.record_abuse_violation(source_node_id, now);
+            }
+        }
 
-        Ok(RelayForward {
-            destination,
-            peer_node_id,
-            circuit_id,
-            sequence,
-            opaque_payload_hex,
-        })
+        forward_result
     }
 
     pub fn close(
@@ -256,6 +407,7 @@ impl RelayManager {
     pub fn expire(&mut self, now: Instant) -> usize {
         let before = self.circuits.len();
         self.circuits.retain(|_, circuit| circuit.expires_at > now);
+        self.prune_abuse_state(now);
         before.saturating_sub(self.circuits.len())
     }
 
@@ -389,6 +541,86 @@ mod tests {
                 now + RELAY_RATE_WINDOW,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn repeated_quota_violations_reduce_next_window_budget() {
+        let (mut relay, id, origin, target) = setup();
+        let now = Instant::now();
+        relay.accept(id, target, "knp1target", now).unwrap();
+
+        for sequence in 0..MAX_RELAY_CELLS_PER_SECOND as u64 {
+            relay
+                .forward(id, origin, "knp1origin", sequence, "aa".into(), now)
+                .unwrap();
+        }
+
+        for offset in 0..RELAY_ABUSE_VIOLATIONS_PER_LEVEL {
+            assert!(relay
+                .forward(
+                    id,
+                    origin,
+                    "knp1origin",
+                    MAX_RELAY_CELLS_PER_SECOND as u64 + offset as u64,
+                    "aa".into(),
+                    now,
+                )
+                .is_err());
+        }
+
+        let penalized_now = now + RELAY_RATE_WINDOW;
+        let reduced_cells = MAX_RELAY_CELLS_PER_SECOND / 2;
+        for offset in 0..reduced_cells as u64 {
+            relay
+                .forward(
+                    id,
+                    origin,
+                    "knp1origin",
+                    1_000 + offset,
+                    "aa".into(),
+                    penalized_now,
+                )
+                .unwrap();
+        }
+        assert!(relay
+            .forward(
+                id,
+                origin,
+                "knp1origin",
+                2_000,
+                "aa".into(),
+                penalized_now,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn adaptive_penalty_decays_after_quiet_period() {
+        let mut relay = RelayManager::default();
+        let now = Instant::now();
+
+        for _ in 0..RELAY_ABUSE_VIOLATIONS_PER_LEVEL {
+            relay.record_abuse_violation("knp1noisy", now);
+        }
+        assert_eq!(relay.adaptive_limits("knp1noisy", now).0, MAX_RELAY_CELLS_PER_SECOND / 2);
+
+        let recovered = now + RELAY_ABUSE_DECAY;
+        assert_eq!(
+            relay.adaptive_limits("knp1noisy", recovered).0,
+            MAX_RELAY_CELLS_PER_SECOND
+        );
+    }
+
+    #[test]
+    fn abuse_accounting_state_stays_bounded() {
+        let mut relay = RelayManager::default();
+        let now = Instant::now();
+
+        for index in 0..(MAX_RELAY_ABUSE_TRACKED_NODES + 64) {
+            relay.record_abuse_violation(&format!("knp1node{index}"), now);
+        }
+
+        assert_eq!(relay.abuse.len(), MAX_RELAY_ABUSE_TRACKED_NODES);
     }
 
     #[test]
