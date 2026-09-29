@@ -80,7 +80,10 @@ impl RouteController {
         let desired = if let Some(endpoint) = direct {
             Some(ControlRoute::Direct(endpoint))
         } else {
-            let current = self.active.get(peer_node_id).and_then(|active| active.route);
+            let current = self
+                .active
+                .get(peer_node_id)
+                .and_then(|active| active.route);
             current
                 .and_then(|route| match route {
                     ControlRoute::Relay {
@@ -89,7 +92,10 @@ impl RouteController {
                     } if relays.iter().any(|candidate| {
                         candidate.relay_endpoint == relay_endpoint
                             && candidate.circuit_id == circuit_id
-                    }) => Some(route),
+                    }) =>
+                    {
+                        Some(route)
+                    }
                     _ => None,
                 })
                 .or_else(|| relays.first().copied().map(RelayRouteCandidate::route))
@@ -114,7 +120,10 @@ impl RouteController {
                 let generation = active.generation.saturating_add(1);
                 self.active.insert(
                     peer_node_id.to_owned(),
-                    ActiveRoute { route: Some(route), generation },
+                    ActiveRoute {
+                        route: Some(route),
+                        generation,
+                    },
                 );
                 Some(RouteDecision {
                     route,
@@ -166,7 +175,9 @@ impl RouteController {
     }
 
     pub fn active_route(&self, peer_node_id: &str) -> Option<ControlRoute> {
-        self.active.get(peer_node_id).and_then(|active| active.route)
+        self.active
+            .get(peer_node_id)
+            .and_then(|active| active.route)
     }
 }
 
@@ -182,7 +193,7 @@ mod tests {
     fn direct_path_preempts_relay_and_increments_generation_once() {
         let mut controller = RouteController::default();
         let peer = "knp1peer";
-        let relay_route = relay("198.51.100.20:47000", 7);
+        let relay_route = relay("127.0.0.20:47000", 7);
 
         let first = controller
             .select(peer, None, [relay_route])
@@ -190,7 +201,7 @@ mod tests {
         assert_eq!(first.generation, 1);
         assert!(first.changed);
 
-        let direct: SocketAddr = "203.0.113.10:47000".parse().unwrap();
+        let direct: SocketAddr = "127.0.0.50:47000".parse().unwrap();
         let migrated = controller
             .select(peer, Some(direct), [relay_route])
             .expect("direct route should be selected");
@@ -209,9 +220,9 @@ mod tests {
     fn relay_selection_is_deterministic_and_sticky_within_bounded_set() {
         let mut controller = RouteController::default();
         let peer = "knp1peer";
-        let v4_a = relay("198.51.100.10:47000", 20);
-        let v4_b = relay("198.51.100.11:47000", 10);
-        let v6 = relay("[2001:db8::1]:47000", 30);
+        let v4_a = relay("127.0.0.10:47000", 20);
+        let v4_b = relay("127.0.0.11:47000", 10);
+        let v6 = relay("[::1]:47000", 30);
 
         let first = controller
             .select(peer, None, [v4_b, v4_a, v6])
@@ -230,19 +241,15 @@ mod tests {
     fn relay_failure_migrates_to_next_existing_circuit() {
         let mut controller = RouteController::default();
         let peer = "knp1peer";
-        let primary = relay("198.51.100.10:47000", 1);
-        let secondary = relay("198.51.100.11:47000", 2);
+        let primary = relay("127.0.0.10:47000", 1);
+        let secondary = relay("127.0.0.11:47000", 2);
 
         let first = controller
             .select(peer, None, [secondary, primary])
             .expect("primary relay should be selected");
         assert_eq!(first.route, primary.route());
 
-        assert!(controller.invalidate_relay(
-            peer,
-            primary.relay_endpoint,
-            primary.circuit_id
-        ));
+        assert!(controller.invalidate_relay(peer, primary.relay_endpoint, primary.circuit_id));
 
         let failover = controller
             .select(peer, None, [secondary])
@@ -257,10 +264,10 @@ mod tests {
         let mut controller = RouteController::default();
         let peer = "knp1peer";
         let candidates = [
-            relay("198.51.100.40:47000", 4),
-            relay("198.51.100.30:47000", 3),
-            relay("198.51.100.20:47000", 2),
-            relay("198.51.100.10:47000", 1),
+            relay("127.0.0.40:47000", 4),
+            relay("127.0.0.30:47000", 3),
+            relay("127.0.0.20:47000", 2),
+            relay("127.0.0.10:47000", 1),
         ];
 
         let selected = controller
@@ -270,7 +277,7 @@ mod tests {
         assert_eq!(
             selected.route,
             ControlRoute::Relay {
-                relay_endpoint: "198.51.100.10:47000".parse().unwrap(),
+                relay_endpoint: "127.0.0.10:47000".parse().unwrap(),
                 circuit_id: 1,
             }
         );
@@ -280,7 +287,7 @@ mod tests {
     fn losing_all_routes_clears_control_plane_state() {
         let mut controller = RouteController::default();
         let peer = "knp1peer";
-        let candidate = relay("198.51.100.10:47000", 1);
+        let candidate = relay("127.0.0.10:47000", 1);
 
         controller
             .select(peer, None, [candidate])
