@@ -195,12 +195,7 @@ impl RouteController {
         self.evict_health_if_needed();
     }
 
-    pub fn report_failure(
-        &mut self,
-        peer_node_id: &str,
-        route: ControlRoute,
-        now: Instant,
-    ) {
+    pub fn report_failure(&mut self, peer_node_id: &str, route: ControlRoute, now: Instant) {
         self.health_touch = self.health_touch.saturating_add(1);
         let health = self
             .health
@@ -212,12 +207,7 @@ impl RouteController {
         self.evict_health_if_needed();
     }
 
-    pub fn route_on_cooldown(
-        &self,
-        peer_node_id: &str,
-        route: ControlRoute,
-        now: Instant,
-    ) -> bool {
+    pub fn route_on_cooldown(&self, peer_node_id: &str, route: ControlRoute, now: Instant) -> bool {
         self.health
             .get(&(peer_node_id.to_owned(), route))
             .and_then(|health| health.last_failure)
@@ -435,9 +425,15 @@ mod tests {
         let peer = "knp1forget";
         let route = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
         controller.report_failure(peer, route, now);
-        assert!(controller.health.keys().any(|(stored_peer, _)| stored_peer == peer));
+        assert!(controller
+            .health
+            .keys()
+            .any(|(stored_peer, _)| stored_peer == peer));
         controller.forget_peer(peer);
-        assert!(!controller.health.keys().any(|(stored_peer, _)| stored_peer == peer));
+        assert!(!controller
+            .health
+            .keys()
+            .any(|(stored_peer, _)| stored_peer == peer));
     }
 
     #[test]
