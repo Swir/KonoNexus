@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 
 pub const MAX_RELAY_ROUTE_CANDIDATES: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlRoute {
     Direct(SocketAddr),
     Relay {
