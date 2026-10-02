@@ -1,10 +1,94 @@
-# KonoNexus
+<!-- SWIR-README-STANDARD:v2 -->
 
-**KonoNexus** is an experimental, serverless global mesh networking project.
+<div align="center">
 
-The protocol is called **KonoNexus Protocol (KNP)**. Its goal is to let applications such as Konofix communicate without a central application server, VPS, hosted API, or single relay provider. Every running KonoNexus instance can act as an endpoint and, in later protocol phases, as a privacy-preserving relay for other peers.
+<img width="100%" src="assets/readme/hero.svg" alt="KonoNexus — experimental serverless KNP mesh networking core" />
 
-> Status: **0.1.0-alpha.16 — Windows Network Tester candidate**. The core now includes direct and relay-inner E2E rekey, live RelayApp direct↔relay migration, a signed one-code invite, runtime path/NAT diagnostics, and a Windows GUI for controlled two-PC Internet tests. A local or CI result is not proof of universal NAT/CGNAT success; the tester reports the real selected path and evidence.
+<br>
+
+<img width="88" src="assets/kononexus-tester.png" alt="KonoNexus Network Tester icon" />
+
+![Rust](https://img.shields.io/badge/Rust-2021-02050A?style=for-the-badge&logo=rust&logoColor=62E5FF)
+![Status](https://img.shields.io/badge/Status-Alpha-02050A?style=for-the-badge&logoColor=62E5FF)
+![Core](https://img.shields.io/badge/Core-KNP_Mesh-02050A?style=for-the-badge&logoColor=62E5FF)
+![License](https://img.shields.io/badge/License-MIT-02050A?style=for-the-badge&logoColor=62E5FF)
+
+**KonoNexus** is an experimental, serverless mesh-networking core for the **KonoNexus Protocol (KNP)**.
+
+[**Highlights**](#-highlights) · [**Quick Start**](#-quick-start) · [**Roadmap**](#roadmap) · [**Testing**](#testing-candidate)
+
+</div>
+
+## Project status
+
+| Item | Status |
+|---|---|
+| Current stage | Alpha / controlled network-testing candidate |
+| Source version | `0.1.0-alpha.16` |
+| Roadmap | **40 / 49 = 81.6%** |
+| Core | Rust 2021 |
+| Current tester focus | Windows two-PC Internet testing |
+| License | MIT |
+
+> Local or CI success is **not** proof of universal Internet, NAT or CGNAT connectivity. The tester reports the actual selected path and evidence; real multi-network validation remains an open gate.
+
+## Overview
+
+KonoNexus is designed so applications such as Konofix can communicate without depending on a permanent central application server, VPS, hosted API or single relay provider. Running nodes can participate as endpoints and, where explicitly established by the protocol, as bounded cooperative relays for other authenticated peers.
+
+Node identity comes from cryptographic keys rather than an IP address. Direct transport is preferred, while encrypted relay paths provide a controlled fallback when direct traversal cannot be established.
+
+## ⚡ Highlights
+
+| Feature | What it does |
+|---|---|
+| 🔐 Cryptographic peer identity | Uses persistent Ed25519 identity and authenticated session establishment. |
+| 🔄 Direct + relay transport | Prefers direct KNP sessions and can use bounded cooperative relay circuits as a fallback. |
+| 🧭 Decentralized rendezvous | Existing encrypted peers can coordinate a direct-path attempt without becoming permanent infrastructure. |
+| 🗺️ Bounded DHT discovery | Signed peer records and bounded recursive lookup operate over authenticated mesh edges. |
+| ♻️ Path migration | Application traffic can migrate between confirmed direct and established relay paths. |
+| 🛡️ Replay / abuse controls | Bounded windows, quotas, TTLs and admission rules constrain protocol state and forwarding. |
+| 🪟 Network Tester | Provides a Windows GUI for controlled two-PC Internet testing and path diagnostics. |
+| 🧪 Runtime harnesses | Automated tests cover authenticated multi-node runtime paths without claiming WAN evidence. |
+
+## 🚀 Quick Start
+
+### From source
+
+Requirements: a current Rust toolchain with Cargo and the platform dependencies required by the Rust crates in this repository.
+
+```bash
+git clone https://github.com/Swir/KonoNexus.git
+cd KonoNexus
+cargo run -- --help
+```
+
+Run the automated Rust test suite before experimenting with network scenarios:
+
+```bash
+cargo test
+```
+
+For controlled multi-machine testing, follow [`docs/TESTING.md`](docs/TESTING.md) rather than treating loopback or CI results as Internet proof.
+
+## Requirements / compatibility
+
+- **Core:** Rust 2021.
+- **Primary development targets:** Windows and Linux.
+- **Windows tester:** intended for controlled two-PC validation.
+- **Networking:** UDP reachability and NAT behavior vary by network; no universal NAT/CGNAT success is claimed.
+- **Android transport:** planned, not yet complete.
+- **Security:** pre-release protocol/security work has automated coverage but no claim of independent security review.
+
+## Usage
+
+The CLI supports explicit peers, NodeID-based connection attempts, bounded rendezvous, DHT-assisted discovery, relay paths and controlled filtering-evidence tests. Use `cargo run -- --help` for the current command surface.
+
+The examples below document protocol flows that are already present in this branch; keep production expectations bounded by the limitations and testing notes.
+
+## Releases
+
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.16`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -62,6 +146,8 @@ Both A and B must already have an encrypted KNP session with that coordinator. T
 This is an experimental primitive. NATs that create destination-specific mappings can still defeat this strategy; cooperative relay is the later fallback.
 
 ## Roadmap
+
+**Verified roadmap progress:** 40 / 49 items complete (**81.6%**). This number is derived from the checklist below; documentation-only changes do not increase it.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -131,7 +217,6 @@ KonoNexus is pre-release networking/security software. Its security and NAT trav
 
 MIT
 
-
 ### Consent-based filtering evidence
 
 A controlled positive filtering-evidence test can be requested through a coordinator:
@@ -141,7 +226,6 @@ cargo run -- --peer COORDINATOR_IP:47000 --filter-test COORDINATOR_IP:47000
 ```
 
 The coordinator proposes an independent helper and the exact endpoint it already observes for the tested node. The tested node signs a short-lived Ed25519 authorization binding its NodeID/public key, that endpoint, the helper NodeID, and a random token. Only then may the helper send one signed direct probe. Receiving it is positive evidence that an independent endpoint can reach the mapping. Failure to receive it remains **inconclusive**, not proof of restrictive filtering.
-
 
 ### Signed DHT discovery foundation
 
@@ -157,7 +241,6 @@ The local table is bounded to 4,096 records and responses to at most 8 records. 
 
 This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup and persistent bounded k-bucket snapshots are implemented; endpoint attestations, replication/refresh policy, Sybil-resistant diversity, and convergence testing across a large mesh remain future work.
 
-
 ### Bounded multi-hop DHT
 
 Alpha.8 adds an in-memory 256-bucket routing table populated only by peers that already completed an encrypted KNP session. Each bucket stores at most 8 active peers and refreshes/evicts by last-seen time.
@@ -172,7 +255,6 @@ A lookup is recursive but deliberately bounded:
 - intermediate nodes keep a short-lived reverse route so encrypted `DHT_NODES` results can travel back toward the origin.
 
 The lookup walks only existing encrypted mesh edges. It does **not** open connections to arbitrary nearest records returned by gossip. A new outbound discovery attempt still requires an exact, valid signed record for the NodeID the local application explicitly requested.
-
 
 ### Persistent routing buckets
 
@@ -192,13 +274,11 @@ The relay must already have encrypted KNP sessions with both endpoints. Circuit 
 
 Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per cell, sized to remain within the 16 KiB outer KNP datagram after nested encryption/hex framing. The relay forwards those bytes without interpreting their application meaning. Alpha.10 layers a separate authenticated inner session inside those opaque cells. The inner handshake is signed with each endpoint's Ed25519 identity, bound to the circuit ID and both NodeIDs, and derives fresh X25519/HKDF/ChaCha20-Poly1305 keys. The relay therefore cannot derive the endpoint-to-endpoint session keys. KNP currently validates that session with encrypted inner PING/PONG; a public Konofix application-data API is the next layer.
 
-
 ### Automatic direct → punch → relay fallback
 
 For a requested NodeID, KNP still prefers a direct authenticated session. If rendezvous is required, it performs the bounded UDP punch burst first. When that punch schedule expires without confirmation, the two endpoints use NodeID ordering so only one side initiates fallback. If the rendezvous coordinator is still connected with an encrypted KNP session, that node requests a cooperative relay circuit through the same coordinator.
 
 After `RelayReady`, the lower NodeID starts the signed inner E2E handshake. Once the handshake completes, an encrypted inner PING/PONG confirms that the relay path carries data the forwarding node cannot decrypt. A failed relay request does not mark the target as authenticated or connected.
-
 
 ### RelayApp application API
 
@@ -223,11 +303,9 @@ The command/event channels are bounded; application send calls wait for command-
 
 Alpha.12 retransmits the complete fragment set after a 1-second ACK timeout, up to four times. The receiver keeps a bounded delivered-message ID cache so a lost ACK causes ACK replay without duplicate delivery to the application. All encrypted session and relay-transport receive paths use a 128-sequence sliding window: authenticated frames inside the window may arrive out of order, while duplicates and frames older than the window are rejected. Outbound messages still have a 120-second hard TTL.
 
-
 ### Relay abuse controls
 
 Alpha.12 limits a relay to 256 circuits globally and at most 16 circuits involving any one NodeID. Each circuit direction is capped at 128 relay cells per second and 256 KiB per second. The counters reset on a one-second window and apply before forwarding. These limits are protocol safety defaults, not final production tuning.
-
 
 ### Session handshake reliability
 
@@ -236,7 +314,6 @@ Alpha.13 retransmits the same `SESSION_INIT` after a one-second timeout, up to f
 ### Alternate relay selection
 
 When direct UDP punching fails, the preferred relay remains the rendezvous coordinator that helped produce the punch candidate. If that relay is gone, cannot open the target, or rejects the circuit, the lower-NodeID endpoint can try other already-authenticated encrypted peers. Alpha.13 tries at most three distinct relay candidates in a 30-second fallback state, never repeats the same candidate, and stops as soon as a direct or relay path to the target becomes active.
-
 
 ### Bounded multi-relay control-plane migration
 
@@ -259,7 +336,6 @@ RelayApp queues are keyed by peer NodeID, not by a socket or circuit. Alpha.14 t
 3. if neither exists, the message remains queued/backpressured until a path becomes available or its existing delivery timeout policy fires.
 
 Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-independent. A message may begin through relay and continue/retry through direct transport after a direct session appears, or fall back to relay if the direct session disappears. The relay circuit may remain available as a hot fallback until its normal idle expiry.
-
 
 ## Testing candidate
 
@@ -287,3 +363,17 @@ The next validation phase must use separate machines/networks and will check:
 7. delivery receipts/failures under temporary packet loss.
 
 See `docs/TESTING.md` for the controlled operator procedure.
+
+## 🔎 Search Keywords
+
+`serverless mesh networking` • `rust p2p networking` • `decentralized networking` • `udp hole punching` • `nat traversal` • `encrypted relay network` • `x25519 ed25519 chacha20poly1305` • `distributed hash table rust` • `peer to peer windows` • `peer to peer linux` • `kononexus protocol` • `knp networking`
+
+<div align="center">
+
+### `CONNECT • AUTHENTICATE • ROUTE • RECOVER`
+
+⭐ **If KonoNexus is useful, consider leaving a star.**
+
+[**← SWIR profile**](https://github.com/Swir) · [**All projects →**](https://github.com/Swir?tab=repositories)
+
+</div>
