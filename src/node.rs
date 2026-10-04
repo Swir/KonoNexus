@@ -1,5 +1,6 @@
 use crate::dht::{
-    endpoint_publishable, node_id_closer_to_target, DhtTable, EndpointAttestation,
+    dht_network_group, endpoint_publishable, node_id_closer_to_target,
+    prioritize_network_group_diversity, DhtNetworkGroup, DhtTable, EndpointAttestation,
     EndpointAttestationTable, PeerRecord, RoutingTable, DHT_ATTESTATION_RESPONSE_LIMIT,
     DHT_BUCKET_SIZE, DHT_MAX_HOPS, DHT_QUERY_FANOUT, DHT_QUERY_RETRY_DELAY, DHT_QUERY_TIMEOUT,
     DHT_REPLICATION_FANOUT, DHT_REPLICATION_MAX_HOPS, DHT_RESPONSE_LIMIT, DHT_SYNC_REPLICA_LIMIT,
@@ -31,7 +32,7 @@ use crate::session::{respond_handshake, PendingHandshake, SecurePayload, Session
 use anyhow::{anyhow, bail, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -442,7 +443,7 @@ pub struct KonoNode {
     last_endpoint_attestation_refresh: HashMap<SocketAddr, Instant>,
     dht_replication_rate_windows: HashMap<String, DhtReplicationRateWindow>,
     dht_query_peer_buckets: HashMap<String, DhtQueryTokenBucket>,
-    dht_query_prefix_buckets: HashMap<String, DhtQueryTokenBucket>,
+    dht_query_prefix_buckets: HashMap<DhtNetworkGroup, DhtQueryTokenBucket>,
     dht_query_global_bucket: DhtQueryTokenBucket,
     dht_replication_history: HashMap<(String, u64), DhtReplicationHistory>,
     pending_dht_replications: VecDeque<PendingDhtReplication>,
@@ -962,8 +963,6 @@ impl KonoNode {
                 )
                 .await?;
                 self.sessions.insert(source, SessionSlot::new(session));
-                self.routing
-                    .observe(sender_node_id.clone(), source, Instant::now());
 
                 info!(
                     peer = %sender_node_id,
@@ -1049,6 +1048,8 @@ impl KonoNode {
                 };
 
                 let newly_confirmed = self.confirmed_sessions.insert(source);
+                self.routing
+                    .observe(sender_node_id.clone(), source, Instant::now());
                 if newly_confirmed {
                     self.last_rekey.insert(source, Instant::now());
                     self.flush_rendezvous_requests(source).await?;
@@ -1437,12 +1438,12 @@ impl KonoNode {
                     );
                     return Ok(());
                 }
-                if let Err(error) = record.verify() {
-                    debug!(peer = %sender_node_id, %error, "rejected invalid DHT peer record");
-                    return Ok(());
-                }
                 if !self.allow_dht_record_admission(sender_node_id, source, 1, Instant::now()) {
                     debug!(peer = %sender_node_id, "DHT record admission rate-limited");
+                    return Ok(());
+                }
+                if let Err(error) = record.verify() {
+                    debug!(peer = %sender_node_id, %error, "rejected invalid DHT peer record");
                     return Ok(());
                 }
                 let record_node_id = record.node_id.clone();
@@ -1604,14 +1605,18 @@ impl KonoNode {
                     self.last_dht_forward.insert(source, now);
                     let mut forwarded = 0_usize;
 
-                    for candidate in self.routing.nearest(&target_node_id, DHT_QUERY_FANOUT + 2) {
-                        if candidate.endpoint == source
-                            || candidate.node_id == origin_node_id
-                            || !self.sessions.contains_key(&candidate.endpoint)
-                        {
-                            continue;
-                        }
+                    let eligible: Vec<_> = self
+                        .routing
+                        .nearest(&target_node_id, self.routing.len())
+                        .into_iter()
+                        .filter(|candidate| {
+                            candidate.endpoint != source
+                                && candidate.node_id != origin_node_id
+                                && self.sessions.contains_key(&candidate.endpoint)
+                        })
+                        .collect();
 
+                    for candidate in prioritize_network_group_diversity(eligible) {
                         self.send_secure_payload(
                             candidate.endpoint,
                             SecurePayload::DhtFind {
@@ -3256,7 +3261,13 @@ impl KonoNode {
                 continue;
             }
 
-            let candidates = self.routing.nearest(&target_node_id, DHT_QUERY_FANOUT);
+            let eligible: Vec<_> = self
+                .routing
+                .nearest(&target_node_id, self.routing.len())
+                .into_iter()
+                .filter(|candidate| self.sessions.contains_key(&candidate.endpoint))
+                .collect();
+            let candidates = prioritize_network_group_diversity(eligible);
             if candidates.is_empty() {
                 continue;
             }
@@ -3280,10 +3291,6 @@ impl KonoNode {
 
             let mut sent = 0_usize;
             for candidate in candidates {
-                if !self.sessions.contains_key(&candidate.endpoint) {
-                    continue;
-                }
-
                 match self
                     .send_secure_payload(
                         candidate.endpoint,
@@ -3300,6 +3307,9 @@ impl KonoNode {
                         sent += 1;
                         if let Some(query) = self.active_dht_queries.get_mut(&query_id) {
                             query.expected_responders.insert(candidate.endpoint, 0);
+                        }
+                        if sent >= DHT_QUERY_FANOUT {
+                            break;
                         }
                     }
                     Err(error) => {
@@ -3563,14 +3573,18 @@ impl KonoNode {
             return Ok(());
         }
         let local_node_id = self.node_id();
-        let candidates = self.routing.nearest(&local_node_id, self.routing.len());
+        let eligible: Vec<_> = self
+            .routing
+            .nearest(&local_node_id, self.routing.len())
+            .into_iter()
+            .filter(|candidate| {
+                self.confirmed_sessions.contains(&candidate.endpoint)
+                    && self.peer_supports_feature(candidate.endpoint, "bounded-dht-replication-v1")
+            })
+            .collect();
+        let candidates = prioritize_network_group_diversity(eligible);
         let mut queued = 0_usize;
         for candidate in candidates {
-            if !self.confirmed_sessions.contains(&candidate.endpoint)
-                || !self.peer_supports_feature(candidate.endpoint, "bounded-dht-replication-v1")
-            {
-                continue;
-            }
             if self.queue_dht_replication(
                 candidate.endpoint,
                 candidate.node_id,
@@ -3633,19 +3647,23 @@ impl KonoNode {
         let attestations = self
             .endpoint_attestations
             .for_record(record, DHT_ATTESTATION_RESPONSE_LIMIT);
-        let candidates = self.routing.nearest(&record.node_id, self.routing.len());
         let local_node_id = self.node_id();
+        let eligible: Vec<_> = self
+            .routing
+            .nearest(&record.node_id, self.routing.len())
+            .into_iter()
+            .filter(|candidate| {
+                candidate.endpoint != source
+                    && candidate.node_id != record.node_id
+                    && node_id_closer_to_target(&candidate.node_id, &local_node_id, &record.node_id)
+                    && self.confirmed_sessions.contains(&candidate.endpoint)
+                    && self.peer_supports_feature(candidate.endpoint, "bounded-dht-replication-v1")
+            })
+            .collect();
+        let candidates = prioritize_network_group_diversity(eligible);
         let mut queued = 0_usize;
 
         for candidate in candidates {
-            if candidate.endpoint == source
-                || candidate.node_id == record.node_id
-                || !node_id_closer_to_target(&candidate.node_id, &local_node_id, &record.node_id)
-                || !self.confirmed_sessions.contains(&candidate.endpoint)
-                || !self.peer_supports_feature(candidate.endpoint, "bounded-dht-replication-v1")
-            {
-                continue;
-            }
             if self.queue_dht_replication(
                 candidate.endpoint,
                 candidate.node_id,
@@ -3927,9 +3945,6 @@ impl KonoNode {
         cost: u16,
         now: Instant,
     ) -> bool {
-        self.dht_replication_rate_windows.retain(|_, window| {
-            now.duration_since(window.last_seen) < DHT_REPLICATION_RATE_RETENTION
-        });
         let keys = [
             (
                 format!("peer:{sender_node_id}"),
@@ -4994,22 +5009,6 @@ fn plausible_node_id(node_id: &str) -> bool {
         && node_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn dht_network_group(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(ip) => {
-            let octets = ip.octets();
-            format!("v4:{}.{}.{}", octets[0], octets[1], octets[2])
-        }
-        IpAddr::V6(ip) => {
-            if let Some(mapped) = ip.to_ipv4_mapped() {
-                return dht_network_group(IpAddr::V4(mapped));
-            }
-            let segments = ip.segments();
-            format!("v6:{:x}:{:x}:{:x}", segments[0], segments[1], segments[2])
-        }
-    }
-}
-
 fn local_features() -> Vec<String> {
     vec![
         "knp/1".to_owned(),
@@ -5126,6 +5125,56 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn invalid_dht_stores_consume_admission_budget_before_signature_work() {
+        let local_identity = NodeIdentity::generate();
+        let sender_node_id = NodeIdentity::generate().node_id();
+        let record_identity = NodeIdentity::generate();
+        let source: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let valid_record =
+            PeerRecord::signed(&record_identity, vec!["1.1.1.1:47000".parse().unwrap()]).unwrap();
+        let mut invalid_record = valid_record.clone();
+        invalid_record.signature = "00".to_owned();
+        let mut node = KonoNode::bind(
+            local_identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..MAX_DHT_RECORDS_PER_PEER_WINDOW {
+            node.handle_secure_payload(
+                source,
+                &sender_node_id,
+                "test-session",
+                SecurePayload::DhtStore {
+                    record: invalid_record.clone(),
+                    attestations: Vec::new(),
+                    replication_hops_remaining: 0,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        node.handle_secure_payload(
+            source,
+            &sender_node_id,
+            "test-session",
+            SecurePayload::DhtStore {
+                record: valid_record.clone(),
+                attestations: Vec::new(),
+                replication_hops_remaining: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(node.dht.get(&valid_record.node_id).is_none());
+    }
+
     #[test]
     fn dht_query_token_bucket_refills_at_exact_boundary() {
         let now = Instant::now();
@@ -5180,6 +5229,56 @@ mod tests {
             now
         ));
         assert!(node.allow_dht_query(&first, source, now + DHT_QUERY_PEER_REFILL));
+    }
+
+    #[tokio::test]
+    async fn session_init_does_not_enter_routing_before_encrypted_confirmation() {
+        let local_identity = NodeIdentity::generate();
+        let local_node_id = local_identity.node_id();
+        let peer_identity = NodeIdentity::generate();
+        let peer_node_id = peer_identity.node_id();
+        let source: SocketAddr = "127.0.0.1:47000".parse().unwrap();
+        let now = Instant::now();
+        let pending = PendingHandshake::new(local_node_id);
+        let handshake_id = pending.handshake_id();
+        let envelope = WireEnvelope::signed(
+            &peer_identity,
+            1,
+            MessageBody::SessionInit {
+                handshake_id,
+                ephemeral_public_key: pending.public_key_hex(),
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let mut node = KonoNode::bind(
+            local_identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.peers.insert(
+            source,
+            PeerInfo {
+                node_id: peer_node_id,
+                public_key: peer_identity.public_key_hex(),
+                endpoint: source,
+                first_seen: now,
+                last_seen: now,
+                observed_external_endpoint: None,
+                features: HashSet::new(),
+            },
+        );
+
+        node.handle_datagram(&envelope, source).await.unwrap();
+
+        assert!(node.sessions.contains_key(&source));
+        assert!(!node.confirmed_sessions.contains(&source));
+        assert!(node.routing.is_empty());
     }
 
     #[tokio::test]
@@ -5247,6 +5346,7 @@ mod tests {
         node.handle_datagram(&mismatched, source).await.unwrap();
 
         assert!(!node.confirmed_sessions.contains(&source));
+        assert!(node.routing.is_empty());
 
         let correctly_bound = WireEnvelope::signed(
             &peer_identity,
@@ -5265,22 +5365,7 @@ mod tests {
             .unwrap();
 
         assert!(node.confirmed_sessions.contains(&source));
-    }
-
-    #[test]
-    fn dht_network_groups_normalize_prefixes_and_mapped_ipv4() {
-        assert_eq!(
-            dht_network_group("8.8.8.1".parse().unwrap()),
-            dht_network_group("8.8.8.250".parse().unwrap())
-        );
-        assert_eq!(
-            dht_network_group("::ffff:8.8.8.1".parse().unwrap()),
-            dht_network_group("8.8.8.250".parse().unwrap())
-        );
-        assert_eq!(
-            dht_network_group("2001:db8:abcd::1".parse().unwrap()),
-            dht_network_group("2001:db8:abcd:ffff::1".parse().unwrap())
-        );
+        assert_eq!(node.routing.len(), 1);
     }
 
     #[tokio::test]
