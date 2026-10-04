@@ -4106,7 +4106,7 @@ impl KonoNode {
                 }
             }
         }
-        self.nat_profile.expire_filter_matrix_at(now);
+        self.nat_profile.expire_filter_matrix_at(Instant::now());
     }
 
     async fn drive_dht_queries(&mut self) {
