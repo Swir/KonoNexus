@@ -147,7 +147,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 41 / 49 items complete (**83.7%**). This number is derived from the checklist below; documentation-only changes do not increase it.
+**Verified roadmap progress:** 39 / 49 items complete (**79.6%**). This number is derived from the checklist below; documentation-only changes do not increase it.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
