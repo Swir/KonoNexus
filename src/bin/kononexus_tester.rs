@@ -283,11 +283,9 @@ impl eframe::App for TesterApp {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!(
-                                "alpha.16  •  Windows x64  •  UDP 47000\ncore {APP_VERSION}"
-                            ))
-                            .size(11.0)
-                            .color(Color32::from_rgb(122, 139, 171)),
+                            RichText::new(format!("{APP_VERSION}  •  Windows x64  •  UDP 47000"))
+                                .size(11.0)
+                                .color(Color32::from_rgb(122, 139, 171)),
                         );
                     });
                 });
