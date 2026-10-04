@@ -57,6 +57,8 @@ pub enum SecurePayload {
         record: PeerRecord,
         #[serde(default)]
         attestations: Vec<EndpointAttestation>,
+        #[serde(default)]
+        replication_hops_remaining: u8,
     },
     DhtAttestation {
         attestation: EndpointAttestation,
@@ -609,8 +611,33 @@ mod tests {
         let decoded: SecurePayload = serde_json::from_value(legacy).unwrap();
         assert!(matches!(
             decoded,
-            SecurePayload::DhtStore { attestations, .. } if attestations.is_empty()
+            SecurePayload::DhtStore {
+                attestations,
+                replication_hops_remaining: 0,
+                ..
+            } if attestations.is_empty()
         ));
+    }
+
+    #[test]
+    fn dht_store_round_trip_preserves_replication_budget() {
+        let identity = NodeIdentity::generate();
+        let record =
+            PeerRecord::signed(&identity, vec!["8.8.8.8:47000".parse().unwrap()]).unwrap();
+        let payload = SecurePayload::DhtStore {
+            record,
+            attestations: Vec::new(),
+            replication_hops_remaining: 2,
+        };
+        let (mut initiator, mut responder) = session_pair();
+        let frame = initiator.encrypt(&payload).unwrap();
+
+        assert_eq!(
+            responder
+                .decrypt(&frame.session_id, frame.sequence, &frame.ciphertext)
+                .unwrap(),
+            payload
+        );
     }
 
     #[test]

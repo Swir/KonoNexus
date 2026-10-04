@@ -240,7 +240,7 @@ DHT control messages travel inside the existing encrypted KNP session:
 
 The local table is bounded to 4,096 records and responses to at most 8 records plus 4 matching attestations. Records and evidence expire automatically. KNP may cache nearest records, but it **does not automatically dial arbitrary nearest nodes**. A new network connection is attempted only from an exact valid record for a NodeID that the local user/application is already trying to reach, and only when one exact endpoint has current signatures from at least two independent observer identities.
 
-This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup, persistent bounded k-bucket snapshots, and endpoint-attestation exchange/enforcement are implemented; replication/refresh policy, Sybil-resistant diversity, and convergence testing across a large mesh remain future work.
+This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup, persistent bounded k-bucket snapshots, endpoint-attestation exchange/enforcement, and bounded replica refresh are implemented; Sybil-resistant diversity and convergence testing across a large mesh remain future work.
 
 ### Bounded multi-hop DHT
 

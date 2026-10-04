@@ -141,11 +141,14 @@ An authenticated peer signs a short-lived `EndpointAttestation` for the public s
 
 Two independent identities provide reachability corroboration, not Sybil resistance. Stronger observer diversity remains required before production.
 
+Fresh, quorum-attested `DhtStore` records use a replication hop budget of 2. A node forwards a newly accepted record or newly accepted matching evidence to at most 2 nearest confirmed routing peers, excluding the sender and record owner, and decrements the budget. Duplicate sequence/evidence observations do not forward again. Replication is sent only to peers advertising `bounded-dht-replication-v1`.
+
+Topology refresh is also bounded: when a capable encrypted session is confirmed, each side may send at most 4 current quorum-attested cached records nearest to the new peer, with no further replication hops. Endpoint-attestation refresh causes owners to issue fresh signed records before the ten-minute record TTL. A replica never extends or re-signs owner lifetime; records and evidence still expire under their original signatures.
+
 To constrain amplification and loops, query state expires after 8 seconds, forwarding from the same immediate peer is throttled, and the seen-query cache is capped. The design intentionally favors bounded reachability over aggressive flooding.
 
 ## 15. Remaining DHT work
 
-- replication/refresh strategy,
 - stronger long-window query rate limiting,
 - Sybil-resistant routing diversity,
 - large-mesh convergence and churn testing.
