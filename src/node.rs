@@ -1,6 +1,8 @@
 use crate::dht::{
-    endpoint_publishable, DhtTable, PeerRecord, RoutingTable, DHT_MAX_HOPS, DHT_QUERY_FANOUT,
+    endpoint_publishable, DhtTable, EndpointAttestation, EndpointAttestationTable, PeerRecord,
+    RoutingTable, DHT_ATTESTATION_RESPONSE_LIMIT, DHT_MAX_HOPS, DHT_QUERY_FANOUT,
     DHT_QUERY_RETRY_DELAY, DHT_QUERY_TIMEOUT, DHT_RESPONSE_LIMIT,
+    MIN_ENDPOINT_ATTESTATION_OBSERVERS,
 };
 use crate::identity::NodeIdentity;
 use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
@@ -46,6 +48,8 @@ const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
+const ENDPOINT_ATTESTATION_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60);
+const MAX_ENDPOINT_ATTESTATION_REFRESHES_PER_TICK: usize = 8;
 const RELAY_APP_BURST_PER_TICK: usize = 4;
 const MAX_RELAY_APP_HANDLE_CAPACITY: usize = 1_024;
 const SESSION_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -76,6 +80,7 @@ pub struct PeerInfo {
     pub first_seen: Instant,
     pub last_seen: Instant,
     pub observed_external_endpoint: Option<String>,
+    pub features: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +260,12 @@ struct ReverseDhtRoute {
 }
 
 #[derive(Debug, Clone)]
+struct DhtDiscoveryCandidate {
+    expected_node_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
 struct RelayPath {
     peer_node_id: String,
     expires_at: Instant,
@@ -319,6 +330,8 @@ pub struct KonoNode {
     last_rendezvous_request: HashMap<SocketAddr, Instant>,
     last_filter_test_request: HashMap<SocketAddr, Instant>,
     dht: DhtTable,
+    endpoint_attestations: EndpointAttestationTable,
+    last_endpoint_attestation_refresh: HashMap<SocketAddr, Instant>,
     routing: RoutingTable,
     pending_dht_queries: HashSet<String>,
     active_dht_queries: HashMap<u64, ActiveDhtQuery>,
@@ -326,7 +339,7 @@ pub struct KonoNode {
     reverse_dht_routes: HashMap<(String, u64), ReverseDhtRoute>,
     last_dht_query_start: HashMap<String, Instant>,
     last_dht_forward: HashMap<SocketAddr, Instant>,
-    discovery_candidates: HashMap<SocketAddr, Instant>,
+    discovery_candidates: HashMap<SocketAddr, DhtDiscoveryCandidate>,
     routing_cache_path: Option<PathBuf>,
     relay_manager: RelayManager,
     queued_relays: HashMap<SocketAddr, Vec<String>>,
@@ -389,6 +402,8 @@ impl KonoNode {
             last_rendezvous_request: HashMap::new(),
             last_filter_test_request: HashMap::new(),
             dht: DhtTable::default(),
+            endpoint_attestations: EndpointAttestationTable::default(),
+            last_endpoint_attestation_refresh: HashMap::new(),
             routing: RoutingTable::new(&local_node_id),
             pending_dht_queries: HashSet::new(),
             active_dht_queries: HashMap::new(),
@@ -583,6 +598,7 @@ impl KonoNode {
                 _ = ticker.tick() => {
                     self.refresh_discovery().await;
                     self.ping_known_peers().await;
+                    self.refresh_endpoint_attestations().await;
                     self.expire_stale_state();
                     if let Err(error) = self.persist_routing_cache() {
                         debug!(%error, "routing cache persistence failed");
@@ -643,7 +659,15 @@ impl KonoNode {
         let body = envelope.body.clone();
 
         match body {
-            MessageBody::Hello { cookie, .. } => {
+            MessageBody::Hello { cookie, features } => {
+                if !self.discovery_identity_matches(source, &sender_node_id) {
+                    debug!(
+                        %source,
+                        peer = %sender_node_id,
+                        "rejected DHT discovery response from unexpected identity"
+                    );
+                    return Ok(());
+                }
                 let cookie_valid = match cookie {
                     Some(cookie) => self.cookie_guard.validate(&source, &cookie)?,
                     None => false,
@@ -657,6 +681,9 @@ impl KonoNode {
                 }
 
                 self.record_peer(&envelope, source);
+                if let Some(peer) = self.peers.get_mut(&source) {
+                    peer.features = features.into_iter().collect();
+                }
                 info!(
                     peer = %sender_node_id,
                     endpoint = %source,
@@ -673,7 +700,7 @@ impl KonoNode {
                 .await?;
             }
             MessageBody::CookieChallenge { cookie } => {
-                if self.is_expected_endpoint(source) {
+                if self.is_expected_peer(source, &sender_node_id) {
                     self.cookie_cache.insert(source, cookie.clone());
                     self.send(
                         source,
@@ -691,7 +718,7 @@ impl KonoNode {
                 observed_endpoint,
                 features,
             } => {
-                if !self.is_expected_endpoint(source) {
+                if !self.is_expected_peer(source, &sender_node_id) {
                     debug!(%source, "ignoring unsolicited HELLO_ACK");
                     return Ok(());
                 }
@@ -703,6 +730,7 @@ impl KonoNode {
                 self.record_peer(&envelope, source);
                 if let Some(peer) = self.peers.get_mut(&source) {
                     peer.observed_external_endpoint = Some(observed_endpoint.clone());
+                    peer.features = features.into_iter().collect();
                 }
 
                 if let Ok(observed) = observed_endpoint.parse::<SocketAddr>() {
@@ -1256,7 +1284,18 @@ impl KonoNode {
             SecurePayload::RelayAppAck { message_id } => {
                 self.handle_app_ack(sender_node_id, message_id);
             }
-            SecurePayload::DhtStore { record } => {
+            SecurePayload::DhtStore {
+                record,
+                attestations,
+            } => {
+                if attestations.len() > DHT_ATTESTATION_RESPONSE_LIMIT {
+                    debug!(
+                        peer = %sender_node_id,
+                        count = attestations.len(),
+                        "rejected oversized DHT attestation set"
+                    );
+                    return Ok(());
+                }
                 let record_node_id = record.node_id.clone();
                 match self.dht.upsert(record.clone()) {
                     Ok(true) => {
@@ -1273,9 +1312,56 @@ impl KonoNode {
                     }
                 }
 
+                self.store_dht_attestations(attestations);
+
                 if self.pending_dht_queries.contains(&record_node_id) {
                     if let Some(current) = self.dht.get(&record_node_id).cloned() {
                         self.activate_dht_record(&current).await?;
+                    }
+                }
+            }
+            SecurePayload::DhtAttestation { attestation } => {
+                if attestation.observer_node_id != sender_node_id
+                    || attestation.subject_node_id != self.node_id()
+                {
+                    debug!(
+                        peer = %sender_node_id,
+                        subject = %attestation.subject_node_id,
+                        observer = %attestation.observer_node_id,
+                        "rejected misbound direct endpoint attestation"
+                    );
+                    return Ok(());
+                }
+
+                let stored = match self.endpoint_attestations.upsert(attestation) {
+                    Ok(true) => {
+                        debug!(
+                            peer = %sender_node_id,
+                            attestations = self.endpoint_attestations.len(),
+                            "stored direct endpoint attestation"
+                        );
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(error) => {
+                        debug!(peer = %sender_node_id, %error, "rejected endpoint attestation");
+                        false
+                    }
+                };
+
+                if stored {
+                    if let Some(record) = self.build_own_dht_record()? {
+                        let attestations = self
+                            .endpoint_attestations
+                            .for_record(&record, DHT_ATTESTATION_RESPONSE_LIMIT);
+                        self.send_secure_payload(
+                            source,
+                            SecurePayload::DhtStore {
+                                record,
+                                attestations,
+                            },
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1326,11 +1412,11 @@ impl KonoNode {
 
                 if target_node_id == self.node_id() {
                     if let Some(record) = self.build_own_dht_record()? {
-                        exact_found = true;
+                        exact_found = self.record_has_attested_endpoint(&record);
                         records.push(record);
                     }
                 } else if let Some(record) = self.dht.get(&target_node_id) {
-                    exact_found = true;
+                    exact_found = self.record_has_attested_endpoint(record);
                     records.push(record.clone());
                 }
 
@@ -1344,6 +1430,8 @@ impl KonoNode {
                     }
                 }
 
+                let attestations = self.attestations_for_records(&records);
+
                 self.send_secure_payload(
                     source,
                     SecurePayload::DhtNodes {
@@ -1351,6 +1439,7 @@ impl KonoNode {
                         origin_node_id: origin_node_id.clone(),
                         target_node_id: target_node_id.clone(),
                         records,
+                        attestations,
                     },
                 )
                 .await?;
@@ -1395,8 +1484,10 @@ impl KonoNode {
                 origin_node_id,
                 target_node_id,
                 records,
+                attestations,
             } => {
                 if records.len() > DHT_RESPONSE_LIMIT
+                    || attestations.len() > DHT_ATTESTATION_RESPONSE_LIMIT
                     || !plausible_node_id(&origin_node_id)
                     || !plausible_node_id(&target_node_id)
                 {
@@ -1414,11 +1505,14 @@ impl KonoNode {
                     }
                 }
 
+                self.store_dht_attestations(attestations.clone());
+
                 if origin_node_id == self.node_id() {
                     if self.pending_dht_queries.contains(&target_node_id) {
                         if let Some(current) = self.dht.get(&target_node_id).cloned() {
-                            self.active_dht_queries.remove(&query_id);
-                            self.activate_dht_record(&current).await?;
+                            if self.activate_dht_record(&current).await? {
+                                self.active_dht_queries.remove(&query_id);
+                            }
                         }
                     }
                 } else {
@@ -1436,6 +1530,7 @@ impl KonoNode {
                                     origin_node_id,
                                     target_node_id,
                                     records,
+                                    attestations,
                                 },
                             )
                             .await?;
@@ -2937,10 +3032,13 @@ impl KonoNode {
             }
 
             if let Some(record) = self.dht.get(&target_node_id).cloned() {
-                if let Err(error) = self.activate_dht_record(&record).await {
-                    debug!(target = %target_node_id, %error, "cached exact DHT activation failed");
+                match self.activate_dht_record(&record).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        debug!(target = %target_node_id, %error, "cached exact DHT activation failed");
+                    }
                 }
-                continue;
             }
 
             if self
@@ -3037,9 +3135,20 @@ impl KonoNode {
     }
 
     async fn sync_dht_peer(&mut self, peer: SocketAddr) -> Result<()> {
+        self.issue_endpoint_attestation(peer).await?;
+
         if let Some(record) = self.build_own_dht_record()? {
-            self.send_secure_payload(peer, SecurePayload::DhtStore { record })
-                .await?;
+            let attestations = self
+                .endpoint_attestations
+                .for_record(&record, DHT_ATTESTATION_RESPONSE_LIMIT);
+            self.send_secure_payload(
+                peer,
+                SecurePayload::DhtStore {
+                    record,
+                    attestations,
+                },
+            )
+            .await?;
         }
 
         for target_node_id in self.pending_dht_queries.clone() {
@@ -3049,14 +3158,95 @@ impl KonoNode {
         Ok(())
     }
 
-    async fn activate_dht_record(&mut self, record: &PeerRecord) -> Result<()> {
-        if !self.pending_dht_queries.contains(&record.node_id) {
+    async fn issue_endpoint_attestation(&mut self, peer: SocketAddr) -> Result<()> {
+        if !endpoint_publishable(peer) {
+            return Ok(());
+        }
+        let Some(peer_node_id) = self.peers.get(&peer).map(|info| info.node_id.clone()) else {
+            return Ok(());
+        };
+        if !self
+            .peers
+            .get(&peer)
+            .is_some_and(|info| info.features.contains("endpoint-attestations-v1"))
+        {
             return Ok(());
         }
 
-        for endpoint in record.socket_endpoints().into_iter().take(2) {
-            self.discovery_candidates
-                .insert(endpoint, Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL);
+        let attestation = EndpointAttestation::signed(&self.identity, peer_node_id, peer)?;
+        self.endpoint_attestations.upsert(attestation.clone())?;
+        self.send_secure_payload(peer, SecurePayload::DhtAttestation { attestation })
+            .await?;
+        self.last_endpoint_attestation_refresh
+            .insert(peer, Instant::now());
+        Ok(())
+    }
+
+    async fn refresh_endpoint_attestations(&mut self) {
+        let now = Instant::now();
+        let mut due: Vec<SocketAddr> = self
+            .confirmed_sessions
+            .iter()
+            .copied()
+            .filter(|peer| {
+                endpoint_publishable(*peer)
+                    && self
+                        .last_endpoint_attestation_refresh
+                        .get(peer)
+                        .is_none_or(|last| {
+                            now.duration_since(*last) >= ENDPOINT_ATTESTATION_REFRESH_INTERVAL
+                        })
+            })
+            .collect();
+        due.sort_unstable();
+        due.truncate(MAX_ENDPOINT_ATTESTATION_REFRESHES_PER_TICK);
+
+        for peer in due {
+            if let Err(error) = self.issue_endpoint_attestation(peer).await {
+                debug!(%peer, %error, "endpoint attestation refresh failed");
+            }
+        }
+    }
+
+    async fn activate_dht_record(&mut self, record: &PeerRecord) -> Result<bool> {
+        if !self.pending_dht_queries.contains(&record.node_id) {
+            return Ok(false);
+        }
+
+        let attested_endpoints = self.endpoint_attestations.attested_endpoints(
+            record,
+            MIN_ENDPOINT_ATTESTATION_OBSERVERS,
+        );
+        if attested_endpoints.is_empty() {
+            debug!(
+                target = %record.node_id,
+                "deferred DHT activation without independent endpoint attestation"
+            );
+            return Ok(false);
+        }
+
+        let mut started = false;
+        for endpoint in attested_endpoints.into_iter().take(2) {
+            if let Some(existing) = self.discovery_candidates.get_mut(&endpoint) {
+                if existing.expected_node_id != record.node_id {
+                    debug!(
+                        %endpoint,
+                        expected = %existing.expected_node_id,
+                        rejected = %record.node_id,
+                        "kept existing DHT endpoint identity binding"
+                    );
+                    continue;
+                }
+                existing.expires_at = Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL;
+            } else {
+                self.discovery_candidates.insert(
+                    endpoint,
+                    DhtDiscoveryCandidate {
+                        expected_node_id: record.node_id.clone(),
+                        expires_at: Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL,
+                    },
+                );
+            }
 
             let cookie = self.cookie_cache.get(&endpoint).cloned();
             self.send(
@@ -3067,6 +3257,7 @@ impl KonoNode {
                 },
             )
             .await?;
+            started = true;
 
             info!(
                 target = %record.node_id,
@@ -3075,7 +3266,42 @@ impl KonoNode {
             );
         }
 
-        Ok(())
+        Ok(started)
+    }
+
+    fn record_has_attested_endpoint(&self, record: &PeerRecord) -> bool {
+        !self
+            .endpoint_attestations
+            .attested_endpoints(record, MIN_ENDPOINT_ATTESTATION_OBSERVERS)
+            .is_empty()
+    }
+
+    fn attestations_for_records(&self, records: &[PeerRecord]) -> Vec<EndpointAttestation> {
+        let mut attestations = Vec::new();
+        for record in records {
+            let remaining = DHT_ATTESTATION_RESPONSE_LIMIT.saturating_sub(attestations.len());
+            if remaining == 0 {
+                break;
+            }
+            attestations.extend(self.endpoint_attestations.for_record(record, remaining));
+        }
+        attestations
+    }
+
+    fn store_dht_attestations(&mut self, attestations: Vec<EndpointAttestation>) {
+        for attestation in attestations {
+            let matches_current_record = self
+                .dht
+                .get(&attestation.subject_node_id)
+                .is_some_and(|record| record.endpoints.contains(&attestation.endpoint));
+            if !matches_current_record {
+                continue;
+            }
+
+            if let Err(error) = self.endpoint_attestations.upsert(attestation) {
+                debug!(%error, "rejected DHT endpoint attestation");
+            }
+        }
     }
 
     async fn send_secure_payload(
@@ -3812,6 +4038,16 @@ impl KonoNode {
             || self.discovery_candidates.contains_key(&source)
     }
 
+    fn is_expected_peer(&self, source: SocketAddr, node_id: &str) -> bool {
+        self.is_expected_endpoint(source) && self.discovery_identity_matches(source, node_id)
+    }
+
+    fn discovery_identity_matches(&self, source: SocketAddr, node_id: &str) -> bool {
+        self.discovery_candidates
+            .get(&source)
+            .is_none_or(|candidate| candidate.expected_node_id == node_id)
+    }
+
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
         let previous_endpoint = self
             .peers
@@ -3878,6 +4114,7 @@ impl KonoNode {
                 first_seen: now,
                 last_seen: now,
                 observed_external_endpoint: None,
+                features: HashSet::new(),
             });
     }
 
@@ -3971,6 +4208,8 @@ impl KonoNode {
         });
         self.last_rekey
             .retain(|endpoint, _| self.sessions.contains_key(endpoint));
+        self.last_endpoint_attestation_refresh
+            .retain(|endpoint, _| self.sessions.contains_key(endpoint));
         let active_session_endpoints: HashSet<SocketAddr> = self.sessions.keys().copied().collect();
         self.routing.retain_endpoints(&active_session_endpoints);
         self.pending_filter_probes
@@ -3982,7 +4221,7 @@ impl KonoNode {
         self.last_filter_test_request
             .retain(|_, last| last.elapsed() < Duration::from_secs(60));
         self.discovery_candidates
-            .retain(|_, expires_at| *expires_at > Instant::now());
+            .retain(|_, candidate| candidate.expires_at > Instant::now());
         self.relay_paths
             .retain(|_, path| path.expires_at > Instant::now());
         self.relay_e2e_pending
@@ -4007,6 +4246,13 @@ impl KonoNode {
         let expired_dht = self.dht.expire();
         if expired_dht > 0 {
             debug!(expired_dht, "expired stale DHT peer records");
+        }
+        let expired_attestations = self.endpoint_attestations.expire();
+        if expired_attestations > 0 {
+            debug!(
+                expired_attestations,
+                "expired stale DHT endpoint attestations"
+            );
         }
         let removed = before.saturating_sub(self.peers.len());
         if removed > 0 {
@@ -4048,6 +4294,7 @@ fn local_features() -> Vec<String> {
         "signed-dht-records".to_owned(),
         "encrypted-dht-lookup".to_owned(),
         "bounded-multihop-dht".to_owned(),
+        "endpoint-attestations-v1".to_owned(),
         "k-bucket-routing".to_owned(),
         "persistent-routing-hints".to_owned(),
         "cooperative-relay-control".to_owned(),
@@ -4090,5 +4337,31 @@ mod tests {
         node.set_local_test_mode(true);
         assert!(node.rendezvous_candidate_allowed(loopback));
         assert!(!node.rendezvous_candidate_allowed("0.0.0.0:47000".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn dht_discovery_candidate_is_bound_to_expected_node_identity() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let endpoint: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let expected = NodeIdentity::generate().node_id();
+        let unexpected = NodeIdentity::generate().node_id();
+        node.discovery_candidates.insert(
+            endpoint,
+            DhtDiscoveryCandidate {
+                expected_node_id: expected.clone(),
+                expires_at: Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL,
+            },
+        );
+
+        assert!(node.is_expected_peer(endpoint, &expected));
+        assert!(!node.is_expected_peer(endpoint, &unexpected));
     }
 }

@@ -18,8 +18,9 @@ pub mod session;
 
 pub use dht::{
     endpoint_publishable, routing_bucket_index, DhtTable, EndpointAttestation,
-    EndpointAttestationTable, PeerRecord, RoutingPeer, RoutingTable, DHT_MAX_HOPS,
-    DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
+    EndpointAttestationTable, PeerRecord, RoutingPeer, RoutingTable,
+    DHT_ATTESTATION_RESPONSE_LIMIT, DHT_MAX_HOPS, DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
+    MIN_ENDPOINT_ATTESTATION_OBSERVERS,
 };
 pub use identity::NodeIdentity;
 pub use invite::InviteCode;

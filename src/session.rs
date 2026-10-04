@@ -1,4 +1,4 @@
-use crate::dht::PeerRecord;
+use crate::dht::{EndpointAttestation, PeerRecord};
 use crate::nat::FilterProbeAuthorization;
 use crate::relay_app::RelayAppFragment;
 use crate::security::SequenceWindow;
@@ -55,6 +55,11 @@ pub enum SecurePayload {
     FilteringTestUnavailable,
     DhtStore {
         record: PeerRecord,
+        #[serde(default)]
+        attestations: Vec<EndpointAttestation>,
+    },
+    DhtAttestation {
+        attestation: EndpointAttestation,
     },
     DhtFind {
         query_id: u64,
@@ -67,6 +72,8 @@ pub enum SecurePayload {
         origin_node_id: String,
         target_node_id: String,
         records: Vec<PeerRecord>,
+        #[serde(default)]
+        attestations: Vec<EndpointAttestation>,
     },
     RelayOpen {
         circuit_id: u64,
@@ -496,6 +503,9 @@ fn frame_aad(session_id: &str, sequence: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dht::{EndpointAttestation, PeerRecord, DHT_ATTESTATION_RESPONSE_LIMIT};
+    use crate::identity::NodeIdentity;
+    use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 
     fn session_pair() -> (SecureSession, SecureSession) {
         let pending = PendingHandshake::new("node-b".to_owned());
@@ -528,6 +538,83 @@ mod tests {
             .decrypt(&reply.session_id, reply.sequence, &reply.ciphertext)
             .unwrap();
         assert_eq!(payload, SecurePayload::Pong { token: 7 });
+    }
+
+    #[test]
+    fn maximum_dht_attestation_response_fits_wire_packet_bound() {
+        let subjects: Vec<NodeIdentity> = (0..8).map(|_| NodeIdentity::generate()).collect();
+        let records: Vec<PeerRecord> = subjects
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| {
+                PeerRecord::signed(
+                    identity,
+                    (0..4)
+                        .map(|endpoint_index| {
+                            format!(
+                                "[2001:4860:{index:04x}:{endpoint_index:04x}:ffff:ffff:ffff:ffff]:65535"
+                            )
+                            .parse()
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let endpoint = records[0].socket_endpoints()[0];
+        let attestations: Vec<EndpointAttestation> = (0..DHT_ATTESTATION_RESPONSE_LIMIT)
+            .map(|_| {
+                EndpointAttestation::signed(
+                    &NodeIdentity::generate(),
+                    records[0].node_id.clone(),
+                    endpoint,
+                )
+                .unwrap()
+            })
+            .collect();
+        let (mut initiator, _) = session_pair();
+        let frame = initiator
+            .encrypt(&SecurePayload::DhtNodes {
+                query_id: u64::MAX,
+                origin_node_id: records[0].node_id.clone(),
+                target_node_id: records[1].node_id.clone(),
+                records,
+                attestations,
+            })
+            .unwrap();
+        let envelope = WireEnvelope::signed(
+            &NodeIdentity::generate(),
+            u64::MAX,
+            MessageBody::Encrypted {
+                session_id: frame.session_id,
+                sequence: frame.sequence,
+                ciphertext: frame.ciphertext,
+            },
+        )
+        .unwrap();
+
+        assert!(envelope.encode().unwrap().len() <= MAX_PACKET_SIZE);
+    }
+
+    #[test]
+    fn legacy_dht_store_without_attestations_decodes_with_empty_evidence() {
+        let identity = NodeIdentity::generate();
+        let record = PeerRecord::signed(
+            &identity,
+            vec!["8.8.8.8:47000".parse().unwrap()],
+        )
+        .unwrap();
+        let legacy = serde_json::json!({
+            "type": "dht_store",
+            "data": { "record": record }
+        });
+
+        let decoded: SecurePayload = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            SecurePayload::DhtStore { attestations, .. } if attestations.is_empty()
+        ));
     }
 
     #[test]
