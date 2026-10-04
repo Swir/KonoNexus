@@ -6,6 +6,8 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "build.rs"
+      - "assets/kononexus-tester.ico"
       - "src/**"
       - ".github/workflows/windows-probe-release.yml"
   workflow_dispatch:
@@ -38,8 +40,22 @@ jobs:
           $version = $versionLine.Matches[0].Groups[1].Value
           "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Check SDK-only library
+        run: cargo check --release --no-default-features --lib
+
       - name: Build self-contained GUI and diagnostic probe
         run: cargo build --release --bin kononexus_tester --bin kononexus_probe
+
+      - name: Verify embedded tester metadata
+        shell: pwsh
+        run: |
+          $versionInfo = (Get-Item "target\release\kononexus_tester.exe").VersionInfo
+          if ($versionInfo.ProductName -ne "KonoNexus Network Tester") {
+            throw "Tester ProductName resource is missing"
+          }
+          if ($versionInfo.FileDescription -ne "KonoNexus WAN / Internet Network Tester") {
+            throw "Tester FileDescription resource is missing"
+          }
 
       - name: Verify CRT is statically linked
         shell: pwsh

@@ -1,5 +1,5 @@
 fn main() {
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "tester-gui"))]
     {
         let mut resource = winresource::WindowsResource::new();
         resource.set_icon("assets/kononexus-tester.ico");

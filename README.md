@@ -71,6 +71,18 @@ cargo test
 
 For controlled multi-machine testing, follow [`docs/TESTING.md`](docs/TESTING.md) rather than treating loopback or CI results as Internet proof.
 
+### SDK-only dependency
+
+Downstream applications can depend on the library without pulling in the Network Tester GUI stack:
+
+```toml
+[dependencies]
+kononexus = { git = "https://github.com/Swir/KonoNexus.git", default-features = false }
+```
+
+The default `tester-gui` feature keeps the tester enabled for normal builds. Disable default features for SDK integration; for example, `cargo check --no-default-features --lib` checks only the core library without `eframe`, `arboard` or `image`.
+Production consumers should also pin `rev` to an exact reviewed commit instead of following a moving branch.
+
 ## Requirements / compatibility
 
 - **Core:** Rust 2021.
