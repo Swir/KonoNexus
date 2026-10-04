@@ -1031,6 +1031,15 @@ impl KonoNode {
 
                 let payload = match self.sessions.get_mut(&source) {
                     Some(session) => {
+                        if session.peer_node_id() != sender_node_id.as_str() {
+                            debug!(
+                                %source,
+                                peer = %sender_node_id,
+                                expected_peer = %session.peer_node_id(),
+                                "ignoring secure frame from identity not bound to session"
+                            );
+                            return Ok(());
+                        }
                         session.decrypt(&session_id, sequence, &ciphertext, Instant::now())?
                     }
                     None => {
@@ -5171,6 +5180,91 @@ mod tests {
             now
         ));
         assert!(node.allow_dht_query(&first, source, now + DHT_QUERY_PEER_REFILL));
+    }
+
+    #[tokio::test]
+    async fn encrypted_payload_requires_outer_sender_to_match_session_identity() {
+        let local_identity = NodeIdentity::generate();
+        let local_node_id = local_identity.node_id();
+        let peer_identity = NodeIdentity::generate();
+        let peer_node_id = peer_identity.node_id();
+        let unrelated_identity = NodeIdentity::generate();
+        let source: SocketAddr = "127.0.0.1:47000".parse().unwrap();
+        let now = Instant::now();
+
+        let pending = PendingHandshake::new(local_node_id.clone());
+        let handshake_id = pending.handshake_id();
+        let initiator_public_key = pending.public_key_hex();
+        let (receiver_session, responder_public_key) = respond_handshake(
+            &local_node_id,
+            &peer_node_id,
+            handshake_id,
+            &initiator_public_key,
+        )
+        .unwrap();
+        let mut sender_session = pending
+            .complete(&peer_node_id, &responder_public_key)
+            .unwrap();
+        let frame = sender_session
+            .encrypt(&SecurePayload::Pong { token: 7 })
+            .unwrap();
+
+        let mut node = KonoNode::bind(
+            local_identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.peers.insert(
+            source,
+            PeerInfo {
+                node_id: peer_node_id.clone(),
+                public_key: peer_identity.public_key_hex(),
+                endpoint: source,
+                first_seen: now,
+                last_seen: now,
+                observed_external_endpoint: None,
+                features: HashSet::new(),
+            },
+        );
+        node.sessions
+            .insert(source, SessionSlot::new(receiver_session));
+
+        let mismatched = WireEnvelope::signed(
+            &unrelated_identity,
+            1,
+            MessageBody::Encrypted {
+                session_id: frame.session_id.clone(),
+                sequence: frame.sequence,
+                ciphertext: frame.ciphertext.clone(),
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        node.handle_datagram(&mismatched, source).await.unwrap();
+
+        assert!(!node.confirmed_sessions.contains(&source));
+
+        let correctly_bound = WireEnvelope::signed(
+            &peer_identity,
+            2,
+            MessageBody::Encrypted {
+                session_id: frame.session_id,
+                sequence: frame.sequence,
+                ciphertext: frame.ciphertext,
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        node.handle_datagram(&correctly_bound, source)
+            .await
+            .unwrap();
+
+        assert!(node.confirmed_sessions.contains(&source));
     }
 
     #[test]
