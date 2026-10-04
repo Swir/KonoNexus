@@ -28,7 +28,7 @@ fn endpoint(index: usize) -> SocketAddr {
 }
 
 fn identity(index: usize, state_dir: &Path) -> NodeIdentity {
-    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::create_dir_all(state_dir).unwrap();
     let path = state_dir.join(format!("node-{index}.key"));
     let mut secret = [0_u8; 32];
     secret[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
