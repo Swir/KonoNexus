@@ -7549,8 +7549,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn live_large_mesh_converges_and_recovers_from_churn() {
         const NODE_COUNT: usize = 32;
-        const LEAF_COUNT: usize = 28;
-        const HUB_COUNT: usize = 4;
+        const LEAF_COUNT: usize = 30;
+        const HUB_COUNT: usize = 2;
         const HELLO_INTERVAL: Duration = Duration::from_secs(2);
         const MESH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -7600,7 +7600,7 @@ mod tests {
             apps[leaf] = Some(app);
             diagnostics[leaf] = Some(diagnostic);
             tasks[leaf] = Some(tokio::spawn(node.run()));
-            time::sleep(Duration::from_millis(150)).await;
+            time::sleep(Duration::from_millis(250)).await;
         }
         let mut apps: Vec<_> = apps.into_iter().map(Option::unwrap).map(Some).collect();
         let diagnostics: Vec<_> = diagnostics.into_iter().map(Option::unwrap).collect();

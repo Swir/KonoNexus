@@ -4,7 +4,7 @@ Development log for KonoNexus.
 
 ## 0.1.0-alpha.23
 
-- Added a 32-node localhost `KonoNode` runtime convergence and churn harness with 28 leaves bootstrapped to four hubs. It uses real signed HELLO/cookie admission, encrypted sessions, endpoint observations and attestations, DHT publication/replication/find/nodes, and RelayApp delivery.
+- Added a 32-node localhost `KonoNode` runtime convergence and churn harness with 30 leaves bootstrapped to two hubs. It uses real signed HELLO/cookie admission, encrypted sessions, endpoint observations and attestations, DHT publication/replication/find/nodes, and RelayApp delivery.
 - Verifies non-neighbor leaf delivery before churn, stops every third node (including one hub), waits for HELLO-based expiry and survivor reconvergence, then verifies a second distinct leaf delivery and bounded state.
 - Added a cfg(test)-only exception for the harness's exact ephemeral loopback DHT endpoints; production endpoint publishability continues to reject loopback. This is local runtime evidence only, not WAN/NAT/CGNAT validation.
 - Marked large-mesh convergence/churn roadmap work complete for this bounded localhost scope and updated testing documentation.
