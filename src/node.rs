@@ -7575,8 +7575,8 @@ mod tests {
         let _loopback_dht_policy = TestLoopbackDhtEndpoints::register(endpoints.clone());
 
         let hubs: Vec<_> = (LEAF_COUNT..NODE_COUNT).collect();
-        for leaf in 0..LEAF_COUNT {
-            nodes[leaf].0.bootstrap_peers = hubs.iter().map(|hub| endpoints[*hub]).collect();
+        for (node, _, _, _, _) in nodes.iter_mut().take(LEAF_COUNT) {
+            node.bootstrap_peers = hubs.iter().map(|hub| endpoints[*hub]).collect();
         }
 
         let node_ids: Vec<_> = nodes.iter().map(|entry| entry.1.clone()).collect();
@@ -7716,11 +7716,11 @@ mod tests {
             &counters,
         );
 
-        for index in 0..NODE_COUNT {
+        for (index, diagnostic) in diagnostics.iter().enumerate().take(NODE_COUNT) {
             if stopped.contains(&index) {
                 continue;
             }
-            let snapshot = diagnostics[index].snapshot();
+            let snapshot = diagnostic.snapshot();
             if index < LEAF_COUNT {
                 assert!((surviving_hubs.len()..=HUB_COUNT).contains(&snapshot.authenticated_peers));
             } else {
