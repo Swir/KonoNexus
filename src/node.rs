@@ -306,8 +306,14 @@ struct PendingDhtReplication {
     record: PeerRecord,
     attestations: Vec<EndpointAttestation>,
     replication_hops_remaining: u8,
-    transit_forward: bool,
-    owner_priority: bool,
+    kind: DhtReplicationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DhtReplicationKind {
+    Sync,
+    Transit,
+    Owner,
 }
 
 #[derive(Debug, Clone)]
@@ -3331,8 +3337,7 @@ impl KonoNode {
                 record,
                 attestations,
                 0,
-                false,
-                false,
+                DhtReplicationKind::Sync,
             ) {
                 sent += 1;
             }
@@ -3502,8 +3507,7 @@ impl KonoNode {
                 record.clone(),
                 attestations.clone(),
                 DHT_REPLICATION_MAX_HOPS,
-                false,
-                true,
+                DhtReplicationKind::Owner,
             ) {
                 queued += 1;
             }
@@ -3542,8 +3546,7 @@ impl KonoNode {
             record,
             attestations,
             replication_hops_remaining,
-            false,
-            true,
+            DhtReplicationKind::Owner,
         );
         Ok(())
     }
@@ -3579,8 +3582,7 @@ impl KonoNode {
                 record.clone(),
                 attestations.clone(),
                 replication_hops_remaining,
-                true,
-                false,
+                DhtReplicationKind::Transit,
             ) {
                 queued += 1;
             }
@@ -3597,9 +3599,10 @@ impl KonoNode {
         record: PeerRecord,
         attestations: Vec<EndpointAttestation>,
         replication_hops_remaining: u8,
-        transit_forward: bool,
-        owner_priority: bool,
+        kind: DhtReplicationKind,
     ) -> bool {
+        let owner_priority = kind == DhtReplicationKind::Owner;
+        let transit_forward = kind == DhtReplicationKind::Transit;
         let queue_limit = if owner_priority {
             MAX_PENDING_DHT_REPLICATIONS
         } else {
@@ -3659,8 +3662,7 @@ impl KonoNode {
             record,
             attestations,
             replication_hops_remaining,
-            transit_forward,
-            owner_priority,
+            kind,
         };
         if owner_priority {
             self.pending_dht_replications.push_front(pending);
@@ -3708,12 +3710,12 @@ impl KonoNode {
                     .get_mut(&(pending.record.node_id.clone(), pending.record.sequence))
                 {
                     history.target_node_ids.remove(&pending.target_node_id);
-                    if pending.transit_forward {
+                    if pending.kind == DhtReplicationKind::Transit {
                         history
                             .transit_target_node_ids
                             .remove(&pending.target_node_id);
                     }
-                    if pending.owner_priority {
+                    if pending.kind == DhtReplicationKind::Owner {
                         history
                             .owner_target_node_ids
                             .remove(&pending.target_node_id);
@@ -3738,12 +3740,12 @@ impl KonoNode {
                     .get_mut(&(pending.record.node_id.clone(), pending.record.sequence))
                 {
                     history.target_node_ids.remove(&pending.target_node_id);
-                    if pending.transit_forward {
+                    if pending.kind == DhtReplicationKind::Transit {
                         history
                             .transit_target_node_ids
                             .remove(&pending.target_node_id);
                     }
-                    if pending.owner_priority {
+                    if pending.kind == DhtReplicationKind::Owner {
                         history
                             .owner_target_node_ids
                             .remove(&pending.target_node_id);
@@ -5079,8 +5081,7 @@ mod tests {
                 record.clone(),
                 Vec::new(),
                 0,
-                false,
-                false,
+                DhtReplicationKind::Sync,
             ));
         }
         assert!(!node.queue_dht_replication(
@@ -5089,8 +5090,7 @@ mod tests {
             record.clone(),
             Vec::new(),
             0,
-            false,
-            false,
+            DhtReplicationKind::Sync,
         ));
         assert!(node.queue_dht_replication(
             "1.0.0.1:47000".parse().unwrap(),
@@ -5098,8 +5098,7 @@ mod tests {
             record,
             Vec::new(),
             DHT_REPLICATION_MAX_HOPS,
-            false,
-            true,
+            DhtReplicationKind::Owner,
         ));
         assert_eq!(node.pending_dht_replications.len(), ordinary_limit + 1);
         assert_eq!(
