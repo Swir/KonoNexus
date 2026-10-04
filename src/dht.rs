@@ -126,8 +126,8 @@ impl EndpointAttestation {
             bail!("attestation observer NodeID/public-key mismatch");
         }
 
-        let signature_raw = hex::decode(&self.signature)
-            .context("attestation signature is not valid hex")?;
+        let signature_raw =
+            hex::decode(&self.signature).context("attestation signature is not valid hex")?;
         let signature: [u8; SIGNATURE_LEN] = signature_raw
             .try_into()
             .map_err(|_| anyhow!("attestation signature must be 64 bytes"))?;
@@ -181,8 +181,7 @@ impl EndpointAttestationTable {
         {
             return Ok(false);
         }
-        if !self.attestations.contains_key(&key)
-            && self.attestations.len() >= self.max_attestations
+        if !self.attestations.contains_key(&key) && self.attestations.len() >= self.max_attestations
         {
             self.evict_oldest();
         }
@@ -223,7 +222,8 @@ impl EndpointAttestationTable {
     pub fn expire(&mut self) -> usize {
         let now = unix_time_ms().unwrap_or(u64::MAX);
         let before = self.attestations.len();
-        self.attestations.retain(|_, attestation| attestation.expires_unix_ms > now);
+        self.attestations
+            .retain(|_, attestation| attestation.expires_unix_ms > now);
         before.saturating_sub(self.attestations.len())
     }
 
