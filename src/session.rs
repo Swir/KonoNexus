@@ -600,8 +600,7 @@ mod tests {
     #[test]
     fn legacy_dht_store_without_attestations_decodes_with_empty_evidence() {
         let identity = NodeIdentity::generate();
-        let record =
-            PeerRecord::signed(&identity, vec!["8.8.8.8:47000".parse().unwrap()]).unwrap();
+        let record = PeerRecord::signed(&identity, vec!["8.8.8.8:47000".parse().unwrap()]).unwrap();
         let legacy = serde_json::json!({
             "type": "dht_store",
             "data": { "record": record }
