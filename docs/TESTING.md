@@ -167,6 +167,8 @@ A timeout or `FAILED` event is evidence to diagnose, not something to hide by in
 
 Automated CI now passes a real three-node localhost runtime harness. That proves the runtime/API/discovery delivery path works under controlled conditions.
 
+CI also runs a deterministic 64-node algorithm harness over the production routing table, signed peer-record table, and protocol hop/fanout limits. It removes one third of the nodes, reconverges the remaining routing views, re-replicates surviving records, and verifies bounded lookup and state invariants. This is useful large-mesh algorithm evidence, but it does not exercise UDP/session transport, endpoint-attestation admission, real packet loss, or independent networks; the broad large-mesh validation roadmap item therefore remains open.
+
 CI also exercises the bounded exact-candidate planner: deduplication and the three-endpoint cap, exact supplied-port preservation, stagger/TTL exhaustion, cross-NodeID rejection, global target-state bounds, cancellation after encrypted-session confirmation, and rendezvous-round exhaustion before relay eligibility. These checks prove deterministic logic and admission invariants; they do not prove that any candidate traverses a real NAT or CGNAT.
 
 It does **not** prove success through every real NAT, CGNAT, carrier firewall, or router. The external tests above are the next required validation stage before calling the networking foundation stable.
