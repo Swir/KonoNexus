@@ -58,6 +58,7 @@ const MAX_DHT_REPLICATION_RATE_WINDOWS: usize = 4_096;
 const OWN_DHT_RECORD_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
 const MAX_DHT_REPLICATION_HISTORY: usize = 8_192;
 const MAX_PENDING_DHT_REPLICATIONS: usize = 256;
+const DHT_OWNER_REPLICATION_RESERVE: usize = DHT_BUCKET_SIZE;
 const DHT_REPLICATION_BURST_PER_TICK: usize = 4;
 const RELAY_APP_BURST_PER_TICK: usize = 4;
 const MAX_RELAY_APP_HANDLE_CAPACITY: usize = 1_024;
@@ -3252,6 +3253,7 @@ impl KonoNode {
                 attestations,
                 0,
                 false,
+                false,
             ) {
                 sent += 1;
             }
@@ -3413,6 +3415,7 @@ impl KonoNode {
                 attestations.clone(),
                 DHT_REPLICATION_MAX_HOPS,
                 false,
+                true,
             ) {
                 queued += 1;
             }
@@ -3455,6 +3458,7 @@ impl KonoNode {
                 attestations.clone(),
                 replication_hops_remaining,
                 true,
+                false,
             ) {
                 queued += 1;
             }
@@ -3472,8 +3476,14 @@ impl KonoNode {
         attestations: Vec<EndpointAttestation>,
         replication_hops_remaining: u8,
         transit_forward: bool,
+        owner_priority: bool,
     ) -> bool {
-        if self.pending_dht_replications.len() >= MAX_PENDING_DHT_REPLICATIONS
+        let queue_limit = if owner_priority {
+            MAX_PENDING_DHT_REPLICATIONS
+        } else {
+            MAX_PENDING_DHT_REPLICATIONS.saturating_sub(DHT_OWNER_REPLICATION_RESERVE)
+        };
+        if self.pending_dht_replications.len() >= queue_limit
             || record.verify().is_err()
             || attestations.len() > DHT_ATTESTATION_RESPONSE_LIMIT
         {
@@ -3509,15 +3519,19 @@ impl KonoNode {
                 .insert(target_node_id.clone());
         }
 
-        self.pending_dht_replications
-            .push_back(PendingDhtReplication {
-                target,
-                target_node_id,
-                record,
-                attestations,
-                replication_hops_remaining,
-                transit_forward,
-            });
+        let pending = PendingDhtReplication {
+            target,
+            target_node_id,
+            record,
+            attestations,
+            replication_hops_remaining,
+            transit_forward,
+        };
+        if owner_priority {
+            self.pending_dht_replications.push_front(pending);
+        } else {
+            self.pending_dht_replications.push_back(pending);
+        }
         true
     }
 
@@ -4770,5 +4784,64 @@ mod tests {
             .observe("observer-a".to_owned(), second_endpoint);
         let changed = node.build_own_dht_record().unwrap().unwrap();
         assert_eq!(changed.endpoints, vec![second_endpoint.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn replication_queue_reserves_capacity_for_owner_publication() {
+        let identity = NodeIdentity::generate();
+        let record = PeerRecord::signed(
+            &identity,
+            vec!["8.8.8.8:47000".parse().unwrap()],
+        )
+        .unwrap();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let ordinary_limit = MAX_PENDING_DHT_REPLICATIONS - DHT_OWNER_REPLICATION_RESERVE;
+
+        for index in 0..ordinary_limit {
+            let target = format!("8.8.8.{}:{}", (index % 250) + 1, 20_000 + index)
+                .parse()
+                .unwrap();
+            assert!(node.queue_dht_replication(
+                target,
+                format!("ordinary-{index}"),
+                record.clone(),
+                Vec::new(),
+                0,
+                false,
+                false,
+            ));
+        }
+        assert!(!node.queue_dht_replication(
+            "1.1.1.1:47000".parse().unwrap(),
+            "ordinary-overflow".to_owned(),
+            record.clone(),
+            Vec::new(),
+            0,
+            false,
+            false,
+        ));
+        assert!(node.queue_dht_replication(
+            "1.0.0.1:47000".parse().unwrap(),
+            "owner-priority".to_owned(),
+            record,
+            Vec::new(),
+            DHT_REPLICATION_MAX_HOPS,
+            false,
+            true,
+        ));
+        assert_eq!(node.pending_dht_replications.len(), ordinary_limit + 1);
+        assert_eq!(
+            node.pending_dht_replications
+                .front()
+                .map(|pending| pending.target_node_id.as_str()),
+            Some("owner-priority")
+        );
     }
 }
