@@ -65,7 +65,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 ## Current limitations
 
 - timed hole punching is implemented but has not yet been validated across a wide NAT matrix,
-- no port-prediction or safe alternate-candidate strategy exists,
+- bounded exact-candidate selection exists, but there is no port prediction, broad ICE-style gathering, or evidence yet that its ordering succeeds across a representative WAN/NAT/CGNAT matrix,
 - positive observations are supported for the exact contacted-endpoint control, same-IP/different-port, and different previously-uncontacted-address cells; timeout, unavailable and send-failed results remain intentionally inconclusive,
 - filtering-matrix localhost and CI tests are not evidence for real WAN, NAT, or CGNAT behavior,
 - authenticated secure frames tolerate reordering only within the 128-sequence receive window; duplicates and frames older than that window are rejected,

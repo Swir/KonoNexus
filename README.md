@@ -24,8 +24,8 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.20` |
-| Roadmap | **40 / 49 = 81.6%** |
+| Source version | `0.1.0-alpha.21` |
+| Roadmap | **41 / 49 = 83.7%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -88,7 +88,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.20`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.21`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -141,13 +141,15 @@ cargo run -- --peer KNOWN_PEER:47000 --connect-node TARGET_KNP_NODE_ID
 
 KNP then tries at most three currently encrypted peers per round as coordinators, avoids repeating them in the same round, and backs off before another round.
 
+Explicit `connect()` hints and independently attested exact DHT results now enter one NodeID-bound candidate plan. The plan preserves source priority, deduplicates endpoints, tries at most three exact addresses with a four-second stagger, expires after 30 seconds, and never derives adjacent addresses or ports. Only the attempted address is admitted as an expected source; a different signed NodeID is rejected before peer admission. A confirmed encrypted direct session cancels the remaining direct, punch, rendezvous and pending relay work for that target. If exact candidates fail, KNP exhausts one bounded round of at most three authenticated rendezvous coordinators before relay fallback becomes eligible.
+
 Both A and B must already have an encrypted KNP session with that coordinator. The coordinator sends each side the UDP source endpoint it currently observes for the other side. Each side waits briefly, then emits a locally bounded seven-probe backoff burst over roughly 2.7 seconds while the signed punch authorization remains valid for five seconds. A successful `PUNCH_PROBE/PUNCH_ACK` stops the schedule, establishes the authenticated direct endpoint, and starts a fresh encrypted KNP session over it.
 
 This is an experimental primitive. NATs that create destination-specific mappings can still defeat this strategy; cooperative relay is the later fallback.
 
 ## Roadmap
 
-**Verified roadmap progress:** 40 / 49 items complete (**81.6%**). This number is derived from the checklist below and reflects the implemented, bounded filtering matrix described below; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 41 / 49 items complete (**83.7%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -164,7 +166,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Multi-attempt timed hole-punch burst/state machine
 - [x] Consent-based endpoint-independent filtering evidence test
 - [x] Broader filtering-behavior matrix and negative-result interpretation
-- [ ] Multi-candidate/path prioritization without unsafe port spraying
+- [x] Multi-candidate/path prioritization without unsafe port spraying
 - [x] Bounded automatic selection of encrypted rendezvous peers
 - [ ] IPv6 direct-path preference
 - [x] Signed bounded DHT peer records and encrypted exact lookup
@@ -348,7 +350,7 @@ Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-inde
 
 ## Testing candidate
 
-Alpha.19 is the current build state intended for controlled testing on separate computers.
+Alpha.21 is the current build state intended for controlled testing on separate computers.
 
 Automated CI now includes a live three-node runtime harness:
 

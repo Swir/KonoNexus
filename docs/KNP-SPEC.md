@@ -77,6 +77,14 @@ A node may request a target NodeID without naming a coordinator. KNP considers o
 
 The bounded selector does not discover new peers by itself; DHT discovery is still required for a truly global rendezvous pool.
 
+### Bounded exact-candidate planning
+
+Explicit application connection hints and independently attested endpoints from an exact DHT record use the same target-NodeID-bound plan. Input order is the priority order. The plan deduplicates endpoints, retains at most three, starts them with a four-second stagger, expires after 30 seconds, and never synthesizes another address or port. At most 256 target plans may exist at once.
+
+Only the endpoint selected for an attempt is temporarily admitted as an expected discovery source. Its signed NodeID must equal the plan's target before ordinary peer admission, so a valid but different identity at a supplied address cannot satisfy the plan. The same endpoint cannot be active under two target NodeIDs. Port zero, unspecified, multicast and IPv4 broadcast connection hints are rejected.
+
+A confirmed encrypted direct session removes every remaining exact candidate and pending handshake for that target, cancels sibling punch schedules and automatic rendezvous, and suppresses pending relay work. When exact candidates are exhausted, the target advances to one bounded automatic-rendezvous coordinator round. Relay fallback becomes eligible only after that round and its authorized punch work are exhausted. This is bounded exact-candidate selection, not ICE, port prediction or permission to scan neighboring endpoints.
+
 ## 9. Consent-based filtering matrix
 
 KNP records a bounded three-cell filtering-behavior matrix. Each cell represents the source relationship of one authorized UDP probe to the coordinator endpoint that the target already contacted:
@@ -95,7 +103,7 @@ Every negative state remains deliberately non-diagnostic. Timeout, unavailable h
 
 ## 10. Current limitations
 
-The punch burst still does not implement port prediction or broad ICE-like candidate prioritization. The filtering matrix records positive reachability across three source relationships, but it does not infer a restrictive filtering class from non-arrival. Real multi-network/NAT/CGNAT field validation remains open.
+The bounded planner tries only supplied, signed-offer or independently attested exact endpoints. It does not implement port prediction, broad ICE-like candidate gathering or arbitrary interface discovery. The filtering matrix records positive reachability across three source relationships, but it does not infer a restrictive filtering class from non-arrival. Real multi-network/NAT/CGNAT field validation remains open.
 
 Destination-specific/symmetric NAT mappings may therefore still fail. Cooperative relay remains the planned fallback.
 
@@ -109,10 +117,9 @@ A token alone is insufficient: the punch sender must also prove possession of th
 
 1. real multi-network/NAT/CGNAT validation of the filtering matrix,
 2. IPv6 direct-path preference,
-3. safe multi-candidate/path prioritization,
-4. DHT-based peer discovery,
-5. cooperative encrypted relay fallback,
-6. route scoring and KonoMind optimization.
+3. broader DHT convergence and churn validation,
+4. multi-relay/full-control-plane migration,
+5. route scoring and KonoMind optimization.
 
 ## 13. Signed DHT discovery foundation
 
@@ -124,7 +131,7 @@ The local DHT table stores at most 4,096 records. A newer valid sequence replace
 
 DHT control travels inside encrypted SecurePayload messages: `DhtStore` carries one signed record, `DhtFind` carries a requested NodeID, and `DhtNodes` carries that target plus at most eight records. Responses return an exact record first when available and then a bounded nearest-record set ordered by XOR distance over SHA-256(NodeID).
 
-Nearest records may be cached for future answers, but the current implementation does not automatically dial them. Only an exact valid record matching a locally pending NodeID lookup can create temporary discovery candidates. Those candidates still pass through signed HELLO, anti-amplification cookie, peer admission, and encrypted-session handshake.
+Nearest records may be cached for future answers, but the current implementation does not automatically dial them. Only an exact valid record matching a locally pending NodeID lookup can contribute independently attested endpoints to the bounded candidate plan. At most three exact endpoints are tried in order, and each still passes through signed HELLO, anti-amplification cookie, expected-NodeID admission, and encrypted-session handshake.
 
 This deliberately avoids turning untrusted nearest-record gossip into automatic outbound connection scanning.
 
