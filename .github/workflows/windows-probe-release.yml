@@ -110,5 +110,14 @@ jobs:
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --target "$env:GITHUB_SHA" --title "KonoNexus $env:PACKAGE_VERSION Network Tester" --notes "Windows x64 GUI for controlled two-PC WAN/Internet testing. Signed one-code invite, automatic DIRECT → UDP HOLE PUNCH → RELAY path attempt, authenticated delivery RTT/loss, NAT/endpoint evidence, NodeID and technical log. The console probe remains included only for diagnostics. This is a prerelease; real NAT/CGNAT results are evidence, not a universal connectivity guarantee." --prerelease
+          } else {
+            $tagSha = gh api "repos/$env:GITHUB_REPOSITORY/commits/$tag" --jq .sha
+            if ($LASTEXITCODE -ne 0 -or -not $tagSha) {
+              throw "Unable to resolve existing release tag $tag"
+            }
+            if ($tagSha.Trim() -ne $env:GITHUB_SHA) {
+              Write-Warning "Release $tag already targets $($tagSha.Trim()); skipping publication for $env:GITHUB_SHA. Bump Cargo.toml before publishing another tester release."
+              exit 0
+            }
           }
           gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" --clobber
