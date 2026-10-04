@@ -6347,8 +6347,9 @@ mod tests {
         timeout: Duration,
         mut condition: impl FnMut() -> bool,
         message: &str,
+        timeout_detail: impl Fn() -> String,
     ) {
-        time::timeout(timeout, async {
+        if time::timeout(timeout, async {
             loop {
                 if condition() {
                     return;
@@ -6357,7 +6358,10 @@ mod tests {
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {message}"));
+        .is_err()
+        {
+            panic!("timed out waiting for {message}: {}", timeout_detail());
+        }
     }
 
     async fn deliver_between_mesh_leaves(
@@ -7580,14 +7584,26 @@ mod tests {
         }
 
         let node_ids: Vec<_> = nodes.iter().map(|entry| entry.1.clone()).collect();
-        let mut apps = Vec::with_capacity(NODE_COUNT);
-        let mut diagnostics = Vec::with_capacity(NODE_COUNT);
-        let mut tasks = Vec::with_capacity(NODE_COUNT);
-        for (node, _, _, app, diagnostic) in nodes {
-            apps.push(Some(app));
-            diagnostics.push(diagnostic);
-            tasks.push(Some(tokio::spawn(node.run())));
+        let mut nodes: Vec<_> = nodes.into_iter().map(Some).collect();
+        let mut apps: Vec<_> = (0..NODE_COUNT).map(|_| None).collect();
+        let mut diagnostics: Vec<_> = (0..NODE_COUNT).map(|_| None).collect();
+        let mut tasks: Vec<_> = (0..NODE_COUNT).map(|_| None).collect();
+        for (index, node_slot) in nodes.iter_mut().enumerate().skip(LEAF_COUNT) {
+            let (node, _, _, app, diagnostic) = node_slot.take().unwrap();
+            apps[index] = Some(app);
+            diagnostics[index] = Some(diagnostic);
+            tasks[index] = Some(tokio::spawn(node.run()));
         }
+        time::sleep(Duration::from_millis(200)).await;
+        for (leaf, node_slot) in nodes.iter_mut().enumerate().take(LEAF_COUNT) {
+            let (node, _, _, app, diagnostic) = node_slot.take().unwrap();
+            apps[leaf] = Some(app);
+            diagnostics[leaf] = Some(diagnostic);
+            tasks[leaf] = Some(tokio::spawn(node.run()));
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut apps: Vec<_> = apps.into_iter().map(Option::unwrap).map(Some).collect();
+        let diagnostics: Vec<_> = diagnostics.into_iter().map(Option::unwrap).collect();
         let mut tasks = MeshTaskGuard(tasks);
 
         wait_for_mesh_condition(
@@ -7603,12 +7619,31 @@ mod tests {
                         .all(|handle| handle.snapshot().authenticated_peers == LEAF_COUNT)
             },
             "all leaf-to-hub sessions to authenticate",
+            || {
+                let leaf_counts: Vec<_> = diagnostics
+                    .iter()
+                    .take(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                let hub_counts: Vec<_> = diagnostics
+                    .iter()
+                    .skip(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                format!("leaf peer counts {leaf_counts:?}; hub peer counts {hub_counts:?}")
+            },
         )
         .await;
         wait_for_mesh_condition(
             MESH_TIMEOUT,
             || counters.replicated_stores.load(Ordering::Relaxed) > 0,
             "a bounded DHT replication store to traverse the runtime mesh",
+            || {
+                format!(
+                    "replicated store count {}",
+                    counters.replicated_stores.load(Ordering::Relaxed)
+                )
+            },
         )
         .await;
         wait_for_mesh_condition(
@@ -7625,6 +7660,12 @@ mod tests {
                 })
             },
             "two independent accepted attestations for every loopback endpoint",
+            || {
+                format!(
+                    "accepted attestation count {}",
+                    counters.attestations.load(Ordering::Relaxed)
+                )
+            },
         )
         .await;
         assert!(counters.attestations.load(Ordering::Relaxed) >= NODE_COUNT * 2);
@@ -7686,6 +7727,19 @@ mod tests {
                 })
             },
             "HELLO expiry and survivor reconvergence",
+            || {
+                let leaf_counts: Vec<_> = diagnostics
+                    .iter()
+                    .take(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                let hub_counts: Vec<_> = diagnostics
+                    .iter()
+                    .skip(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                format!("leaf peer counts {leaf_counts:?}; hub peer counts {hub_counts:?}")
+            },
         )
         .await;
 
