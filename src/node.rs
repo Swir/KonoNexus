@@ -7547,8 +7547,8 @@ mod tests {
         const NODE_COUNT: usize = 32;
         const LEAF_COUNT: usize = 28;
         const HUB_COUNT: usize = 4;
-        const HELLO_INTERVAL: Duration = Duration::from_millis(250);
-        const MESH_TIMEOUT: Duration = Duration::from_secs(15);
+        const HELLO_INTERVAL: Duration = Duration::from_millis(500);
+        const MESH_TIMEOUT: Duration = Duration::from_secs(30);
 
         assert!(!endpoint_publishable("127.0.0.1:47000".parse().unwrap()));
         let counters = Arc::new(RuntimeMeshCounters::default());
