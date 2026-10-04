@@ -128,7 +128,7 @@ impl NatProfile {
             order: VecDeque::new(),
             filter_helpers: HashSet::new(),
             filter_order: VecDeque::new(),
-            max_observers: max_observers.max(1),
+            max_observers: max_observers.clamp(1, DEFAULT_MAX_NAT_OBSERVERS),
         }
     }
 

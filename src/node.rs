@@ -688,11 +688,16 @@ impl KonoNode {
                 }
             }
             MessageBody::HelloAck {
-                observed_endpoint, ..
+                observed_endpoint,
+                features,
             } => {
                 if !self.is_expected_endpoint(source) {
                     debug!(%source, "ignoring unsolicited HELLO_ACK");
                     return Ok(());
+                }
+
+                if features.is_empty() {
+                    debug!(peer = %sender_node_id, "HELLO_ACK advertised no capabilities");
                 }
 
                 self.record_peer(&envelope, source);

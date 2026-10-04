@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">KonoNexus</title>
+  <desc id="desc">KonoNexus — experimental serverless KNP mesh networking core by SWIR</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#02050A"/><stop offset=".55" stop-color="#07111C"/><stop offset="1" stop-color="#02050A"/></linearGradient>
+    <linearGradient id="wire" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#62E5FF"/><stop offset=".58" stop-color="#0088FF"/><stop offset="1" stop-color="#8E6BFF"/></linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#173049" stroke-width="1" opacity=".32"/></pattern>
+  </defs>
+  <rect width="1200" height="320" rx="28" fill="url(#bg)"/>
+  <rect width="1200" height="320" rx="28" fill="url(#grid)"/>
+  <g transform="translate(90 54)" fill="none" stroke="url(#wire)" filter="url(#glow)">
+    <path d="M38 105L112 46 190 90 250 28 322 74 272 150 176 170 96 154Z" stroke-width="5" opacity=".92"/>
+    <path d="M112 46L176 170M190 90L96 154M190 90L272 150M250 28L322 74" stroke-width="3" opacity=".62"/>
+    <g fill="#07111C" stroke-width="6">
+      <circle cx="38" cy="105" r="13"/><circle cx="112" cy="46" r="13"/><circle cx="190" cy="90" r="16"/>
+      <circle cx="250" cy="28" r="12"/><circle cx="322" cy="74" r="13"/><circle cx="272" cy="150" r="14"/>
+      <circle cx="176" cy="170" r="13"/><circle cx="96" cy="154" r="12"/>
+    </g>
+  </g>
+  <text x="475" y="78" fill="#62E5FF" font-family="Segoe UI,Arial,sans-serif" font-size="18" font-weight="700" letter-spacing="4">SWIR PROJECT</text>
+  <text x="475" y="154" fill="#F4FAFF" font-family="Segoe UI,Arial,sans-serif" font-size="62" font-weight="800">KonoNexus</text>
+  <text x="477" y="200" fill="#BBD2DF" font-family="Segoe UI,Arial,sans-serif" font-size="24">Serverless mesh networking core for KNP</text>
+  <text x="477" y="242" fill="#62E5FF" font-family="Segoe UI,Arial,sans-serif" font-size="17" letter-spacing="1.5">RUST • AUTHENTICATED PEERS • DIRECT + RELAY PATHS</text>
+  <path d="M475 266H1080" stroke="url(#wire)" stroke-width="3" stroke-linecap="round"/>
+</svg>

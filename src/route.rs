@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 pub const MAX_RELAY_ROUTE_CANDIDATES: usize = 3;
+const MAX_ROUTE_HEALTH_ENTRIES: usize = 2048;
+const ROUTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlRoute {
     Direct(SocketAddr),
     Relay {
@@ -47,9 +50,19 @@ struct ActiveRoute {
     generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RouteHealth {
+    last_failure: Option<Instant>,
+    successes: u32,
+    failures: u32,
+    touch: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct RouteController {
     active: HashMap<String, ActiveRoute>,
+    health: HashMap<(String, ControlRoute), RouteHealth>,
+    health_touch: u64,
 }
 
 impl RouteController {
@@ -170,14 +183,80 @@ impl RouteController {
         matches
     }
 
+    pub fn report_success(&mut self, peer_node_id: &str, route: ControlRoute) {
+        self.health_touch = self.health_touch.saturating_add(1);
+        let health = self
+            .health
+            .entry((peer_node_id.to_owned(), route))
+            .or_default();
+        health.successes = health.successes.saturating_add(1);
+        health.last_failure = None;
+        health.touch = self.health_touch;
+        self.evict_health_if_needed();
+    }
+
+    pub fn report_failure(&mut self, peer_node_id: &str, route: ControlRoute, now: Instant) {
+        self.health_touch = self.health_touch.saturating_add(1);
+        let health = self
+            .health
+            .entry((peer_node_id.to_owned(), route))
+            .or_default();
+        health.failures = health.failures.saturating_add(1);
+        health.last_failure = Some(now);
+        health.touch = self.health_touch;
+        self.evict_health_if_needed();
+    }
+
+    pub fn route_on_cooldown(&self, peer_node_id: &str, route: ControlRoute, now: Instant) -> bool {
+        self.health
+            .get(&(peer_node_id.to_owned(), route))
+            .and_then(|health| health.last_failure)
+            .is_some_and(|failed_at| {
+                now.saturating_duration_since(failed_at) < ROUTE_FAILURE_COOLDOWN
+            })
+    }
+
+    fn evict_health_if_needed(&mut self) {
+        while self.health.len() > MAX_ROUTE_HEALTH_ENTRIES {
+            let victim = self
+                .health
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.touch
+                        .cmp(&right.touch)
+                        .then_with(|| left_key.0.cmp(&right_key.0))
+                        .then_with(|| {
+                            route_order_key(left_key.1).cmp(&route_order_key(right_key.1))
+                        })
+                })
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            self.health.remove(&victim);
+        }
+    }
+
     pub fn forget_peer(&mut self, peer_node_id: &str) {
         self.active.remove(peer_node_id);
+        self.health
+            .retain(|(stored_peer, _), _| stored_peer != peer_node_id);
     }
 
     pub fn active_route(&self, peer_node_id: &str) -> Option<ControlRoute> {
         self.active
             .get(peer_node_id)
             .and_then(|active| active.route)
+    }
+}
+
+fn route_order_key(route: ControlRoute) -> (u8, SocketAddr, u64) {
+    match route {
+        ControlRoute::Direct(endpoint) => (0, endpoint, 0),
+        ControlRoute::Relay {
+            relay_endpoint,
+            circuit_id,
+        } => (1, relay_endpoint, circuit_id),
     }
 }
 
@@ -313,6 +392,48 @@ mod tests {
                 circuit_id: 1,
             }
         );
+    }
+
+    #[test]
+    fn route_failure_cooldown_and_success_recovery_are_deterministic() {
+        let mut controller = RouteController::default();
+        let peer = "knp1peer";
+        let route = ControlRoute::Direct("127.0.0.50:47000".parse().unwrap());
+        let now = Instant::now();
+
+        controller.report_failure(peer, route, now);
+        assert!(controller.route_on_cooldown(peer, route, now + Duration::from_secs(4)));
+        assert!(!controller.route_on_cooldown(peer, route, now + Duration::from_secs(5)));
+
+        controller.report_success(peer, route);
+        assert!(!controller.route_on_cooldown(peer, route, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn route_health_is_bounded_and_forget_peer_clears_it() {
+        let mut controller = RouteController::default();
+        let now = Instant::now();
+
+        for index in 0..=MAX_ROUTE_HEALTH_ENTRIES {
+            let peer = format!("knp1peer{index:04}");
+            let endpoint: SocketAddr = format!("127.0.0.1:{}", 10000 + index).parse().unwrap();
+            controller.report_failure(&peer, ControlRoute::Direct(endpoint), now);
+        }
+
+        assert_eq!(controller.health.len(), MAX_ROUTE_HEALTH_ENTRIES);
+
+        let peer = "knp1forget";
+        let route = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
+        controller.report_failure(peer, route, now);
+        assert!(controller
+            .health
+            .keys()
+            .any(|(stored_peer, _)| stored_peer == peer));
+        controller.forget_peer(peer);
+        assert!(!controller
+            .health
+            .keys()
+            .any(|(stored_peer, _)| stored_peer == peer));
     }
 
     #[test]
