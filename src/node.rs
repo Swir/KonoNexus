@@ -1378,7 +1378,7 @@ impl KonoNode {
 
                 if replication_hops_remaining > 0
                     && (record_was_new || stored_attestations > 0)
-                    && self.allow_dht_replication(&sender_node_id, Instant::now())
+                    && self.allow_dht_replication(sender_node_id, Instant::now())
                 {
                     if let Some(current) = self.dht.get(&record_node_id).cloned() {
                         self.replicate_dht_record(source, &current, replication_hops_remaining - 1);
