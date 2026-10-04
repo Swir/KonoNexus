@@ -25,7 +25,7 @@
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
 | Source version | `0.1.0-alpha.16` |
-| Roadmap | **40 / 49 = 81.6%** |
+| Roadmap | **41 / 49 = 83.7%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -147,7 +147,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 40 / 49 items complete (**81.6%**). This number is derived from the checklist below; documentation-only changes do not increase it.
+**Verified roadmap progress:** 41 / 49 items complete (**83.7%**). This number is derived from the checklist below; documentation-only changes do not increase it.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -187,7 +187,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Bounded alternate relay selection across up to 3 encrypted peers
 - [x] Live RelayApp direct↔relay migration with direct preference
 - [x] Multi-relay routing and full control-plane path migration
-- [ ] Path scoring and self-healing routing
+- [x] Path scoring and self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
 - [x] Direct KNP session key rotation with 30-second grace window
