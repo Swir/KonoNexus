@@ -19,8 +19,9 @@ KonoNexus assumes that the public Internet, arbitrary peers, and future relay no
 - bounded pending-punch state (128 schedules),
 - rejection of loopback/unspecified/multicast/broadcast rendezvous targets,
 - bounded automatic rendezvous coordinator attempts and per-requester coordinator cooldown,
-- consent-based third-peer filtering probes with Ed25519 authorization bound to endpoint, helper and token,
-- target-side verification that a coordinator proposal matches that coordinator's previously observed endpoint,
+- consent-based three-cell filtering probes with versioned Ed25519 authorization bound to target identity/endpoint, coordinator and baseline endpoint, helper, source class, trial and token,
+- target-side verification that a coordinator proposal matches that coordinator's previously observed endpoint and that an observed probe's actual source relationship matches its authorized class,
+- one-shot filtering authorizations plus bounded authorization, pending-state, replay, signature-verification, per-coordinator, per-target, global-rate, recent-egress, and evidence windows,
 - signed short-lived DHT peer records with NodeID/public-key binding,
 - bounded DHT table (4,096) and response size (8), TTL limits, and rollback rejection,
 - DHT endpoints restricted to publishable public addresses,
@@ -65,7 +66,8 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 
 - timed hole punching is implemented but has not yet been validated across a wide NAT matrix,
 - no port-prediction or safe alternate-candidate strategy exists,
-- positive endpoint-independent filtering evidence is supported, but negative results remain intentionally inconclusive,
+- positive observations are supported for the exact contacted-endpoint control, same-IP/different-port, and different previously-uncontacted-address cells; timeout, unavailable and send-failed results remain intentionally inconclusive,
+- filtering-matrix localhost and CI tests are not evidence for real WAN, NAT, or CGNAT behavior,
 - authenticated secure frames tolerate reordering only within the 128-sequence receive window; duplicates and frames older than that window are rejected,
 - periodic fresh-X25519 key rotation with bounded retries and previous-session grace is implemented for direct KNP and relay-inner E2E sessions,
 - DHT endpoint activation requires matching short-lived attestations signed by two independent observer identities, but identity count alone is not a Sybil-resistant quorum,
@@ -81,7 +83,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 ## Required before production
 
 - stronger long-window per-peer rendezvous/filter-test rate limits,
-- wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
+- real multi-network/NAT/CGNAT validation of the implemented matrix and loss-tolerant repeated field evidence,
 - Sybil-resistant endpoint-attestation quorum and routing diversity stronger than observed-prefix grouping,
 - selective RelayApp recovery, longer-window relay abuse accounting, adaptive per-peer quotas, and multi-relay/control-plane failover hardening,
 - secure key-file permissions,

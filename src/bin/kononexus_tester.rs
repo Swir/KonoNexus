@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use kononexus::{
-    InviteCode, KonofixSdkConfig, KonofixTransport, NatFilteringEvidence, NatMappingBehavior,
-    NetworkDiagnostics, NodeIdentity, PathMethod, RelayAppEvent,
+    FilterCellStatus, InviteCode, KonofixSdkConfig, KonofixTransport, NatFilteringEvidence,
+    NatMappingBehavior, NetworkDiagnostics, NodeIdentity, PathMethod, RelayAppEvent,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -565,6 +565,21 @@ fn technical_details(ui: &mut egui::Ui, app: &TesterApp) {
                 );
                 detail(
                     ui,
+                    "Filter: contacted endpoint",
+                    filter_cell_label(snapshot.filtering_matrix.contacted_endpoint),
+                );
+                detail(
+                    ui,
+                    "Filter: same address, different port",
+                    filter_cell_label(snapshot.filtering_matrix.same_address_different_port),
+                );
+                detail(
+                    ui,
+                    "Filter: different address",
+                    filter_cell_label(snapshot.filtering_matrix.different_address),
+                );
+                detail(
+                    ui,
                     "Authenticated peers",
                     &snapshot.authenticated_peers.to_string(),
                 );
@@ -622,9 +637,27 @@ fn nat_label(behavior: NatMappingBehavior) -> &'static str {
 
 fn filtering_label(evidence: NatFilteringEvidence) -> &'static str {
     match evidence {
-        NatFilteringEvidence::Unknown => "Unknown / inconclusive",
+        NatFilteringEvidence::Unknown => "Unknown / no evidence",
+        NatFilteringEvidence::Inconclusive => "Inconclusive",
+        NatFilteringEvidence::ContactedEndpointObserved => "Contacted endpoint observed",
+        NatFilteringEvidence::SameAddressDifferentPortObserved => {
+            "Same address, different port observed"
+        }
         NatFilteringEvidence::EndpointIndependentObserved => "Endpoint-independent observed",
         NatFilteringEvidence::EndpointIndependentRepeated => "Endpoint-independent repeated",
+    }
+}
+
+fn filter_cell_label(status: FilterCellStatus) -> &'static str {
+    match status {
+        FilterCellStatus::Unknown => "Unknown / no evidence",
+        FilterCellStatus::Observed => "Observed",
+        FilterCellStatus::InconclusiveTimedOut => "Inconclusive — timed out",
+        FilterCellStatus::InconclusiveControlCorrelatedTimeout => {
+            "Inconclusive — timed out (control observed)"
+        }
+        FilterCellStatus::InconclusiveUnavailable => "Inconclusive — helper unavailable",
+        FilterCellStatus::InconclusiveSendFailed => "Inconclusive — send failed",
     }
 }
 

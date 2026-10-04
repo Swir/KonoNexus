@@ -1,4 +1,5 @@
 use crate::identity::{node_id_from_public_key, NodeIdentity, PUBLIC_KEY_LEN, SIGNATURE_LEN};
+use crate::nat::FilterProbeClass;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +45,16 @@ pub enum MessageBody {
         probe_token: u64,
     },
     FilterProbeAck {
+        probe_token: u64,
+    },
+    FilteringMatrixProbe {
+        trial_id: u64,
+        probe_class: FilterProbeClass,
+        probe_token: u64,
+    },
+    FilteringMatrixProbeAck {
+        trial_id: u64,
+        probe_class: FilterProbeClass,
         probe_token: u64,
     },
     Ping {
@@ -202,5 +213,29 @@ mod tests {
         assert_eq!(decoded.sender_node_id, envelope.sender_node_id);
         assert_eq!(decoded.body, envelope.body);
         decoded.verify().expect("decoded packet should verify");
+    }
+
+    #[test]
+    fn filtering_matrix_probe_variants_round_trip_with_signatures() {
+        let identity = NodeIdentity::generate();
+        let variants = [
+            MessageBody::FilteringMatrixProbe {
+                trial_id: 7,
+                probe_class: FilterProbeClass::DifferentAddress,
+                probe_token: 11,
+            },
+            MessageBody::FilteringMatrixProbeAck {
+                trial_id: 7,
+                probe_class: FilterProbeClass::SameAddressDifferentPort,
+                probe_token: 12,
+            },
+        ];
+
+        for (nonce, body) in variants.into_iter().enumerate() {
+            let envelope = WireEnvelope::signed(&identity, nonce as u64, body).unwrap();
+            let decoded = WireEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+            assert_eq!(decoded.body, envelope.body);
+            decoded.verify().unwrap();
+        }
     }
 }

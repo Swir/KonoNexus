@@ -29,7 +29,10 @@ pub use konofix_sdk::{KonofixSdkConfig, KonofixTransport};
 pub use konomind::{
     KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
 };
-pub use nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
+pub use nat::{
+    FilterCellStatus, FilterMatrixSnapshot, FilterProbeAuthorization, NatFilteringEvidence,
+    NatMappingBehavior, NatProfile,
+};
 pub use node::{
     KonoNode, NetworkDiagnostics, NetworkDiagnosticsHandle, PathDiagnostic, PathMethod, PeerInfo,
     RelayAppHandle,

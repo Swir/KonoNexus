@@ -7,7 +7,11 @@ use crate::dht::{
     MIN_ENDPOINT_ATTESTATION_OBSERVERS,
 };
 use crate::identity::NodeIdentity;
-use crate::nat::{FilterProbeAuthorization, NatFilteringEvidence, NatMappingBehavior, NatProfile};
+use crate::nat::{
+    FilterMatrixSnapshot, FilterProbeClass, FilterProbeOutcome, FilteringMatrixAuthorization,
+    NatFilteringEvidence, NatMappingBehavior, NatProfile, FILTERING_MATRIX_AUTH_TTL_MS,
+    FILTERING_MATRIX_CLOCK_SKEW_MS,
+};
 use crate::protocol::{MessageBody, WireEnvelope, MAX_PACKET_SIZE};
 use crate::punch::{PunchSchedule, PUNCH_AUTH_TTL};
 use crate::relay::{RelayManager, MAX_RELAY_CIRCUITS, RELAY_CIRCUIT_TTL};
@@ -28,11 +32,13 @@ use crate::routing_cache::{
     MAX_ROUTING_BOOTSTRAP_HINTS,
 };
 use crate::security::{CookieGuard, ReplayGuard, SequenceWindow};
-use crate::session::{respond_handshake, PendingHandshake, SecurePayload, SessionSlot};
+use crate::session::{
+    respond_handshake, FilteringMatrixFailure, PendingHandshake, SecurePayload, SessionSlot,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -44,9 +50,24 @@ use tracing::{debug, info, warn};
 const MAX_ACTIVE_PEERS: usize = 2_048;
 const MAX_PENDING_PUNCHES: usize = 128;
 const MAX_PENDING_FILTER_PROBES: usize = 64;
+const MAX_PENDING_FILTER_TRIALS: usize = 32;
 const RENDEZVOUS_REQUEST_COOLDOWN: Duration = Duration::from_secs(1);
 const FILTER_TEST_REQUEST_COOLDOWN: Duration = Duration::from_secs(10);
 const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
+const FILTER_AUTHORIZATION_REPLAY_RETENTION: Duration =
+    Duration::from_millis(FILTERING_MATRIX_AUTH_TTL_MS + FILTERING_MATRIX_CLOCK_SKEW_MS);
+const FILTER_MATRIX_TRIAL_TTL: Duration = Duration::from_secs(12);
+const FILTER_PROBE_RATE_WINDOW: Duration = Duration::from_secs(60);
+const FILTER_PROBE_RATE_RETENTION: Duration = Duration::from_secs(10 * 60);
+const FILTER_PROBE_COORDINATOR_LIMIT: u16 = 12;
+const FILTER_PROBE_TARGET_GROUP_LIMIT: u16 = 32;
+const FILTER_PROBE_GLOBAL_LIMIT: u16 = 128;
+const FILTER_PROBE_AUTH_ATTEMPT_LIMIT: u16 = 32;
+const FILTER_PROBE_AUTH_ATTEMPT_GLOBAL_LIMIT: u16 = 256;
+const MAX_FILTER_PROBE_RATE_STATES: usize = 1_024;
+const MAX_USED_FILTER_AUTHORIZATIONS: usize = 1_024;
+const FILTER_CONTACT_HISTORY_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_FILTER_CONTACT_HISTORY: usize = 4_096;
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
@@ -129,6 +150,7 @@ pub struct NetworkDiagnostics {
     pub observed_external_endpoint: Option<SocketAddr>,
     pub nat_behavior: NatMappingBehavior,
     pub filtering_evidence: NatFilteringEvidence,
+    pub filtering_matrix: FilterMatrixSnapshot,
     pub authenticated_peers: usize,
     pub dht_records: usize,
     pub active_paths: Vec<PathDiagnostic>,
@@ -260,17 +282,92 @@ struct ResponderRekeyAck {
 
 #[derive(Debug, Clone)]
 struct PendingFilterProbe {
-    expected_helper_node_id: String,
+    authorization: FilteringMatrixAuthorization,
     expires_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct PendingFilterConsent {
+    trial_id: u64,
+    probe_class: FilterProbeClass,
+    probe_token: u64,
     requester_endpoint: SocketAddr,
     requester_node_id: String,
-    helper_endpoint: SocketAddr,
+    helper_endpoint: Option<SocketAddr>,
     helper_node_id: String,
     expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingFilterTrial {
+    coordinator_endpoint: SocketAddr,
+    coordinator_node_id: String,
+    target_endpoint: SocketAddr,
+    seen_classes: HashSet<FilterProbeClass>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FilterAuthorizationUseKey {
+    target_node_id: String,
+    coordinator_node_id: String,
+    helper_node_id: String,
+    trial_id: u64,
+    class: FilterProbeClass,
+    probe_token: u64,
+}
+
+impl From<&FilteringMatrixAuthorization> for FilterAuthorizationUseKey {
+    fn from(authorization: &FilteringMatrixAuthorization) -> Self {
+        Self {
+            target_node_id: authorization.target_node_id.clone(),
+            coordinator_node_id: authorization.coordinator_node_id.clone(),
+            helper_node_id: authorization.helper_node_id.clone(),
+            trial_id: authorization.trial_id,
+            class: authorization.class,
+            probe_token: authorization.probe_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FilterProbeRateWindow {
+    window_started_at: Instant,
+    last_seen: Instant,
+    count: u16,
+}
+
+impl FilterProbeRateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            last_seen: now,
+            count: 0,
+        }
+    }
+
+    fn count_at(&self, now: Instant) -> u16 {
+        if now
+            .checked_duration_since(self.window_started_at)
+            .is_none_or(|age| age >= FILTER_PROBE_RATE_WINDOW)
+        {
+            0
+        } else {
+            self.count
+        }
+    }
+
+    fn increment_at(&mut self, now: Instant) {
+        if now
+            .checked_duration_since(self.window_started_at)
+            .is_none_or(|age| age >= FILTER_PROBE_RATE_WINDOW)
+        {
+            self.window_started_at = now;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.last_seen = now;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -434,8 +531,17 @@ pub struct KonoNode {
     queued_rendezvous: HashMap<SocketAddr, Vec<String>>,
     auto_rendezvous: HashMap<String, AutoRendezvousState>,
     queued_filter_tests: HashSet<SocketAddr>,
+    pending_filter_trials: HashMap<u64, PendingFilterTrial>,
     pending_filter_probes: HashMap<u64, PendingFilterProbe>,
     pending_filter_consents: HashMap<u64, PendingFilterConsent>,
+    used_filter_authorizations: HashMap<FilterAuthorizationUseKey, Instant>,
+    filter_probe_auth_attempt_windows: HashMap<String, FilterProbeRateWindow>,
+    filter_probe_auth_attempt_global_window: FilterProbeRateWindow,
+    filter_probe_coordinator_windows: HashMap<String, FilterProbeRateWindow>,
+    filter_probe_target_windows: HashMap<DhtNetworkGroup, FilterProbeRateWindow>,
+    filter_probe_global_window: FilterProbeRateWindow,
+    recent_egress_ips: HashMap<IpAddr, Instant>,
+    filter_contact_history_saturated_until: Option<Instant>,
     last_rendezvous_request: HashMap<SocketAddr, Instant>,
     last_filter_test_request: HashMap<SocketAddr, Instant>,
     dht: DhtTable,
@@ -514,8 +620,17 @@ impl KonoNode {
             queued_rendezvous: HashMap::new(),
             auto_rendezvous: HashMap::new(),
             queued_filter_tests: HashSet::new(),
+            pending_filter_trials: HashMap::new(),
             pending_filter_probes: HashMap::new(),
             pending_filter_consents: HashMap::new(),
+            used_filter_authorizations: HashMap::new(),
+            filter_probe_auth_attempt_windows: HashMap::new(),
+            filter_probe_auth_attempt_global_window: FilterProbeRateWindow::new(now),
+            filter_probe_coordinator_windows: HashMap::new(),
+            filter_probe_target_windows: HashMap::new(),
+            filter_probe_global_window: FilterProbeRateWindow::new(now),
+            recent_egress_ips: HashMap::new(),
+            filter_contact_history_saturated_until: None,
             last_rendezvous_request: HashMap::new(),
             last_filter_test_request: HashMap::new(),
             dht: DhtTable::default(),
@@ -737,6 +852,7 @@ impl KonoNode {
                     self.publish_diagnostics();
                 }
                 _ = rendezvous_ticker.tick() => {
+                    self.expire_filtering_matrix_state();
                     self.drive_session_handshakes().await;
                     self.drive_session_rekeys().await;
                     self.drive_relay_e2e_rekeys().await;
@@ -1163,36 +1279,11 @@ impl KonoNode {
                 self.maybe_start_session(source, &sender_node_id).await?;
             }
             MessageBody::FilterProbe { probe_token } => {
-                let authorized =
-                    self.pending_filter_probes
-                        .get(&probe_token)
-                        .is_some_and(|pending| {
-                            pending.expected_helper_node_id == sender_node_id
-                                && pending.expires_at > Instant::now()
-                        });
-                if !authorized {
-                    debug!(
-                        peer = %sender_node_id,
-                        %source,
-                        probe_token,
-                        "ignoring unauthorized filter probe"
-                    );
-                    return Ok(());
-                }
-
-                self.pending_filter_probes.remove(&probe_token);
-                self.nat_profile
-                    .record_endpoint_independent_probe(sender_node_id.clone());
-
-                self.send(source, MessageBody::FilterProbeAck { probe_token })
-                    .await?;
-
-                info!(
-                    helper = %sender_node_id,
+                debug!(
+                    peer = %sender_node_id,
                     %source,
                     probe_token,
-                    filtering = ?self.nat_profile.filtering_evidence(),
-                    "received authorized independent-endpoint filter probe"
+                    "ignored legacy filter probe; matrix-v1 authorization is required"
                 );
             }
             MessageBody::FilterProbeAck { probe_token } => {
@@ -1202,6 +1293,72 @@ impl KonoNode {
                     probe_token,
                     "filter probe acknowledged"
                 );
+            }
+            MessageBody::FilteringMatrixProbe {
+                trial_id,
+                probe_class,
+                probe_token,
+            } => {
+                let Some(pending) = self.pending_filter_probes.get(&probe_token).cloned() else {
+                    debug!(peer = %sender_node_id, %source, probe_token, "ignored unsolicited filtering matrix probe");
+                    return Ok(());
+                };
+                let authorization = &pending.authorization;
+                if pending.expires_at <= Instant::now()
+                    || authorization.trial_id != trial_id
+                    || authorization.class != probe_class
+                    || authorization.probe_token != probe_token
+                    || authorization.helper_node_id != sender_node_id
+                    || !self.filter_probe_endpoint_allowed(source)
+                {
+                    debug!(peer = %sender_node_id, %source, trial_id, probe_token, "ignored mismatched filtering matrix probe");
+                    return Ok(());
+                }
+                if probe_class == FilterProbeClass::DifferentAddress
+                    && (self
+                        .peers
+                        .keys()
+                        .any(|endpoint| ip_equivalent(endpoint.ip(), source.ip()))
+                        || self.filter_probe_source_was_contacted(source.ip(), Instant::now()))
+                {
+                    debug!(peer = %sender_node_id, %source, "different-address helper source was previously contacted");
+                    return Ok(());
+                }
+                if let Err(error) = self.nat_profile.record_filter_probe(
+                    authorization,
+                    Some(source),
+                    FilterProbeOutcome::Observed,
+                ) {
+                    debug!(peer = %sender_node_id, %source, %error, "rejected filtering matrix evidence");
+                    return Ok(());
+                }
+
+                self.pending_filter_probes.remove(&probe_token);
+                self.send(
+                    source,
+                    MessageBody::FilteringMatrixProbeAck {
+                        trial_id,
+                        probe_class,
+                        probe_token,
+                    },
+                )
+                .await?;
+                info!(
+                    helper = %sender_node_id,
+                    %source,
+                    ?probe_class,
+                    trial_id,
+                    probe_token,
+                    filtering = ?self.nat_profile.filtering_evidence(),
+                    "recorded consent-bound filtering matrix observation"
+                );
+            }
+            MessageBody::FilteringMatrixProbeAck {
+                trial_id,
+                probe_class,
+                probe_token,
+            } => {
+                debug!(peer = %sender_node_id, %source, ?probe_class, trial_id, probe_token, "filtering matrix probe acknowledged");
             }
             MessageBody::Ping { token } => {
                 if self.peers.contains_key(&source) && !self.confirmed_sessions.contains(&source) {
@@ -1384,7 +1541,8 @@ impl KonoNode {
                 }
             }
             SecurePayload::FilteringTestRequest => {
-                self.handle_filtering_test_request(source, sender_node_id)
+                debug!(peer = %sender_node_id, "legacy filtering probe requested; matrix-v1 is required");
+                self.send_secure_payload(source, SecurePayload::FilteringTestUnavailable)
                     .await?;
             }
             SecurePayload::FilteringTestProposal {
@@ -1392,27 +1550,95 @@ impl KonoNode {
                 target_endpoint,
                 probe_token,
             } => {
-                self.handle_filtering_test_proposal(
+                debug!(
+                    coordinator = %sender_node_id,
+                    %helper_node_id,
+                    %target_endpoint,
+                    probe_token,
+                    "ignored legacy filtering proposal; matrix-v1 is required"
+                );
+            }
+            SecurePayload::FilteringTestConsent { authorization } => {
+                debug!(
+                    peer = %sender_node_id,
+                    probe_token = authorization.probe_token,
+                    "ignored legacy filtering consent; matrix-v1 is required"
+                );
+            }
+            SecurePayload::FilteringTestSend { authorization } => {
+                debug!(
+                    coordinator = %sender_node_id,
+                    probe_token = authorization.probe_token,
+                    "rejected legacy helper send; matrix-v1 authorization is required"
+                );
+            }
+            SecurePayload::FilteringTestUnavailable => {
+                debug!(
+                    coordinator = %sender_node_id,
+                    "legacy filtering test unavailable from this coordinator"
+                );
+            }
+            SecurePayload::FilteringMatrixRequest { trial_id } => {
+                self.handle_filtering_matrix_request(source, sender_node_id, trial_id)
+                    .await?;
+            }
+            SecurePayload::FilteringMatrixProposal {
+                trial_id,
+                probe_class,
+                helper_node_id,
+                target_endpoint,
+                probe_token,
+            } => {
+                self.handle_filtering_matrix_proposal(
                     source,
                     sender_node_id,
+                    trial_id,
+                    probe_class,
                     &helper_node_id,
                     &target_endpoint,
                     probe_token,
                 )
                 .await?;
             }
-            SecurePayload::FilteringTestConsent { authorization } => {
-                self.handle_filtering_test_consent(source, sender_node_id, authorization)
+            SecurePayload::FilteringMatrixConsent { authorization } => {
+                self.handle_filtering_matrix_consent(source, sender_node_id, authorization)
                     .await?;
             }
-            SecurePayload::FilteringTestSend { authorization } => {
-                self.handle_filtering_test_send(source, sender_node_id, authorization)
+            SecurePayload::FilteringMatrixSend { authorization } => {
+                self.handle_filtering_matrix_send(source, sender_node_id, authorization)
                     .await?;
             }
-            SecurePayload::FilteringTestUnavailable => {
-                debug!(
-                    coordinator = %sender_node_id,
-                    "filtering test unavailable from this coordinator"
+            SecurePayload::FilteringMatrixSendResult {
+                trial_id,
+                probe_class,
+                probe_token,
+                accepted,
+                failure,
+            } => {
+                self.handle_filtering_matrix_send_result(
+                    source,
+                    sender_node_id,
+                    trial_id,
+                    probe_class,
+                    probe_token,
+                    accepted,
+                    failure,
+                )
+                .await?;
+            }
+            SecurePayload::FilteringMatrixUnavailable {
+                trial_id,
+                probe_class,
+                probe_token,
+                failure,
+            } => {
+                self.handle_filtering_matrix_unavailable(
+                    source,
+                    sender_node_id,
+                    trial_id,
+                    probe_class,
+                    probe_token,
+                    failure,
                 );
             }
             SecurePayload::RelayAppFragment { fragment } => {
@@ -2828,6 +3054,7 @@ impl KonoNode {
             observed_external_endpoint: self.observed_external_endpoint(),
             nat_behavior: self.nat_behavior(),
             filtering_evidence: self.nat_filtering_evidence(),
+            filtering_matrix: self.nat_profile.filter_matrix_snapshot(),
             authenticated_peers: self.confirmed_sessions.len(),
             dht_records: self.dht_record_count(),
             active_paths,
@@ -3031,19 +3258,76 @@ impl KonoNode {
     }
 
     async fn flush_filter_test_request(&mut self, coordinator: SocketAddr) -> Result<()> {
-        if self.queued_filter_tests.remove(&coordinator) {
-            self.send_secure_payload(coordinator, SecurePayload::FilteringTestRequest)
-                .await?;
+        if !self.queued_filter_tests.remove(&coordinator) {
+            return Ok(());
+        }
+        if !self.peer_supports_feature(coordinator, "filtering-matrix-v1") {
+            debug!(%coordinator, "peer does not support filtering-matrix-v1");
+            return Ok(());
+        }
+        if self.pending_filter_trials.len() >= MAX_PENDING_FILTER_TRIALS {
+            debug!(%coordinator, "filtering matrix trial capacity reached");
+            return Ok(());
+        }
+
+        let Some(coordinator_node_id) = self
+            .peers
+            .get(&coordinator)
+            .map(|peer| peer.node_id.clone())
+        else {
+            return Ok(());
+        };
+        let Some(target_endpoint) = self.nat_profile.endpoint_seen_by(&coordinator_node_id) else {
+            debug!(%coordinator, "coordinator has not supplied a target mapping observation");
+            return Ok(());
+        };
+        if !self.filter_probe_endpoint_allowed(target_endpoint) {
+            debug!(%target_endpoint, "refused filtering matrix for unsafe target mapping");
+            return Ok(());
+        }
+
+        let Some(trial_id) = (0..8)
+            .map(|_| random())
+            .find(|trial_id| !self.pending_filter_trials.contains_key(trial_id))
+        else {
+            return Ok(());
+        };
+        self.pending_filter_trials.insert(
+            trial_id,
+            PendingFilterTrial {
+                coordinator_endpoint: coordinator,
+                coordinator_node_id,
+                target_endpoint,
+                seen_classes: HashSet::new(),
+                expires_at: Instant::now() + FILTER_MATRIX_TRIAL_TTL,
+            },
+        );
+
+        if let Err(error) = self
+            .send_secure_payload(
+                coordinator,
+                SecurePayload::FilteringMatrixRequest { trial_id },
+            )
+            .await
+        {
+            self.pending_filter_trials.remove(&trial_id);
+            return Err(error);
         }
         Ok(())
     }
 
-    async fn handle_filtering_test_request(
+    async fn handle_filtering_matrix_request(
         &mut self,
         requester_endpoint: SocketAddr,
         requester_node_id: &str,
+        trial_id: u64,
     ) -> Result<()> {
         let now = Instant::now();
+        if !self.confirmed_sessions.contains(&requester_endpoint)
+            || !self.peer_supports_feature(requester_endpoint, "filtering-matrix-v1")
+        {
+            return Ok(());
+        }
         if self
             .last_filter_test_request
             .get(&requester_endpoint)
@@ -3054,104 +3338,234 @@ impl KonoNode {
         self.last_filter_test_request
             .insert(requester_endpoint, now);
 
-        if self.pending_filter_consents.len() >= MAX_PENDING_FILTER_PROBES {
-            self.send_secure_payload(requester_endpoint, SecurePayload::FilteringTestUnavailable)
-                .await?;
+        if !self.filter_probe_endpoint_allowed(requester_endpoint) {
+            self.send_filtering_matrix_unavailable_set(
+                requester_endpoint,
+                trial_id,
+                FilteringMatrixFailure::UnsafeTarget,
+            )
+            .await;
             return Ok(());
         }
 
-        let helper = self
-            .sessions
-            .keys()
+        if self.pending_filter_consents.len().saturating_add(3) > MAX_PENDING_FILTER_PROBES {
+            self.send_filtering_matrix_unavailable_set(
+                requester_endpoint,
+                trial_id,
+                FilteringMatrixFailure::Capacity,
+            )
+            .await;
+            return Ok(());
+        }
+
+        let mut helpers: Vec<(SocketAddr, String)> = self
+            .confirmed_sessions
+            .iter()
             .filter(|endpoint| **endpoint != requester_endpoint)
             .filter_map(|endpoint| {
                 let peer = self.peers.get(endpoint)?;
-                if peer.node_id == requester_node_id || endpoint.ip() == requester_endpoint.ip() {
+                if peer.node_id == requester_node_id
+                    || ip_equivalent(endpoint.ip(), requester_endpoint.ip())
+                    || !peer.features.contains("filtering-matrix-v1")
+                    || !self.filter_probe_endpoint_allowed(*endpoint)
+                {
                     return None;
                 }
                 Some((*endpoint, peer.node_id.clone()))
             })
-            .min_by_key(|(endpoint, _)| *endpoint);
-
-        let Some((helper_endpoint, helper_node_id)) = helper else {
-            self.send_secure_payload(requester_endpoint, SecurePayload::FilteringTestUnavailable)
-                .await?;
-            return Ok(());
+            .collect();
+        helpers.sort_by_key(|(endpoint, node_id)| (*endpoint, node_id.clone()));
+        let helper = if helpers.is_empty() {
+            None
+        } else {
+            let index = (trial_id % helpers.len() as u64) as usize;
+            Some(helpers[index].clone())
         };
 
-        let probe_token = random();
-        self.pending_filter_consents.insert(
-            probe_token,
-            PendingFilterConsent {
-                requester_endpoint,
-                requester_node_id: requester_node_id.to_owned(),
-                helper_endpoint,
-                helper_node_id: helper_node_id.clone(),
-                expires_at: Instant::now() + FILTER_PROBE_STATE_TTL,
-            },
-        );
+        for probe_class in [
+            FilterProbeClass::ContactedEndpoint,
+            FilterProbeClass::SameAddressDifferentPort,
+            FilterProbeClass::DifferentAddress,
+        ] {
+            let Some(probe_token) = (0..8)
+                .map(|_| random())
+                .find(|token| !self.pending_filter_consents.contains_key(token))
+            else {
+                continue;
+            };
 
-        self.send_secure_payload(
-            requester_endpoint,
-            SecurePayload::FilteringTestProposal {
-                helper_node_id,
-                target_endpoint: requester_endpoint.to_string(),
+            let (helper_endpoint, helper_node_id) = match probe_class {
+                FilterProbeClass::ContactedEndpoint
+                | FilterProbeClass::SameAddressDifferentPort => (None, self.node_id()),
+                FilterProbeClass::DifferentAddress => {
+                    let Some((endpoint, node_id)) = helper.clone() else {
+                        let _ = self
+                            .send_secure_payload(
+                                requester_endpoint,
+                                SecurePayload::FilteringMatrixUnavailable {
+                                    trial_id,
+                                    probe_class,
+                                    probe_token,
+                                    failure: FilteringMatrixFailure::NoHelper,
+                                },
+                            )
+                            .await;
+                        continue;
+                    };
+                    (Some(endpoint), node_id)
+                }
+            };
+
+            self.pending_filter_consents.insert(
                 probe_token,
-            },
-        )
-        .await
+                PendingFilterConsent {
+                    trial_id,
+                    probe_class,
+                    probe_token,
+                    requester_endpoint,
+                    requester_node_id: requester_node_id.to_owned(),
+                    helper_endpoint,
+                    helper_node_id: helper_node_id.clone(),
+                    expires_at: now + FILTER_PROBE_STATE_TTL,
+                },
+            );
+            self.send_secure_payload(
+                requester_endpoint,
+                SecurePayload::FilteringMatrixProposal {
+                    trial_id,
+                    probe_class,
+                    helper_node_id,
+                    target_endpoint: requester_endpoint.to_string(),
+                    probe_token,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
-    async fn handle_filtering_test_proposal(
+    async fn send_filtering_matrix_unavailable_set(
+        &mut self,
+        requester_endpoint: SocketAddr,
+        trial_id: u64,
+        failure: FilteringMatrixFailure,
+    ) {
+        for probe_class in [
+            FilterProbeClass::ContactedEndpoint,
+            FilterProbeClass::SameAddressDifferentPort,
+            FilterProbeClass::DifferentAddress,
+        ] {
+            let payload = SecurePayload::FilteringMatrixUnavailable {
+                trial_id,
+                probe_class,
+                probe_token: random(),
+                failure,
+            };
+            if let Err(error) = self.send_secure_payload(requester_endpoint, payload).await {
+                debug!(%requester_endpoint, %error, "failed to report unavailable filtering matrix cell");
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_filtering_matrix_proposal(
         &mut self,
         coordinator: SocketAddr,
         coordinator_node_id: &str,
+        trial_id: u64,
+        probe_class: FilterProbeClass,
         helper_node_id: &str,
-        target_endpoint: &str,
+        target_endpoint_text: &str,
         probe_token: u64,
     ) -> Result<()> {
         if self.pending_filter_probes.len() >= MAX_PENDING_FILTER_PROBES {
             return Ok(());
         }
 
-        let Ok(target_endpoint) = target_endpoint.parse::<SocketAddr>() else {
+        let Some(trial) = self.pending_filter_trials.get(&trial_id).cloned() else {
             return Ok(());
         };
-
-        if self.nat_profile.endpoint_seen_by(coordinator_node_id) != Some(target_endpoint)
-            || self.peer_endpoint_by_node_id(helper_node_id).is_some()
+        let Ok(target_endpoint) = target_endpoint_text.parse::<SocketAddr>() else {
+            return Ok(());
+        };
+        if target_endpoint.to_string() != target_endpoint_text
+            || trial.expires_at <= Instant::now()
+            || trial.coordinator_endpoint != coordinator
+            || trial.coordinator_node_id != coordinator_node_id
+            || trial.target_endpoint != target_endpoint
+            || self.nat_profile.endpoint_seen_by(coordinator_node_id) != Some(target_endpoint)
+            || !self.filter_probe_endpoint_allowed(target_endpoint)
+            || trial.seen_classes.contains(&probe_class)
+            || self.pending_filter_probes.contains_key(&probe_token)
+            || self.pending_filter_probes.values().any(|pending| {
+                pending.authorization.trial_id == trial_id
+                    && pending.authorization.class == probe_class
+            })
         {
             return Ok(());
         }
 
-        let authorization = FilterProbeAuthorization::signed(
+        let helper_valid = match probe_class {
+            FilterProbeClass::ContactedEndpoint | FilterProbeClass::SameAddressDifferentPort => {
+                helper_node_id == coordinator_node_id
+            }
+            FilterProbeClass::DifferentAddress => {
+                helper_node_id != coordinator_node_id
+                    && plausible_node_id(helper_node_id)
+                    && self.peer_endpoint_by_node_id(helper_node_id).is_none()
+            }
+        };
+        if !helper_valid {
+            return Ok(());
+        }
+
+        let authorization = FilteringMatrixAuthorization::signed(
             &self.identity,
             target_endpoint,
+            coordinator_node_id.to_owned(),
+            coordinator,
             helper_node_id.to_owned(),
+            probe_class,
+            trial_id,
             probe_token,
         )?;
         self.pending_filter_probes.insert(
             probe_token,
             PendingFilterProbe {
-                expected_helper_node_id: helper_node_id.to_owned(),
+                authorization: authorization.clone(),
                 expires_at: Instant::now() + FILTER_PROBE_STATE_TTL,
             },
         );
 
-        self.send_secure_payload(
-            coordinator,
-            SecurePayload::FilteringTestConsent { authorization },
-        )
-        .await
+        if let Some(trial) = self.pending_filter_trials.get_mut(&trial_id) {
+            trial.seen_classes.insert(probe_class);
+        }
+        if let Err(error) = self
+            .send_secure_payload(
+                coordinator,
+                SecurePayload::FilteringMatrixConsent {
+                    authorization: authorization.clone(),
+                },
+            )
+            .await
+        {
+            self.pending_filter_probes.remove(&probe_token);
+            let _ = self.nat_profile.record_filter_probe(
+                &authorization,
+                None,
+                FilterProbeOutcome::SendFailed,
+            );
+            return Err(error);
+        }
+        Ok(())
     }
 
-    async fn handle_filtering_test_consent(
+    async fn handle_filtering_matrix_consent(
         &mut self,
         requester_endpoint: SocketAddr,
         sender_node_id: &str,
-        authorization: FilterProbeAuthorization,
+        authorization: FilteringMatrixAuthorization,
     ) -> Result<()> {
-        authorization.verify()?;
         let Some(pending) = self
             .pending_filter_consents
             .get(&authorization.probe_token)
@@ -3160,62 +3574,539 @@ impl KonoNode {
             return Ok(());
         };
 
-        if pending.expires_at <= Instant::now()
+        let now = Instant::now();
+        if pending.expires_at <= now
             || pending.requester_endpoint != requester_endpoint
             || pending.requester_node_id != sender_node_id
+            || pending.trial_id != authorization.trial_id
+            || pending.probe_class != authorization.class
+            || pending.probe_token != authorization.probe_token
             || pending.helper_node_id != authorization.helper_node_id
             || authorization.target_node_id != sender_node_id
             || authorization.target_endpoint != pending.requester_endpoint.to_string()
+            || authorization.coordinator_node_id != self.node_id()
+        {
+            return Ok(());
+        }
+        if !self.allow_filter_probe_auth_attempt(sender_node_id, now)
+            || authorization.verify().is_err()
         {
             return Ok(());
         }
 
-        self.pending_filter_consents
-            .remove(&authorization.probe_token);
-        self.send_secure_payload(
-            pending.helper_endpoint,
-            SecurePayload::FilteringTestSend { authorization },
-        )
-        .await
+        match pending.probe_class {
+            FilterProbeClass::ContactedEndpoint | FilterProbeClass::SameAddressDifferentPort => {
+                let result = self.send_authorized_filter_probe(&authorization).await;
+                self.pending_filter_consents
+                    .remove(&authorization.probe_token);
+                if let Err(failure) = result {
+                    let _ = self
+                        .send_secure_payload(
+                            requester_endpoint,
+                            SecurePayload::FilteringMatrixUnavailable {
+                                trial_id: authorization.trial_id,
+                                probe_class: authorization.class,
+                                probe_token: authorization.probe_token,
+                                failure,
+                            },
+                        )
+                        .await;
+                }
+            }
+            FilterProbeClass::DifferentAddress => {
+                let Some(helper_endpoint) = pending.helper_endpoint else {
+                    return Ok(());
+                };
+                if !self.confirmed_sessions.contains(&helper_endpoint)
+                    || !self.peer_supports_feature(helper_endpoint, "filtering-matrix-v1")
+                {
+                    self.pending_filter_consents
+                        .remove(&authorization.probe_token);
+                    let _ = self
+                        .send_secure_payload(
+                            requester_endpoint,
+                            SecurePayload::FilteringMatrixUnavailable {
+                                trial_id: authorization.trial_id,
+                                probe_class: authorization.class,
+                                probe_token: authorization.probe_token,
+                                failure: FilteringMatrixFailure::NoHelper,
+                            },
+                        )
+                        .await;
+                    return Ok(());
+                }
+                if self
+                    .send_secure_payload(
+                        helper_endpoint,
+                        SecurePayload::FilteringMatrixSend { authorization },
+                    )
+                    .await
+                    .is_err()
+                {
+                    self.pending_filter_consents.remove(&pending.probe_token);
+                    let _ = self
+                        .send_secure_payload(
+                            requester_endpoint,
+                            SecurePayload::FilteringMatrixUnavailable {
+                                trial_id: pending.trial_id,
+                                probe_class: pending.probe_class,
+                                probe_token: pending.probe_token,
+                                failure: FilteringMatrixFailure::SendFailed,
+                            },
+                        )
+                        .await;
+                }
+            }
+        }
+        Ok(())
     }
 
-    async fn handle_filtering_test_send(
+    async fn handle_filtering_matrix_send(
         &mut self,
         coordinator: SocketAddr,
         coordinator_node_id: &str,
-        authorization: FilterProbeAuthorization,
+        authorization: FilteringMatrixAuthorization,
     ) -> Result<()> {
-        authorization.verify()?;
-        if authorization.helper_node_id != self.node_id()
-            || self
+        let session_valid = self.confirmed_sessions.contains(&coordinator)
+            && self.peer_supports_feature(coordinator, "filtering-matrix-v1");
+        let relationship_valid = authorization.coordinator_node_id == coordinator_node_id
+            && authorization.helper_node_id == self.node_id()
+            && authorization.class == FilterProbeClass::DifferentAddress
+            && self
                 .peer_endpoint_by_node_id(&authorization.target_node_id)
-                .is_some()
+                .is_none();
+        let result = if !session_valid {
+            Err(FilteringMatrixFailure::Unsupported)
+        } else if !self.allow_filter_probe_auth_attempt(coordinator_node_id, Instant::now()) {
+            Err(FilteringMatrixFailure::RateLimited)
+        } else if !relationship_valid {
+            Err(FilteringMatrixFailure::Unsupported)
+        } else {
+            self.send_authorized_filter_probe(&authorization).await
+        };
+
+        let (accepted, failure) = match result {
+            Ok(()) => (true, None),
+            Err(failure) => (false, Some(failure)),
+        };
+        if let Err(error) = self
+            .send_secure_payload(
+                coordinator,
+                SecurePayload::FilteringMatrixSendResult {
+                    trial_id: authorization.trial_id,
+                    probe_class: authorization.class,
+                    probe_token: authorization.probe_token,
+                    accepted,
+                    failure,
+                },
+            )
+            .await
+        {
+            debug!(%coordinator, %error, "failed to return filtering helper send result");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_filtering_matrix_send_result(
+        &mut self,
+        helper_endpoint: SocketAddr,
+        helper_node_id: &str,
+        trial_id: u64,
+        probe_class: FilterProbeClass,
+        probe_token: u64,
+        accepted: bool,
+        failure: Option<FilteringMatrixFailure>,
+    ) -> Result<()> {
+        let Some(pending) = self.pending_filter_consents.get(&probe_token).cloned() else {
+            return Ok(());
+        };
+        if pending.trial_id != trial_id
+            || pending.probe_class != probe_class
+            || pending.probe_class != FilterProbeClass::DifferentAddress
+            || pending.helper_endpoint != Some(helper_endpoint)
+            || pending.helper_node_id != helper_node_id
+            || pending.expires_at <= Instant::now()
+            || accepted == failure.is_some()
         {
             return Ok(());
         }
+        self.pending_filter_consents.remove(&probe_token);
+        if !accepted {
+            self.send_secure_payload(
+                pending.requester_endpoint,
+                SecurePayload::FilteringMatrixUnavailable {
+                    trial_id,
+                    probe_class,
+                    probe_token,
+                    failure: failure.unwrap_or(FilteringMatrixFailure::SendFailed),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
 
-        let target = authorization.target_endpoint.parse::<SocketAddr>()?;
-        if !PunchSchedule::candidate_allowed(target) {
-            return Ok(());
+    fn handle_filtering_matrix_unavailable(
+        &mut self,
+        coordinator: SocketAddr,
+        coordinator_node_id: &str,
+        trial_id: u64,
+        probe_class: FilterProbeClass,
+        probe_token: u64,
+        failure: FilteringMatrixFailure,
+    ) {
+        let Some(trial) = self.pending_filter_trials.get(&trial_id).cloned() else {
+            return;
+        };
+        if trial.coordinator_endpoint != coordinator
+            || trial.coordinator_node_id != coordinator_node_id
+            || trial.expires_at <= Instant::now()
+        {
+            return;
         }
 
-        self.send(
-            target,
-            MessageBody::FilterProbe {
-                probe_token: authorization.probe_token,
-            },
-        )
-        .await?;
+        let authorization = match self.pending_filter_probes.get(&probe_token) {
+            Some(pending)
+                if pending.authorization.trial_id == trial_id
+                    && pending.authorization.class == probe_class =>
+            {
+                self.pending_filter_probes
+                    .remove(&probe_token)
+                    .map(|pending| pending.authorization)
+            }
+            Some(_) => return,
+            None => FilteringMatrixAuthorization::signed(
+                &self.identity,
+                trial.target_endpoint,
+                trial.coordinator_node_id.clone(),
+                trial.coordinator_endpoint,
+                trial.coordinator_node_id.clone(),
+                probe_class,
+                trial_id,
+                probe_token,
+            )
+            .ok(),
+        };
+        let Some(authorization) = authorization else {
+            return;
+        };
+        if let Some(trial) = self.pending_filter_trials.get_mut(&trial_id) {
+            trial.seen_classes.insert(probe_class);
+        }
+        let outcome = if failure == FilteringMatrixFailure::SendFailed {
+            FilterProbeOutcome::SendFailed
+        } else {
+            FilterProbeOutcome::Unavailable
+        };
+        if let Err(error) = self
+            .nat_profile
+            .record_filter_probe(&authorization, None, outcome)
+        {
+            debug!(%error, ?failure, "failed to record unavailable filtering matrix cell");
+        }
+    }
 
-        info!(
-            coordinator = %coordinator_node_id,
-            %coordinator,
-            target = %authorization.target_node_id,
-            %target,
-            probe_token = authorization.probe_token,
-            "sent consent-authorized independent filter probe"
-        );
+    async fn send_authorized_filter_probe(
+        &mut self,
+        authorization: &FilteringMatrixAuthorization,
+    ) -> std::result::Result<(), FilteringMatrixFailure> {
+        authorization
+            .verify()
+            .map_err(|_| FilteringMatrixFailure::Unsupported)?;
+        if authorization.helper_node_id != self.node_id() {
+            return Err(FilteringMatrixFailure::Unsupported);
+        }
+        let target = authorization
+            .target_endpoint
+            .parse::<SocketAddr>()
+            .map_err(|_| FilteringMatrixFailure::UnsafeTarget)?;
+        if !self.filter_probe_endpoint_allowed(target) {
+            return Err(FilteringMatrixFailure::UnsafeTarget);
+        }
+        let use_key = FilterAuthorizationUseKey::from(authorization);
+        let now = Instant::now();
+        self.used_filter_authorizations
+            .retain(|_, expires_at| *expires_at > now);
+        if self.used_filter_authorizations.contains_key(&use_key) {
+            return Err(FilteringMatrixFailure::Replay);
+        }
+        if self.used_filter_authorizations.len() >= MAX_USED_FILTER_AUTHORIZATIONS {
+            return Err(FilteringMatrixFailure::Capacity);
+        }
+        if !self.allow_filter_probe(&authorization.coordinator_node_id, target, now) {
+            return Err(FilteringMatrixFailure::RateLimited);
+        }
+        self.used_filter_authorizations
+            .insert(use_key, now + FILTER_AUTHORIZATION_REPLAY_RETENTION);
+
+        let body = MessageBody::FilteringMatrixProbe {
+            trial_id: authorization.trial_id,
+            probe_class: authorization.class,
+            probe_token: authorization.probe_token,
+        };
+        let send = match authorization.class {
+            FilterProbeClass::SameAddressDifferentPort => {
+                self.send_from_alternate_port(target, body).await
+            }
+            FilterProbeClass::ContactedEndpoint | FilterProbeClass::DifferentAddress => {
+                self.send(target, body).await
+            }
+        };
+        send.map_err(|_| FilteringMatrixFailure::SendFailed)
+    }
+
+    fn allow_filter_probe_auth_attempt(&mut self, sender_node_id: &str, now: Instant) -> bool {
+        self.filter_probe_auth_attempt_windows.retain(|_, window| {
+            now.checked_duration_since(window.last_seen)
+                .is_some_and(|age| age < FILTER_PROBE_RATE_RETENTION)
+        });
+        let sender_count = self
+            .filter_probe_auth_attempt_windows
+            .get(sender_node_id)
+            .map_or(0, |window| window.count_at(now));
+        if sender_count >= FILTER_PROBE_AUTH_ATTEMPT_LIMIT
+            || self.filter_probe_auth_attempt_global_window.count_at(now)
+                >= FILTER_PROBE_AUTH_ATTEMPT_GLOBAL_LIMIT
+            || (!self
+                .filter_probe_auth_attempt_windows
+                .contains_key(sender_node_id)
+                && self.filter_probe_auth_attempt_windows.len() >= MAX_FILTER_PROBE_RATE_STATES)
+        {
+            return false;
+        }
+
+        self.filter_probe_auth_attempt_windows
+            .entry(sender_node_id.to_owned())
+            .or_insert_with(|| FilterProbeRateWindow::new(now))
+            .increment_at(now);
+        self.filter_probe_auth_attempt_global_window
+            .increment_at(now);
+        true
+    }
+
+    async fn send_from_alternate_port(
+        &mut self,
+        target: SocketAddr,
+        body: MessageBody,
+    ) -> Result<()> {
+        let bind = match target {
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let socket = UdpSocket::bind(bind).await.with_context(|| {
+            format!("failed to bind alternate filtering probe socket at {bind}")
+        })?;
+        let envelope = WireEnvelope::signed(&self.identity, random(), body)?;
+        let bytes = envelope.encode()?;
+        self.remember_filter_contact(target.ip(), Instant::now());
+        socket.send_to(&bytes, target).await.with_context(|| {
+            format!("failed to send alternate-port filtering probe to {target}")
+        })?;
         Ok(())
+    }
+
+    fn allow_filter_probe(
+        &mut self,
+        coordinator_node_id: &str,
+        target: SocketAddr,
+        now: Instant,
+    ) -> bool {
+        self.filter_probe_coordinator_windows.retain(|_, window| {
+            now.checked_duration_since(window.last_seen)
+                .is_some_and(|age| age < FILTER_PROBE_RATE_RETENTION)
+        });
+        self.filter_probe_target_windows.retain(|_, window| {
+            now.checked_duration_since(window.last_seen)
+                .is_some_and(|age| age < FILTER_PROBE_RATE_RETENTION)
+        });
+        let target_group = dht_network_group(target.ip());
+        let coordinator_count = self
+            .filter_probe_coordinator_windows
+            .get(coordinator_node_id)
+            .map_or(0, |window| window.count_at(now));
+        let target_count = self
+            .filter_probe_target_windows
+            .get(&target_group)
+            .map_or(0, |window| window.count_at(now));
+        if coordinator_count >= FILTER_PROBE_COORDINATOR_LIMIT
+            || target_count >= FILTER_PROBE_TARGET_GROUP_LIMIT
+            || self.filter_probe_global_window.count_at(now) >= FILTER_PROBE_GLOBAL_LIMIT
+            || (!self
+                .filter_probe_coordinator_windows
+                .contains_key(coordinator_node_id)
+                && self.filter_probe_coordinator_windows.len() >= MAX_FILTER_PROBE_RATE_STATES)
+            || (!self.filter_probe_target_windows.contains_key(&target_group)
+                && self.filter_probe_target_windows.len() >= MAX_FILTER_PROBE_RATE_STATES)
+        {
+            return false;
+        }
+
+        self.filter_probe_coordinator_windows
+            .entry(coordinator_node_id.to_owned())
+            .or_insert_with(|| FilterProbeRateWindow::new(now))
+            .increment_at(now);
+        self.filter_probe_target_windows
+            .entry(target_group)
+            .or_insert_with(|| FilterProbeRateWindow::new(now))
+            .increment_at(now);
+        self.filter_probe_global_window.increment_at(now);
+        true
+    }
+
+    fn filter_probe_endpoint_allowed(&self, endpoint: SocketAddr) -> bool {
+        endpoint_publishable(endpoint)
+            || (self.local_test_mode && endpoint.port() != 0 && endpoint.ip().is_loopback())
+    }
+
+    fn remember_filter_contact(&mut self, ip: IpAddr, now: Instant) {
+        let ip = normalized_ip(ip);
+        if let Some(contacted_at) = self.recent_egress_ips.get_mut(&ip) {
+            *contacted_at = now;
+            return;
+        }
+        if self.recent_egress_ips.len() >= MAX_FILTER_CONTACT_HISTORY {
+            let saturated_until = now + FILTER_CONTACT_HISTORY_TTL;
+            self.filter_contact_history_saturated_until = Some(
+                self.filter_contact_history_saturated_until
+                    .map_or(saturated_until, |existing| existing.max(saturated_until)),
+            );
+            return;
+        }
+        self.recent_egress_ips.insert(ip, now);
+    }
+
+    fn filter_probe_source_was_contacted(&self, ip: IpAddr, now: Instant) -> bool {
+        self.filter_contact_history_saturated_until
+            .is_some_and(|saturated_until| saturated_until > now)
+            || self
+                .recent_egress_ips
+                .get(&normalized_ip(ip))
+                .and_then(|contacted_at| now.checked_duration_since(*contacted_at))
+                .is_some_and(|age| age < FILTER_CONTACT_HISTORY_TTL)
+    }
+
+    fn expire_filtering_matrix_state(&mut self) {
+        let now = Instant::now();
+        let expired_probes: Vec<u64> = self
+            .pending_filter_probes
+            .iter()
+            .filter(|(_, pending)| pending.expires_at <= now)
+            .map(|(token, _)| *token)
+            .collect();
+        for token in expired_probes {
+            if let Some(pending) = self.pending_filter_probes.remove(&token) {
+                // The wire authorization is intentionally short lived. Refresh only
+                // its timestamped signature before recording the local timeout; all
+                // trial, endpoint, helper, class, and token bindings stay identical.
+                let authorization = pending.authorization;
+                let refreshed = authorization
+                    .target_endpoint
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .zip(
+                        authorization
+                            .coordinator_baseline_endpoint
+                            .parse::<SocketAddr>()
+                            .ok(),
+                    )
+                    .and_then(|(target_endpoint, coordinator_baseline_endpoint)| {
+                        FilteringMatrixAuthorization::signed(
+                            &self.identity,
+                            target_endpoint,
+                            authorization.coordinator_node_id,
+                            coordinator_baseline_endpoint,
+                            authorization.helper_node_id,
+                            authorization.class,
+                            authorization.trial_id,
+                            authorization.probe_token,
+                        )
+                        .ok()
+                    });
+                let Some(refreshed) = refreshed else {
+                    debug!(
+                        probe_token = token,
+                        "failed to refresh filtering matrix timeout authorization"
+                    );
+                    continue;
+                };
+                if let Err(error) = self.nat_profile.record_filter_probe(
+                    &refreshed,
+                    None,
+                    FilterProbeOutcome::TimedOut,
+                ) {
+                    debug!(%error, probe_token = token, "failed to record filtering matrix timeout");
+                }
+            }
+        }
+
+        self.pending_filter_consents
+            .retain(|_, pending| pending.expires_at > now);
+        self.used_filter_authorizations
+            .retain(|_, expires_at| *expires_at > now);
+        self.filter_probe_auth_attempt_windows.retain(|_, window| {
+            now.checked_duration_since(window.last_seen)
+                .is_some_and(|age| age < FILTER_PROBE_RATE_RETENTION)
+        });
+        self.filter_probe_coordinator_windows.retain(|_, window| {
+            now.checked_duration_since(window.last_seen)
+                .is_some_and(|age| age < FILTER_PROBE_RATE_RETENTION)
+        });
+        self.filter_probe_target_windows.retain(|_, window| {
+            now.checked_duration_since(window.last_seen)
+                .is_some_and(|age| age < FILTER_PROBE_RATE_RETENTION)
+        });
+        self.recent_egress_ips.retain(|_, contacted_at| {
+            now.checked_duration_since(*contacted_at)
+                .is_some_and(|age| age < FILTER_CONTACT_HISTORY_TTL)
+        });
+        if self
+            .filter_contact_history_saturated_until
+            .is_some_and(|saturated_until| saturated_until <= now)
+        {
+            self.filter_contact_history_saturated_until = None;
+        }
+
+        let expired_trials: Vec<u64> = self
+            .pending_filter_trials
+            .iter()
+            .filter(|(_, trial)| trial.expires_at <= now)
+            .map(|(trial_id, _)| *trial_id)
+            .collect();
+        for trial_id in expired_trials {
+            let Some(trial) = self.pending_filter_trials.remove(&trial_id) else {
+                continue;
+            };
+            for probe_class in [
+                FilterProbeClass::ContactedEndpoint,
+                FilterProbeClass::SameAddressDifferentPort,
+                FilterProbeClass::DifferentAddress,
+            ] {
+                if trial.seen_classes.contains(&probe_class) {
+                    continue;
+                }
+                let Ok(authorization) = FilteringMatrixAuthorization::signed(
+                    &self.identity,
+                    trial.target_endpoint,
+                    trial.coordinator_node_id.clone(),
+                    trial.coordinator_endpoint,
+                    trial.coordinator_node_id.clone(),
+                    probe_class,
+                    trial_id,
+                    random(),
+                ) else {
+                    continue;
+                };
+                if let Err(error) = self.nat_profile.record_filter_probe(
+                    &authorization,
+                    None,
+                    FilterProbeOutcome::TimedOut,
+                ) {
+                    debug!(%error, trial_id, ?probe_class, "failed to record missing filtering matrix proposal");
+                }
+            }
+        }
+        self.nat_profile.expire_filter_matrix_at(Instant::now());
     }
 
     async fn drive_dht_queries(&mut self) {
@@ -4863,7 +5754,7 @@ impl KonoNode {
         }
     }
 
-    async fn refresh_discovery(&self) {
+    async fn refresh_discovery(&mut self) {
         let mut endpoints = self.bootstrap_peers.clone();
         endpoints.extend(self.peers.keys().copied());
         endpoints.extend(self.discovery_candidates.keys().copied());
@@ -4944,10 +5835,7 @@ impl KonoNode {
             .retain(|pending| pending.record.verify().is_ok());
         let active_session_endpoints: HashSet<SocketAddr> = self.sessions.keys().copied().collect();
         self.routing.retain_endpoints(&active_session_endpoints);
-        self.pending_filter_probes
-            .retain(|_, pending| pending.expires_at > Instant::now());
-        self.pending_filter_consents
-            .retain(|_, pending| pending.expires_at > Instant::now());
+        self.expire_filtering_matrix_state();
         self.last_rendezvous_request
             .retain(|_, last| last.elapsed() < Duration::from_secs(60));
         self.last_filter_test_request
@@ -4992,9 +5880,10 @@ impl KonoNode {
         }
     }
 
-    async fn send(&self, target: SocketAddr, body: MessageBody) -> Result<()> {
+    async fn send(&mut self, target: SocketAddr, body: MessageBody) -> Result<()> {
         let envelope = WireEnvelope::signed(&self.identity, random(), body)?;
         let bytes = envelope.encode()?;
+        self.remember_filter_contact(target.ip(), Instant::now());
         self.socket
             .send_to(&bytes, target)
             .await
@@ -5007,6 +5896,20 @@ fn plausible_node_id(node_id: &str) -> bool {
     node_id.len() == 44
         && node_id.starts_with("knp1")
         && node_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn ip_equivalent(left: IpAddr, right: IpAddr) -> bool {
+    normalized_ip(left) == normalized_ip(right)
+}
+
+fn normalized_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
 }
 
 fn local_features() -> Vec<String> {
@@ -5040,8 +5943,7 @@ fn local_features() -> Vec<String> {
         "direct-relay-app-migration".to_owned(),
         "punch-to-relay-fallback".to_owned(),
         "multi-candidate-relay-fallback".to_owned(),
-        "multi-relay-control-plane".to_owned(),
-        "consent-filter-probe".to_owned(),
+        "filtering-matrix-v1".to_owned(),
         "udp-punch-probe".to_owned(),
         "udp-punch-burst-v1".to_owned(),
         "secure-ping-pong".to_owned(),
@@ -5051,6 +5953,7 @@ fn local_features() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nat::FilterCellStatus;
 
     #[tokio::test]
     async fn local_test_mode_allows_loopback_rendezvous_only_when_enabled() {
@@ -5449,5 +6352,531 @@ mod tests {
                 .map(|pending| pending.target_node_id.as_str()),
             Some("owner-priority")
         );
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_sender_uses_bound_and_alternate_ports_and_consumes_tokens_once() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.set_local_test_mode(true);
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_endpoint = receiver.local_addr().unwrap();
+        let baseline = node.local_addr().unwrap();
+        let helper_node_id = node.node_id();
+        let target_identity = NodeIdentity::generate();
+
+        let contacted = FilteringMatrixAuthorization::signed(
+            &target_identity,
+            target_endpoint,
+            helper_node_id.clone(),
+            baseline,
+            helper_node_id.clone(),
+            FilterProbeClass::ContactedEndpoint,
+            41,
+            401,
+        )
+        .unwrap();
+        let replay_key = FilterAuthorizationUseKey::from(&contacted);
+        let replay_window_started_at = Instant::now();
+        node.send_authorized_filter_probe(&contacted).await.unwrap();
+        let replay_deadline = node.used_filter_authorizations[&replay_key];
+        assert!(
+            replay_deadline >= replay_window_started_at + FILTER_AUTHORIZATION_REPLAY_RETENTION
+        );
+        assert!(replay_deadline > replay_window_started_at + FILTER_PROBE_STATE_TTL);
+
+        let mut packet = vec![0_u8; MAX_PACKET_SIZE];
+        let (length, source) =
+            time::timeout(Duration::from_secs(1), receiver.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(source, baseline);
+        let envelope = WireEnvelope::decode(&packet[..length]).unwrap();
+        envelope.verify().unwrap();
+        assert!(matches!(
+            envelope.body,
+            MessageBody::FilteringMatrixProbe {
+                trial_id: 41,
+                probe_class: FilterProbeClass::ContactedEndpoint,
+                probe_token: 401,
+            }
+        ));
+        assert_eq!(
+            node.send_authorized_filter_probe(&contacted).await,
+            Err(FilteringMatrixFailure::Replay)
+        );
+        let reissued = FilteringMatrixAuthorization::signed_at(
+            &target_identity,
+            target_endpoint,
+            node.node_id(),
+            baseline,
+            node.node_id(),
+            FilterProbeClass::ContactedEndpoint,
+            41,
+            401,
+            contacted.issued_unix_ms + 1,
+        )
+        .unwrap();
+        assert_ne!(reissued.signature, contacted.signature);
+        assert_eq!(
+            node.send_authorized_filter_probe(&reissued).await,
+            Err(FilteringMatrixFailure::Replay)
+        );
+        assert!(
+            time::timeout(Duration::from_millis(50), receiver.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
+
+        let same_token_other_target = FilteringMatrixAuthorization::signed(
+            &NodeIdentity::generate(),
+            target_endpoint,
+            node.node_id(),
+            baseline,
+            node.node_id(),
+            FilterProbeClass::ContactedEndpoint,
+            42,
+            401,
+        )
+        .unwrap();
+        node.send_authorized_filter_probe(&same_token_other_target)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), receiver.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let alternate = FilteringMatrixAuthorization::signed(
+            &target_identity,
+            target_endpoint,
+            helper_node_id.clone(),
+            baseline,
+            helper_node_id,
+            FilterProbeClass::SameAddressDifferentPort,
+            41,
+            402,
+        )
+        .unwrap();
+        node.send_authorized_filter_probe(&alternate).await.unwrap();
+        let (length, source) =
+            time::timeout(Duration::from_secs(1), receiver.recv_from(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(ip_equivalent(source.ip(), baseline.ip()));
+        assert_ne!(source.port(), baseline.port());
+        let envelope = WireEnvelope::decode(&packet[..length]).unwrap();
+        envelope.verify().unwrap();
+        assert!(matches!(
+            envelope.body,
+            MessageBody::FilteringMatrixProbe {
+                trial_id: 41,
+                probe_class: FilterProbeClass::SameAddressDifferentPort,
+                probe_token: 402,
+            }
+        ));
+        assert_eq!(
+            node.send_authorized_filter_probe(&alternate).await,
+            Err(FilteringMatrixFailure::Replay)
+        );
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_sender_rejects_non_public_targets_outside_test_mode() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let helper_node_id = node.node_id();
+        let authorization = FilteringMatrixAuthorization::signed(
+            &NodeIdentity::generate(),
+            "10.0.0.20:47000".parse().unwrap(),
+            helper_node_id.clone(),
+            node.local_addr().unwrap(),
+            helper_node_id,
+            FilterProbeClass::ContactedEndpoint,
+            51,
+            501,
+        )
+        .unwrap();
+
+        assert_eq!(
+            node.send_authorized_filter_probe(&authorization).await,
+            Err(FilteringMatrixFailure::UnsafeTarget)
+        );
+        assert!(node.used_filter_authorizations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_rejects_unsolicited_proposals() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.set_local_test_mode(true);
+
+        node.handle_filtering_matrix_proposal(
+            "127.0.0.1:47000".parse().unwrap(),
+            &NodeIdentity::generate().node_id(),
+            61,
+            FilterProbeClass::DifferentAddress,
+            &NodeIdentity::generate().node_id(),
+            "127.0.0.1:47001",
+            601,
+        )
+        .await
+        .unwrap();
+
+        assert!(node.pending_filter_probes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_receive_binds_helper_trial_class_and_token() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.set_local_test_mode(true);
+        let target_endpoint = node.local_addr().unwrap();
+        let coordinator_node_id = NodeIdentity::generate().node_id();
+        node.nat_profile
+            .observe(coordinator_node_id.clone(), target_endpoint);
+        let helper_identity = NodeIdentity::generate();
+        let helper_node_id = helper_identity.node_id();
+        let trial_id = 62;
+        let probe_token = 602;
+        let authorization = FilteringMatrixAuthorization::signed(
+            &node.identity,
+            target_endpoint,
+            coordinator_node_id,
+            "127.0.0.3:47000".parse().unwrap(),
+            helper_node_id,
+            FilterProbeClass::DifferentAddress,
+            trial_id,
+            probe_token,
+        )
+        .unwrap();
+        node.pending_filter_probes.insert(
+            probe_token,
+            PendingFilterProbe {
+                authorization,
+                expires_at: Instant::now() + FILTER_PROBE_STATE_TTL,
+            },
+        );
+        let source: SocketAddr = "127.0.0.2:39000".parse().unwrap();
+
+        for (nonce, sender, body) in [
+            (
+                1,
+                &helper_identity,
+                MessageBody::FilteringMatrixProbe {
+                    trial_id: trial_id + 1,
+                    probe_class: FilterProbeClass::DifferentAddress,
+                    probe_token,
+                },
+            ),
+            (
+                2,
+                &helper_identity,
+                MessageBody::FilteringMatrixProbe {
+                    trial_id,
+                    probe_class: FilterProbeClass::SameAddressDifferentPort,
+                    probe_token,
+                },
+            ),
+            (
+                3,
+                &helper_identity,
+                MessageBody::FilteringMatrixProbe {
+                    trial_id,
+                    probe_class: FilterProbeClass::DifferentAddress,
+                    probe_token: probe_token + 1,
+                },
+            ),
+        ] {
+            let packet = WireEnvelope::signed(sender, nonce, body)
+                .unwrap()
+                .encode()
+                .unwrap();
+            node.handle_datagram(&packet, source).await.unwrap();
+            assert!(node.pending_filter_probes.contains_key(&probe_token));
+        }
+
+        let wrong_sender = NodeIdentity::generate();
+        let packet = WireEnvelope::signed(
+            &wrong_sender,
+            4,
+            MessageBody::FilteringMatrixProbe {
+                trial_id,
+                probe_class: FilterProbeClass::DifferentAddress,
+                probe_token,
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        node.handle_datagram(&packet, source).await.unwrap();
+        assert!(node.pending_filter_probes.contains_key(&probe_token));
+
+        let packet = WireEnvelope::signed(
+            &helper_identity,
+            5,
+            MessageBody::FilteringMatrixProbe {
+                trial_id,
+                probe_class: FilterProbeClass::DifferentAddress,
+                probe_token,
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        node.handle_datagram(&packet, source).await.unwrap();
+
+        assert!(!node.pending_filter_probes.contains_key(&probe_token));
+        assert_eq!(
+            node.nat_profile.filter_matrix_snapshot().different_address,
+            FilterCellStatus::Observed
+        );
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_expiry_records_an_inconclusive_timeout() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let coordinator_node_id = NodeIdentity::generate().node_id();
+        let target_endpoint: SocketAddr = "127.0.0.1:47010".parse().unwrap();
+        node.nat_profile
+            .observe(coordinator_node_id.clone(), target_endpoint);
+        let current_unix_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let authorization = FilteringMatrixAuthorization::signed_at(
+            &node.identity,
+            target_endpoint,
+            coordinator_node_id.clone(),
+            "127.0.0.1:47011".parse().unwrap(),
+            coordinator_node_id,
+            FilterProbeClass::ContactedEndpoint,
+            71,
+            701,
+            current_unix_ms.saturating_sub(FILTERING_MATRIX_AUTH_TTL_MS + 1),
+        )
+        .unwrap();
+        assert!(authorization.verify().is_err());
+        node.pending_filter_probes.insert(
+            authorization.probe_token,
+            PendingFilterProbe {
+                authorization,
+                expires_at: Instant::now() - Duration::from_millis(1),
+            },
+        );
+
+        node.expire_filtering_matrix_state();
+
+        assert!(node.pending_filter_probes.is_empty());
+        assert_eq!(
+            node.nat_profile.filter_matrix_snapshot().contacted_endpoint,
+            FilterCellStatus::InconclusiveTimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_filtering_unavailable_preserves_the_pending_cell() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let coordinator_node_id = NodeIdentity::generate().node_id();
+        let coordinator_endpoint: SocketAddr = "127.0.0.1:47011".parse().unwrap();
+        let target_endpoint: SocketAddr = "127.0.0.1:47010".parse().unwrap();
+        let trial_id = 72;
+        let probe_token = 702;
+        node.nat_profile
+            .observe(coordinator_node_id.clone(), target_endpoint);
+        let authorization = FilteringMatrixAuthorization::signed(
+            &node.identity,
+            target_endpoint,
+            coordinator_node_id.clone(),
+            coordinator_endpoint,
+            coordinator_node_id.clone(),
+            FilterProbeClass::ContactedEndpoint,
+            trial_id,
+            probe_token,
+        )
+        .unwrap();
+        node.pending_filter_trials.insert(
+            trial_id,
+            PendingFilterTrial {
+                coordinator_endpoint,
+                coordinator_node_id: coordinator_node_id.clone(),
+                target_endpoint,
+                seen_classes: HashSet::from([FilterProbeClass::ContactedEndpoint]),
+                expires_at: Instant::now() + FILTER_MATRIX_TRIAL_TTL,
+            },
+        );
+        node.pending_filter_probes.insert(
+            probe_token,
+            PendingFilterProbe {
+                authorization,
+                expires_at: Instant::now() + FILTER_PROBE_STATE_TTL,
+            },
+        );
+
+        node.handle_filtering_matrix_unavailable(
+            coordinator_endpoint,
+            &coordinator_node_id,
+            trial_id,
+            FilterProbeClass::SameAddressDifferentPort,
+            probe_token,
+            FilteringMatrixFailure::NoHelper,
+        );
+
+        assert!(node.pending_filter_probes.contains_key(&probe_token));
+        node.pending_filter_probes
+            .get_mut(&probe_token)
+            .unwrap()
+            .expires_at = Instant::now() - Duration::from_millis(1);
+        node.expire_filtering_matrix_state();
+        assert_eq!(
+            node.nat_profile.filter_matrix_snapshot().contacted_endpoint,
+            FilterCellStatus::InconclusiveTimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_rate_limits_each_coordinator_window() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let now = Instant::now();
+        let target: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+
+        for _ in 0..FILTER_PROBE_COORDINATOR_LIMIT {
+            assert!(node.allow_filter_probe("coordinator", target, now));
+        }
+        assert!(!node.allow_filter_probe("coordinator", target, now));
+        let helper_node_id = node.node_id();
+        let authorization = FilteringMatrixAuthorization::signed(
+            &NodeIdentity::generate(),
+            target,
+            "coordinator".to_owned(),
+            node.local_addr().unwrap(),
+            helper_node_id,
+            FilterProbeClass::ContactedEndpoint,
+            81,
+            801,
+        )
+        .unwrap();
+        assert_eq!(
+            node.send_authorized_filter_probe(&authorization).await,
+            Err(FilteringMatrixFailure::RateLimited)
+        );
+        assert!(node.used_filter_authorizations.is_empty());
+        assert!(node.allow_filter_probe("coordinator", target, now + FILTER_PROBE_RATE_WINDOW));
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_tracks_egress_without_admitting_a_peer() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = receiver.local_addr().unwrap();
+
+        node.send(endpoint, MessageBody::Ping { token: 901 })
+            .await
+            .unwrap();
+
+        assert!(!node.peers.contains_key(&endpoint));
+        let now = Instant::now();
+        assert!(node.filter_probe_source_was_contacted(endpoint.ip(), now));
+        assert!(!node
+            .filter_probe_source_was_contacted(endpoint.ip(), now + FILTER_CONTACT_HISTORY_TTL));
+
+        node.recent_egress_ips.clear();
+        let prefix = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
+        for index in 0..MAX_FILTER_CONTACT_HISTORY {
+            node.remember_filter_contact(IpAddr::V6(Ipv6Addr::from(prefix + index as u128)), now);
+        }
+        let oldest = IpAddr::V6(Ipv6Addr::from(prefix));
+        let overflow = IpAddr::V6(Ipv6Addr::from(prefix + MAX_FILTER_CONTACT_HISTORY as u128));
+        node.remember_filter_contact(overflow, now);
+        assert_eq!(node.recent_egress_ips.len(), MAX_FILTER_CONTACT_HISTORY);
+        assert!(node.recent_egress_ips.contains_key(&oldest));
+        assert!(!node.recent_egress_ips.contains_key(&overflow));
+        assert!(node.filter_probe_source_was_contacted(overflow, now));
+    }
+
+    #[tokio::test]
+    async fn filtering_matrix_bounds_signature_verification_attempts() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let now = Instant::now();
+
+        for _ in 0..FILTER_PROBE_AUTH_ATTEMPT_LIMIT {
+            assert!(node.allow_filter_probe_auth_attempt("sender", now));
+        }
+        assert!(!node.allow_filter_probe_auth_attempt("sender", now));
+        assert!(node.allow_filter_probe_auth_attempt("sender", now + FILTER_PROBE_RATE_WINDOW));
     }
 }
