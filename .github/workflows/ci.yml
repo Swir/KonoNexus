@@ -29,4 +29,10 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --all
+        run: cargo test --all --all-targets
+
+      - name: Check SDK-only library
+        run: cargo check --no-default-features --lib
+
+      - name: Clippy SDK-only library
+        run: cargo clippy --no-default-features --lib -- -D warnings

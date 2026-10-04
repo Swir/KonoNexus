@@ -4,6 +4,7 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Split the Network Tester GUI dependencies behind the default `tester-gui` feature, preserving normal tester builds while allowing downstream SDK consumers to disable `eframe`, `arboard` and `image` with `default-features = false`. CI now checks the SDK-only library configuration.
 - Added IPv6-first ordering for exact direct candidates from explicit connect hints and independently attested DHT results, before deduplication and the three-candidate cap. When mixed-family input exceeds the initial three-candidate cap, one slot is reserved for an IPv4 fallback. Unscoped IPv6 link-local connect hints are rejected so they cannot displace usable fallback candidates. This does not add IPv6 socket support, multi-endpoint publication, or WAN evidence, so the roadmap item remains open.
 
 ## 0.1.0-alpha.23
