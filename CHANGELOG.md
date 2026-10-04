@@ -2,6 +2,10 @@
 
 Development log for KonoNexus.
 
+## Unreleased
+
+- Added IPv6-first ordering for exact direct candidates from explicit connect hints and independently attested DHT results, before deduplication and the three-candidate cap. When mixed-family input exceeds the initial three-candidate cap, one slot is reserved for an IPv4 fallback. Unscoped IPv6 link-local connect hints are rejected so they cannot displace usable fallback candidates. This does not add IPv6 socket support, multi-endpoint publication, or WAN evidence, so the roadmap item remains open.
+
 ## 0.1.0-alpha.23
 
 - Added a 32-node localhost `KonoNode` runtime convergence and churn harness with 30 leaves bootstrapped to two hubs. It uses real signed HELLO/cookie admission, encrypted sessions, endpoint observations and attestations, DHT publication/replication/find/nodes, and RelayApp delivery.

@@ -3250,7 +3250,14 @@ impl KonoNode {
         for endpoint in &endpoints {
             let ip = endpoint.ip();
             let broadcast = matches!(ip, IpAddr::V4(ip) if ip.is_broadcast());
-            if endpoint.port() == 0 || ip.is_unspecified() || ip.is_multicast() || broadcast {
+            let unscoped_ipv6_link_local = matches!(endpoint, SocketAddr::V6(endpoint)
+                if endpoint.ip().is_unicast_link_local() && endpoint.scope_id() == 0);
+            if endpoint.port() == 0
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || broadcast
+                || unscoped_ipv6_link_local
+            {
                 bail!("connection endpoint is unusable");
             }
             if self.connect_candidate_groups.iter().any(|(target, group)| {
@@ -6623,6 +6630,116 @@ mod tests {
 
         node.handle_datagram(&packet, endpoint).await.unwrap();
         assert!(!node.peers.contains_key(&endpoint));
+    }
+
+    #[tokio::test]
+    async fn explicit_connect_prioritizes_ipv6_before_candidate_cap() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let target = NodeIdentity::generate().node_id();
+        let ipv4_first: SocketAddr = "8.8.8.8:47001".parse().unwrap();
+        let ipv4_second: SocketAddr = "1.1.1.1:47002".parse().unwrap();
+        let ipv6: SocketAddr = "[2001:4860:4860::8888]:47003".parse().unwrap();
+
+        node.queue_connect(
+            target.clone(),
+            vec![
+                ipv4_first,
+                ipv4_second,
+                ipv6,
+                "9.9.9.9:47004".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            node.connect_candidate_groups[&target].candidates(),
+            &[ipv6, ipv4_first, ipv4_second]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_connect_rejects_unscoped_ipv6_link_local_before_planning() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let target = NodeIdentity::generate().node_id();
+        let unscoped_link_local = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            47000,
+            0,
+            0,
+        ));
+        let scoped_link_local = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            47001,
+            0,
+            3,
+        ));
+
+        assert!(node
+            .queue_connect(target.clone(), vec![unscoped_link_local])
+            .is_err());
+        node.queue_connect(target.clone(), vec![scoped_link_local])
+            .unwrap();
+
+        assert_eq!(
+            node.connect_candidate_groups[&target].candidates(),
+            &[scoped_link_local]
+        );
+    }
+
+    #[tokio::test]
+    async fn dht_activation_prioritizes_only_exactly_attested_ipv6_endpoints() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let target_identity = NodeIdentity::generate();
+        let target_node_id = target_identity.node_id();
+        let ipv4_first: SocketAddr = "8.8.8.8:47001".parse().unwrap();
+        let ipv4_second: SocketAddr = "1.1.1.1:47002".parse().unwrap();
+        let ipv6_first: SocketAddr = "[2001:4860:4860::8888]:47003".parse().unwrap();
+        let ipv6_second: SocketAddr = "[2606:4700:4700::1111]:47004".parse().unwrap();
+        let record = PeerRecord::signed(
+            &target_identity,
+            vec![ipv4_first, ipv4_second, ipv6_first, ipv6_second],
+        )
+        .unwrap();
+
+        for endpoint in [ipv4_first, ipv4_second, ipv6_first] {
+            for _ in 0..MIN_ENDPOINT_ATTESTATION_OBSERVERS {
+                let observer = NodeIdentity::generate();
+                node.endpoint_attestations
+                    .upsert(
+                        EndpointAttestation::signed(&observer, target_node_id.clone(), endpoint)
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        node.pending_dht_queries.insert(target_node_id.clone());
+
+        assert!(node.activate_dht_record(&record).await.unwrap());
+        assert_eq!(
+            node.connect_candidate_groups[&target_node_id].candidates(),
+            &[ipv6_first, ipv4_second, ipv4_first]
+        );
     }
 
     #[tokio::test]

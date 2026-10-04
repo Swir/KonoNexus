@@ -121,6 +121,8 @@ A token alone is insufficient: the punch sender must also prove possession of th
 4. multi-relay/full-control-plane migration,
 5. KonoMind learning and optimization from real path outcomes.
 
+The bounded direct-candidate planner has partial IPv6 groundwork: among exact supplied and independently attested endpoints it tries native IPv6 before IPv4 and, when mixed-family input exceeds the initial three-candidate cap, reserves one slot for an IPv4 fallback. It preserves the signed/supplied socket addresses. Explicit connect hints with IPv6 link-local addresses require an interface scope; DHT records continue to require publishable endpoints and exact endpoint attestations. This does not provide dual-stack socket availability or multi-endpoint publication; the IPv6 direct-path preference stage remains open pending those changes and multi-network validation.
+
 ## 13. Signed DHT discovery foundation
 
 A peer record contains NodeID and Ed25519 public key, up to four public socket endpoints, a time-based sequence/issue timestamp, an expiry timestamp, and an Ed25519 signature over the complete unsigned record.
