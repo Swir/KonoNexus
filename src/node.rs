@@ -1344,10 +1344,7 @@ impl KonoNode {
                 if attestations.len() > DHT_ATTESTATION_RESPONSE_LIMIT
                     || replication_hops_remaining > DHT_REPLICATION_MAX_HOPS
                     || (replication_hops_remaining > 0
-                        && !self.peer_supports_feature(
-                            source,
-                            "bounded-dht-replication-v1",
-                        ))
+                        && !self.peer_supports_feature(source, "bounded-dht-replication-v1"))
                 {
                     debug!(
                         peer = %sender_node_id,
