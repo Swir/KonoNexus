@@ -350,8 +350,11 @@ impl PeerRecord {
         endpoints: Vec<SocketAddr>,
         previous_sequence: u64,
     ) -> Result<Self> {
-        let now = unix_time_ms()?.max(previous_sequence.saturating_add(1));
-        Self::signed_at(identity, endpoints, now, DEFAULT_RECORD_TTL_MS)
+        let wall_now = unix_time_ms()?;
+        let issued_at = wall_now.max(previous_sequence.saturating_add(1));
+        let record = Self::signed_at(identity, endpoints, issued_at, DEFAULT_RECORD_TTL_MS)?;
+        record.verify_at(wall_now)?;
+        Ok(record)
     }
 
     fn signed_at(
