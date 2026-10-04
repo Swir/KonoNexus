@@ -1,3 +1,6 @@
+use crate::candidate_group::{
+    CandidateAction, CandidateGroup, CANDIDATE_GROUP_TTL, MAX_ACTIVE_CANDIDATE_GROUPS,
+};
 use crate::dht::{
     dht_network_group, endpoint_publishable, node_id_closer_to_target,
     prioritize_network_group_diversity, DhtNetworkGroup, DhtTable, EndpointAttestation,
@@ -23,7 +26,7 @@ use crate::relay_e2e::{
     accept_relay_init, decode_relay_payload, encode_relay_payload, encode_relay_payload_on_session,
     packet_kind, RelayE2eInitiator,
 };
-use crate::rendezvous::{AutoRendezvousState, CoordinatorCandidate};
+use crate::rendezvous::{admit_auto_rendezvous_target, AutoRendezvousState, CoordinatorCandidate};
 use crate::route::{
     ControlRoute, RelayRouteCandidate, RouteController, MAX_RELAY_ROUTE_CANDIDATES,
 };
@@ -68,7 +71,6 @@ const MAX_FILTER_PROBE_RATE_STATES: usize = 1_024;
 const MAX_USED_FILTER_AUTHORIZATIONS: usize = 1_024;
 const FILTER_CONTACT_HISTORY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_FILTER_CONTACT_HISTORY: usize = 4_096;
-const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
 const DHT_QUERY_GUARD_RETENTION: Duration = Duration::from_secs(10 * 60);
@@ -562,6 +564,7 @@ pub struct KonoNode {
     last_dht_query_start: HashMap<String, Instant>,
     last_dht_forward: HashMap<SocketAddr, Instant>,
     discovery_candidates: HashMap<SocketAddr, DhtDiscoveryCandidate>,
+    connect_candidate_groups: HashMap<String, CandidateGroup>,
     routing_cache_path: Option<PathBuf>,
     relay_manager: RelayManager,
     queued_relays: HashMap<SocketAddr, Vec<String>>,
@@ -651,6 +654,7 @@ impl KonoNode {
             last_dht_query_start: HashMap::new(),
             last_dht_forward: HashMap::new(),
             discovery_candidates: HashMap::new(),
+            connect_candidate_groups: HashMap::new(),
             routing_cache_path: None,
             relay_manager: RelayManager::default(),
             queued_relays: HashMap::new(),
@@ -688,10 +692,18 @@ impl KonoNode {
     }
 
     pub fn queue_auto_rendezvous(&mut self, target_node_id: String) {
-        self.pending_dht_queries.insert(target_node_id.clone());
-        self.auto_rendezvous
-            .entry(target_node_id.clone())
-            .or_insert_with(|| AutoRendezvousState::new(target_node_id, Instant::now()));
+        let now = Instant::now();
+        let expired_targets: Vec<String> = self
+            .auto_rendezvous
+            .iter()
+            .filter_map(|(target, state)| state.expired(now).then_some(target.clone()))
+            .collect();
+        for expired in expired_targets {
+            self.pending_dht_queries.remove(&expired);
+        }
+        if admit_auto_rendezvous_target(&mut self.auto_rendezvous, target_node_id.clone(), now) {
+            self.pending_dht_queries.insert(target_node_id);
+        }
     }
 
     pub fn queue_filter_test(&mut self, coordinator: SocketAddr) {
@@ -857,6 +869,7 @@ impl KonoNode {
                     self.drive_session_rekeys().await;
                     self.drive_relay_e2e_rekeys().await;
                     self.drive_auto_rendezvous().await;
+                    self.drive_connect_candidate_groups().await;
                     self.drive_auto_relay_fallbacks().await;
                     self.drive_dht_queries().await;
                     if let Err(error) = self.queue_own_dht_publication() {
@@ -1111,6 +1124,7 @@ impl KonoNode {
                 self.sessions.insert(source, SessionSlot::new(session));
                 self.confirmed_sessions.insert(source);
                 self.last_rekey.insert(source, Instant::now());
+                self.complete_direct_candidate_target(&sender_node_id);
 
                 self.send(
                     source,
@@ -1167,6 +1181,7 @@ impl KonoNode {
                 self.routing
                     .observe(sender_node_id.clone(), source, Instant::now());
                 if newly_confirmed {
+                    self.complete_direct_candidate_target(&sender_node_id);
                     self.last_rekey.insert(source, Instant::now());
                     self.flush_rendezvous_requests(source).await?;
                     self.flush_filter_test_request(source).await?;
@@ -1212,7 +1227,6 @@ impl KonoNode {
                 self.punched_endpoints.insert(source);
                 self.pending_punches.remove(&punch_token);
                 self.punch_relay_candidates.remove(&punch_token);
-                self.auto_rendezvous.remove(&sender_node_id);
 
                 self.send(
                     source,
@@ -2407,17 +2421,48 @@ impl KonoNode {
 
     async fn drive_auto_rendezvous(&mut self) {
         let now = Instant::now();
+        let expired_targets: Vec<String> = self
+            .auto_rendezvous
+            .iter()
+            .filter_map(|(target, state)| {
+                (state.expired(now)
+                    && !self
+                        .pending_punches
+                        .values()
+                        .any(|schedule| schedule.expected_node_id() == target))
+                .then_some(target.clone())
+            })
+            .collect();
+        for target in expired_targets {
+            self.auto_rendezvous.remove(&target);
+            self.pending_dht_queries.remove(&target);
+            if self.direct_app_endpoint_for_peer(&target).is_none()
+                && self.node_id().as_str() < target.as_str()
+            {
+                self.schedule_auto_relay_fallback(target, None, now);
+            }
+        }
         let targets: Vec<String> = self.auto_rendezvous.keys().cloned().collect();
 
         for target_node_id in targets {
-            if self.peer_endpoint_by_node_id(&target_node_id).is_some() {
-                self.auto_rendezvous.remove(&target_node_id);
+            if self.direct_app_endpoint_for_peer(&target_node_id).is_some() {
+                self.complete_direct_candidate_target(&target_node_id);
+                continue;
+            }
+            if self.connect_candidate_groups.contains_key(&target_node_id) {
+                continue;
+            }
+            if self
+                .pending_sessions
+                .values()
+                .any(|attempt| attempt.peer_node_id == target_node_id)
+            {
                 continue;
             }
 
             let candidates: Vec<CoordinatorCandidate> = self
-                .sessions
-                .keys()
+                .confirmed_sessions
+                .iter()
                 .filter_map(|endpoint| {
                     let peer = self.peers.get(endpoint)?;
                     if peer.node_id == target_node_id {
@@ -2429,6 +2474,28 @@ impl KonoNode {
                     })
                 })
                 .collect();
+
+            let punch_active = self
+                .pending_punches
+                .values()
+                .any(|schedule| schedule.expected_node_id() == target_node_id);
+            let round_exhausted = self
+                .auto_rendezvous
+                .get(&target_node_id)
+                .is_some_and(|state| state.round_exhausted(&candidates));
+            if round_exhausted && !punch_active {
+                self.auto_rendezvous.remove(&target_node_id);
+                self.pending_dht_queries.remove(&target_node_id);
+                if self.node_id().as_str() < target_node_id.as_str() {
+                    self.schedule_auto_relay_fallback(target_node_id.clone(), None, now);
+                }
+                info!(
+                    target = %target_node_id,
+                    coordinators = candidates.len(),
+                    "bounded rendezvous candidate round exhausted"
+                );
+                continue;
+            }
 
             if candidates.is_empty() {
                 if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
@@ -3006,16 +3073,95 @@ impl KonoNode {
         if endpoints.is_empty() || endpoints.len() > 8 {
             bail!("connection requires between one and eight endpoints");
         }
-        for endpoint in endpoints {
-            if endpoint.port() == 0 || endpoint.ip().is_unspecified() {
+        for endpoint in &endpoints {
+            let ip = endpoint.ip();
+            let broadcast = matches!(ip, IpAddr::V4(ip) if ip.is_broadcast());
+            if endpoint.port() == 0 || ip.is_unspecified() || ip.is_multicast() || broadcast {
                 bail!("connection endpoint is unusable");
             }
-            if !self.bootstrap_peers.contains(&endpoint) {
-                self.bootstrap_peers.push(endpoint);
+            if self.connect_candidate_groups.iter().any(|(target, group)| {
+                target != &peer_node_id && group.candidates().contains(endpoint)
+            }) || self
+                .discovery_candidates
+                .get(endpoint)
+                .is_some_and(|candidate| {
+                    candidate.expected_node_id.as_str() != peer_node_id.as_str()
+                })
+            {
+                bail!("connection endpoint is already bound to another NodeID");
             }
         }
-        self.queue_auto_rendezvous(peer_node_id);
+        if !self.connect_candidate_groups.contains_key(&peer_node_id)
+            && self.connect_candidate_groups.len() >= MAX_ACTIVE_CANDIDATE_GROUPS
+        {
+            bail!("too many active connection candidate groups");
+        }
+        if let Some(group) = self.connect_candidate_groups.get_mut(&peer_node_id) {
+            group.extend(endpoints);
+        } else {
+            self.connect_candidate_groups.insert(
+                peer_node_id.clone(),
+                CandidateGroup::new(endpoints, Instant::now()),
+            );
+        }
+        self.pending_dht_queries.insert(peer_node_id);
         Ok(())
+    }
+
+    async fn drive_connect_candidate_groups(&mut self) {
+        let now = Instant::now();
+        let targets: Vec<String> = self.connect_candidate_groups.keys().cloned().collect();
+        for target_node_id in targets {
+            if self.direct_app_endpoint_for_peer(&target_node_id).is_some() {
+                self.complete_direct_candidate_target(&target_node_id);
+                continue;
+            }
+
+            let action = self
+                .connect_candidate_groups
+                .get_mut(&target_node_id)
+                .and_then(|group| group.next_action(now));
+            match action {
+                Some(CandidateAction::Try(endpoint)) => {
+                    if let Some(existing) = self.discovery_candidates.get_mut(&endpoint) {
+                        if existing.expected_node_id != target_node_id {
+                            debug!(%endpoint, target = %target_node_id, "candidate endpoint is already identity-bound to another peer");
+                            continue;
+                        }
+                        existing.expires_at = now + CANDIDATE_GROUP_TTL;
+                    } else {
+                        self.discovery_candidates.insert(
+                            endpoint,
+                            DhtDiscoveryCandidate {
+                                expected_node_id: target_node_id.clone(),
+                                expires_at: now + CANDIDATE_GROUP_TTL,
+                            },
+                        );
+                    }
+                    let cookie = self.cookie_cache.get(&endpoint).cloned();
+                    if let Err(error) = self
+                        .send(
+                            endpoint,
+                            MessageBody::Hello {
+                                features: local_features(),
+                                cookie,
+                            },
+                        )
+                        .await
+                    {
+                        debug!(%endpoint, target = %target_node_id, %error, "direct candidate HELLO failed");
+                    } else {
+                        info!(%endpoint, target = %target_node_id, "started bounded direct candidate attempt");
+                    }
+                }
+                Some(CandidateAction::Exhausted) => {
+                    self.queue_auto_rendezvous(target_node_id.clone());
+                    self.connect_candidate_groups.remove(&target_node_id);
+                    info!(target = %target_node_id, "direct candidate group exhausted; rendezvous fallback enabled");
+                }
+                None => {}
+            }
+        }
     }
 
     fn diagnostics_snapshot(&self) -> Result<NetworkDiagnostics> {
@@ -4380,48 +4526,34 @@ impl KonoNode {
             return Ok(false);
         }
 
-        let mut started = false;
-        for endpoint in attested_endpoints.into_iter().take(2) {
-            if let Some(existing) = self.discovery_candidates.get_mut(&endpoint) {
-                if existing.expected_node_id != record.node_id {
-                    debug!(
-                        %endpoint,
-                        expected = %existing.expected_node_id,
-                        rejected = %record.node_id,
-                        "kept existing DHT endpoint identity binding"
-                    );
-                    continue;
-                }
-                existing.expires_at = Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL;
-            } else {
-                self.discovery_candidates.insert(
-                    endpoint,
-                    DhtDiscoveryCandidate {
-                        expected_node_id: record.node_id.clone(),
-                        expires_at: Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL,
-                    },
-                );
-            }
-
-            let cookie = self.cookie_cache.get(&endpoint).cloned();
-            self.send(
-                endpoint,
-                MessageBody::Hello {
-                    features: local_features(),
-                    cookie,
-                },
-            )
-            .await?;
-            started = true;
-
-            info!(
-                target = %record.node_id,
-                %endpoint,
-                "started exact-match DHT discovery attempt"
+        if !self.connect_candidate_groups.contains_key(&record.node_id)
+            && self.connect_candidate_groups.len() >= MAX_ACTIVE_CANDIDATE_GROUPS
+        {
+            return Ok(false);
+        }
+        let candidates: Vec<SocketAddr> = attested_endpoints
+            .into_iter()
+            .filter(|endpoint| {
+                !self.connect_candidate_groups.iter().any(|(target, other)| {
+                    target != &record.node_id && other.candidates().contains(endpoint)
+                }) && self
+                    .discovery_candidates
+                    .get(endpoint)
+                    .is_none_or(|candidate| candidate.expected_node_id == record.node_id)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        if let Some(group) = self.connect_candidate_groups.get_mut(&record.node_id) {
+            group.extend(candidates);
+        } else {
+            self.connect_candidate_groups.insert(
+                record.node_id.clone(),
+                CandidateGroup::new(candidates, Instant::now()),
             );
         }
-
-        Ok(started)
+        Ok(true)
     }
 
     fn record_has_attested_endpoint(&self, record: &PeerRecord) -> bool {
@@ -4987,9 +5119,16 @@ impl KonoNode {
                 let relay_candidate = self.punch_relay_candidates.remove(&token);
                 let local_node_id = self.node_id();
                 let mut relay_scheduled = false;
+                let sibling_active = self
+                    .pending_punches
+                    .values()
+                    .any(|other| other.expected_node_id() == target_node_id);
+                let auto_managed = self.auto_rendezvous.contains_key(&target_node_id);
 
-                if local_node_id.as_str() < target_node_id.as_str()
-                    && self.peer_endpoint_by_node_id(&target_node_id).is_none()
+                if !auto_managed
+                    && !sibling_active
+                    && local_node_id.as_str() < target_node_id.as_str()
+                    && self.direct_app_endpoint_for_peer(&target_node_id).is_none()
                 {
                     self.schedule_auto_relay_fallback(
                         target_node_id.clone(),
@@ -5000,11 +5139,7 @@ impl KonoNode {
                 }
 
                 if let Some(state) = self.auto_rendezvous.get_mut(&target_node_id) {
-                    if relay_scheduled {
-                        state.defer(Instant::now(), Duration::from_secs(10));
-                    } else {
-                        state.hurry(Instant::now());
-                    }
+                    state.hurry(Instant::now());
                 }
 
                 info!(
@@ -5060,13 +5195,27 @@ impl KonoNode {
         let targets: Vec<String> = self.auto_relay_fallbacks.keys().cloned().collect();
 
         for target_node_id in targets {
-            if self.peer_endpoint_by_node_id(&target_node_id).is_some()
+            if self.direct_app_endpoint_for_peer(&target_node_id).is_some()
                 || self
                     .relay_paths
                     .values()
                     .any(|path| path.peer_node_id == target_node_id && path.expires_at > now)
             {
                 self.auto_relay_fallbacks.remove(&target_node_id);
+                continue;
+            }
+
+            if self
+                .pending_punches
+                .values()
+                .any(|schedule| schedule.expected_node_id() == target_node_id)
+                || self
+                    .pending_sessions
+                    .values()
+                    .any(|attempt| attempt.peer_node_id == target_node_id)
+                || self.connect_candidate_groups.contains_key(&target_node_id)
+                || self.auto_rendezvous.contains_key(&target_node_id)
+            {
                 continue;
             }
 
@@ -5657,9 +5806,13 @@ impl KonoNode {
     }
 
     fn discovery_identity_matches(&self, source: SocketAddr, node_id: &str) -> bool {
-        self.discovery_candidates
+        self.peers
             .get(&source)
-            .is_none_or(|candidate| candidate.expected_node_id == node_id)
+            .is_none_or(|peer| peer.node_id == node_id)
+            && self
+                .discovery_candidates
+                .get(&source)
+                .is_none_or(|candidate| candidate.expected_node_id == node_id)
     }
 
     fn record_peer(&mut self, envelope: &WireEnvelope, source: SocketAddr) {
@@ -5706,13 +5859,6 @@ impl KonoNode {
         }
 
         self.discovery_candidates.remove(&source);
-        self.pending_dht_queries.remove(&envelope.sender_node_id);
-        self.active_dht_queries
-            .retain(|_, query| query.target_node_id != envelope.sender_node_id);
-        self.last_dht_query_start.remove(&envelope.sender_node_id);
-        self.auto_rendezvous.remove(&envelope.sender_node_id);
-        self.auto_relay_fallbacks.remove(&envelope.sender_node_id);
-
         let now = Instant::now();
         self.peers
             .entry(source)
@@ -5730,6 +5876,38 @@ impl KonoNode {
                 observed_external_endpoint: None,
                 features: HashSet::new(),
             });
+    }
+
+    fn complete_direct_candidate_target(&mut self, peer_node_id: &str) {
+        if let Some(mut group) = self.connect_candidate_groups.remove(peer_node_id) {
+            group.complete();
+            for endpoint in group.candidates() {
+                self.discovery_candidates.remove(endpoint);
+            }
+        }
+
+        let cancelled_punches: Vec<u64> = self
+            .pending_punches
+            .iter()
+            .filter_map(|(token, schedule)| {
+                (schedule.expected_node_id() == peer_node_id).then_some(*token)
+            })
+            .collect();
+        for token in cancelled_punches {
+            self.pending_punches.remove(&token);
+            self.punch_relay_candidates.remove(&token);
+        }
+
+        self.pending_sessions
+            .retain(|_, attempt| attempt.peer_node_id != peer_node_id);
+        self.pending_relay_requests
+            .retain(|_, (_, target)| target != peer_node_id);
+        self.pending_dht_queries.remove(peer_node_id);
+        self.active_dht_queries
+            .retain(|_, query| query.target_node_id != peer_node_id);
+        self.last_dht_query_start.remove(peer_node_id);
+        self.auto_rendezvous.remove(peer_node_id);
+        self.auto_relay_fallbacks.remove(peer_node_id);
     }
 
     fn evict_oldest_peer(&mut self) {
@@ -5993,12 +6171,119 @@ mod tests {
             endpoint,
             DhtDiscoveryCandidate {
                 expected_node_id: expected.clone(),
-                expires_at: Instant::now() + DHT_DISCOVERY_CANDIDATE_TTL,
+                expires_at: Instant::now() + CANDIDATE_GROUP_TTL,
             },
         );
 
         assert!(node.is_expected_peer(endpoint, &expected));
         assert!(!node.is_expected_peer(endpoint, &unexpected));
+    }
+
+    #[tokio::test]
+    async fn connect_candidate_rejects_wrong_identity_before_peer_admission() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let endpoint: SocketAddr = "127.0.0.1:47000".parse().unwrap();
+        let expected = NodeIdentity::generate().node_id();
+        let impostor = NodeIdentity::generate();
+        node.queue_connect(expected, vec![endpoint]).unwrap();
+        node.drive_connect_candidate_groups().await;
+        assert!(node.discovery_candidates.contains_key(&endpoint));
+        let packet = WireEnvelope::signed(
+            &impostor,
+            42,
+            MessageBody::HelloAck {
+                observed_endpoint: endpoint.to_string(),
+                features: Vec::new(),
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        node.handle_datagram(&packet, endpoint).await.unwrap();
+        assert!(!node.peers.contains_key(&endpoint));
+    }
+
+    #[tokio::test]
+    async fn connect_candidate_state_is_globally_bounded_and_endpoint_bound() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let first_endpoint: SocketAddr = "192.0.2.1:20000".parse().unwrap();
+        node.queue_connect(format!("knp1{:040x}", 1), vec![first_endpoint])
+            .unwrap();
+        assert!(node
+            .queue_connect(format!("knp1{:040x}", 2), vec![first_endpoint])
+            .is_err());
+
+        for index in 2..=MAX_ACTIVE_CANDIDATE_GROUPS {
+            let endpoint: SocketAddr = format!("192.0.2.1:{}", 20_000 + index).parse().unwrap();
+            node.queue_connect(format!("knp1{index:040x}"), vec![endpoint])
+                .unwrap();
+        }
+
+        assert_eq!(
+            node.connect_candidate_groups.len(),
+            MAX_ACTIVE_CANDIDATE_GROUPS
+        );
+        assert!(node
+            .queue_connect(
+                format!("knp1{:040x}", MAX_ACTIVE_CANDIDATE_GROUPS + 1),
+                vec!["192.0.2.1:30000".parse().unwrap()],
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_connect_candidate_cancels_remaining_exact_attempts() {
+        let expected = NodeIdentity::generate();
+        let target_node_id = expected.node_id();
+        let first: SocketAddr = "127.0.0.1:47001".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:47002".parse().unwrap();
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        node.queue_connect(target_node_id.clone(), vec![first, second])
+            .unwrap();
+        node.drive_connect_candidate_groups().await;
+
+        let packet = WireEnvelope::signed(
+            &expected,
+            43,
+            MessageBody::HelloAck {
+                observed_endpoint: first.to_string(),
+                features: local_features(),
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        node.handle_datagram(&packet, first).await.unwrap();
+
+        assert!(node.connect_candidate_groups.contains_key(&target_node_id));
+        node.confirmed_sessions.insert(first);
+        node.complete_direct_candidate_target(&target_node_id);
+
+        assert!(!node.connect_candidate_groups.contains_key(&target_node_id));
+        assert!(!node.discovery_candidates.contains_key(&first));
+        assert!(!node.discovery_candidates.contains_key(&second));
     }
 
     #[tokio::test]

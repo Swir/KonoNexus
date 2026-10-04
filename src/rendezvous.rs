@@ -42,6 +42,14 @@ impl AutoRendezvousState {
         now >= self.expires_at
     }
 
+    pub fn round_exhausted(&self, candidates: &[CoordinatorCandidate]) -> bool {
+        !self.tried.is_empty()
+            && (self.tried.len() >= MAX_AUTO_COORDINATORS_PER_ROUND
+                || candidates
+                    .iter()
+                    .all(|candidate| self.tried.contains(&candidate.endpoint)))
+    }
+
     pub fn next_candidate(
         &mut self,
         candidates: &[CoordinatorCandidate],
@@ -201,5 +209,25 @@ mod tests {
             state.next_candidate(&candidates, now + Duration::from_millis(1)),
             None
         );
+    }
+
+    #[test]
+    fn round_exhaustion_requires_every_available_coordinator_or_the_hard_cap() {
+        let now = Instant::now();
+        let candidates: Vec<CoordinatorCandidate> = (1..=4)
+            .map(|last_octet| CoordinatorCandidate {
+                endpoint: format!("203.0.113.{last_octet}:47000").parse().unwrap(),
+                first_seen: now,
+            })
+            .collect();
+        let mut state = AutoRendezvousState::new("knp1target".into(), now);
+
+        assert!(!state.round_exhausted(&candidates));
+        for index in 0..MAX_AUTO_COORDINATORS_PER_ROUND {
+            let attempt_at =
+                now + AUTO_RENDEZVOUS_RETRY_DELAY.saturating_mul(u32::try_from(index).unwrap());
+            assert!(state.next_candidate(&candidates, attempt_at).is_some());
+        }
+        assert!(state.round_exhausted(&candidates));
     }
 }
