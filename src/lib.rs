@@ -1,3 +1,4 @@
+mod candidate_group;
 pub mod dht;
 pub mod identity;
 pub mod invite;

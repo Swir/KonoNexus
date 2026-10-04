@@ -2,6 +2,14 @@
 
 Development log for KonoNexus.
 
+## 0.1.0-alpha.21
+
+- Bumped the active source and external-testing candidate to `0.1.0-alpha.21`.
+- Added a NodeID-bound planner shared by explicit `connect()` hints and independently attested exact DHT results: it deduplicates exact endpoints, retains at most three per target, staggers attempts, expires state after 30 seconds, and caps active target groups at 256.
+- Rejected cross-NodeID endpoint reuse, multicast, broadcast, unspecified and port-zero connection hints; only an attempted endpoint becomes expected, and a mismatched signed identity is rejected before peer admission.
+- Made confirmed encrypted direct sessions atomically cancel sibling direct candidates, punch schedules, rendezvous work and pending relay requests. Automatic rendezvous now exhausts one bounded coordinator round before enabling relay fallback.
+- Added focused tests for exact candidate order, deduplication, caps, expiry, identity binding, one-shot escalation and success cancellation. These are protocol/state-machine proofs only and do not claim real WAN, NAT or CGNAT behavior.
+
 ## 0.1.0-alpha.20
 
 - Bumped the active source and external-testing candidate to `0.1.0-alpha.20`.
