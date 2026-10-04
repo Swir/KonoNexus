@@ -141,7 +141,7 @@ To constrain amplification and loops, query state expires after 8 seconds, forwa
 
 ## 15. Remaining DHT work
 
-- endpoint ownership/observation attestations,
+- runtime exchange and policy enforcement for endpoint ownership/observation attestations (the bounded signed observation primitive is implemented),
 - replication/refresh strategy,
 - stronger long-window query rate limiting,
 - Sybil-resistant routing diversity,

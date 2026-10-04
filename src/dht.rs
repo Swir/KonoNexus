@@ -17,7 +17,237 @@ pub const DHT_QUERY_FANOUT: usize = 2;
 pub const DHT_MAX_HOPS: u8 = 3;
 pub const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DHT_QUERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+pub const DEFAULT_ENDPOINT_ATTESTATION_TTL_MS: u64 = 5 * 60 * 1_000;
+pub const MAX_ENDPOINT_ATTESTATION_TTL_MS: u64 = 10 * 60 * 1_000;
+pub const DEFAULT_DHT_MAX_ATTESTATIONS: usize = DEFAULT_DHT_MAX_RECORDS * MAX_RECORD_ENDPOINTS;
 const RECORD_CLOCK_SKEW_MS: u64 = 120_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EndpointAttestation {
+    pub subject_node_id: String,
+    pub endpoint: String,
+    pub observer_node_id: String,
+    pub observer_public_key: String,
+    pub observed_unix_ms: u64,
+    pub expires_unix_ms: u64,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+struct UnsignedEndpointAttestation<'a> {
+    subject_node_id: &'a str,
+    endpoint: &'a str,
+    observer_node_id: &'a str,
+    observer_public_key: &'a str,
+    observed_unix_ms: u64,
+    expires_unix_ms: u64,
+}
+
+impl EndpointAttestation {
+    pub fn signed(
+        observer: &NodeIdentity,
+        subject_node_id: String,
+        endpoint: SocketAddr,
+    ) -> Result<Self> {
+        let now = unix_time_ms()?;
+        Self::signed_at(
+            observer,
+            subject_node_id,
+            endpoint,
+            now,
+            DEFAULT_ENDPOINT_ATTESTATION_TTL_MS,
+        )
+    }
+
+    fn signed_at(
+        observer: &NodeIdentity,
+        subject_node_id: String,
+        endpoint: SocketAddr,
+        now: u64,
+        ttl_ms: u64,
+    ) -> Result<Self> {
+        if observer.node_id() == subject_node_id {
+            bail!("endpoint attestation requires an independent observer");
+        }
+        if !endpoint_publishable(endpoint) {
+            bail!("attested endpoint is not publishable");
+        }
+
+        let mut attestation = Self {
+            subject_node_id,
+            endpoint: endpoint.to_string(),
+            observer_node_id: observer.node_id(),
+            observer_public_key: observer.public_key_hex(),
+            observed_unix_ms: now,
+            expires_unix_ms: now.saturating_add(ttl_ms.min(MAX_ENDPOINT_ATTESTATION_TTL_MS)),
+            signature: String::new(),
+        };
+        attestation.signature = hex::encode(observer.sign(&attestation.signing_bytes()?));
+        Ok(attestation)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        self.verify_at(unix_time_ms()?)
+    }
+
+    fn verify_at(&self, now: u64) -> Result<()> {
+        if !plausible_node_id(&self.subject_node_id) {
+            bail!("endpoint attestation subject NodeID is invalid");
+        }
+        if self.subject_node_id == self.observer_node_id {
+            bail!("endpoint attestation is self-issued");
+        }
+        if self.observed_unix_ms > now.saturating_add(RECORD_CLOCK_SKEW_MS) {
+            bail!("endpoint attestation issued too far in the future");
+        }
+        if self.expires_unix_ms <= now {
+            bail!("endpoint attestation expired");
+        }
+        if self.expires_unix_ms < self.observed_unix_ms
+            || self.expires_unix_ms - self.observed_unix_ms > MAX_ENDPOINT_ATTESTATION_TTL_MS
+        {
+            bail!("endpoint attestation TTL is invalid");
+        }
+
+        let endpoint = self
+            .endpoint
+            .parse::<SocketAddr>()
+            .context("attested endpoint is not a socket address")?;
+        if !endpoint_publishable(endpoint) {
+            bail!("attested endpoint is not publishable");
+        }
+
+        let public_key_raw = hex::decode(&self.observer_public_key)
+            .context("attestation observer public key is not valid hex")?;
+        let public_key: [u8; PUBLIC_KEY_LEN] = public_key_raw
+            .try_into()
+            .map_err(|_| anyhow!("attestation observer public key must be 32 bytes"))?;
+        if node_id_from_public_key(&public_key) != self.observer_node_id {
+            bail!("attestation observer NodeID/public-key mismatch");
+        }
+
+        let signature_raw = hex::decode(&self.signature)
+            .context("attestation signature is not valid hex")?;
+        let signature: [u8; SIGNATURE_LEN] = signature_raw
+            .try_into()
+            .map_err(|_| anyhow!("attestation signature must be 64 bytes"))?;
+        NodeIdentity::verify_with_public_key(&public_key, &self.signing_bytes()?, &signature)
+    }
+
+    fn signing_bytes(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(&UnsignedEndpointAttestation {
+            subject_node_id: &self.subject_node_id,
+            endpoint: &self.endpoint,
+            observer_node_id: &self.observer_node_id,
+            observer_public_key: &self.observer_public_key,
+            observed_unix_ms: self.observed_unix_ms,
+            expires_unix_ms: self.expires_unix_ms,
+        })
+        .context("failed to serialize endpoint attestation")
+    }
+}
+
+#[derive(Debug)]
+pub struct EndpointAttestationTable {
+    attestations: HashMap<(String, String, String), EndpointAttestation>,
+    max_attestations: usize,
+}
+
+impl Default for EndpointAttestationTable {
+    fn default() -> Self {
+        Self::new(DEFAULT_DHT_MAX_ATTESTATIONS)
+    }
+}
+
+impl EndpointAttestationTable {
+    pub fn new(max_attestations: usize) -> Self {
+        Self {
+            attestations: HashMap::new(),
+            max_attestations: max_attestations.max(1),
+        }
+    }
+
+    pub fn upsert(&mut self, attestation: EndpointAttestation) -> Result<bool> {
+        attestation.verify()?;
+        let key = (
+            attestation.subject_node_id.clone(),
+            attestation.endpoint.clone(),
+            attestation.observer_node_id.clone(),
+        );
+        if self
+            .attestations
+            .get(&key)
+            .is_some_and(|existing| existing.observed_unix_ms >= attestation.observed_unix_ms)
+        {
+            return Ok(false);
+        }
+        if !self.attestations.contains_key(&key)
+            && self.attestations.len() >= self.max_attestations
+        {
+            self.evict_oldest();
+        }
+        self.attestations.insert(key, attestation);
+        Ok(true)
+    }
+
+    pub fn independent_observer_count(&self, subject_node_id: &str, endpoint: SocketAddr) -> usize {
+        let endpoint = endpoint.to_string();
+        let now = unix_time_ms().unwrap_or(u64::MAX);
+        self.attestations
+            .values()
+            .filter(|attestation| {
+                attestation.subject_node_id == subject_node_id
+                    && attestation.endpoint == endpoint
+                    && attestation.expires_unix_ms > now
+            })
+            .map(|attestation| &attestation.observer_node_id)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    pub fn attested_endpoints(
+        &self,
+        record: &PeerRecord,
+        minimum_independent_observers: usize,
+    ) -> Vec<SocketAddr> {
+        record
+            .socket_endpoints()
+            .into_iter()
+            .filter(|endpoint| {
+                self.independent_observer_count(&record.node_id, *endpoint)
+                    >= minimum_independent_observers.max(1)
+            })
+            .collect()
+    }
+
+    pub fn expire(&mut self) -> usize {
+        let now = unix_time_ms().unwrap_or(u64::MAX);
+        let before = self.attestations.len();
+        self.attestations.retain(|_, attestation| attestation.expires_unix_ms > now);
+        before.saturating_sub(self.attestations.len())
+    }
+
+    pub fn len(&self) -> usize {
+        self.attestations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.attestations.is_empty()
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some(key) = self
+            .attestations
+            .iter()
+            .min_by_key(|(_, attestation)| {
+                (attestation.expires_unix_ms, attestation.observed_unix_ms)
+            })
+            .map(|(key, _)| key.clone())
+        {
+            self.attestations.remove(&key);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerRecord {
@@ -377,6 +607,12 @@ fn key_hash(node_id: &str) -> [u8; 32] {
     Sha256::digest(node_id.as_bytes()).into()
 }
 
+fn plausible_node_id(node_id: &str) -> bool {
+    node_id.len() == 44
+        && node_id.starts_with("knp1")
+        && node_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn xor_distance(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     let mut distance = [0_u8; 32];
     for index in 0..32 {
@@ -405,6 +641,77 @@ mod tests {
         record.verify().unwrap();
         record.endpoints[0] = "1.1.1.1:47000".to_owned();
         assert!(record.verify().is_err());
+    }
+
+    #[test]
+    fn endpoint_attestation_requires_independent_valid_observer() {
+        let subject = NodeIdentity::generate();
+        let observer = NodeIdentity::generate();
+        let endpoint: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let mut attestation =
+            EndpointAttestation::signed(&observer, subject.node_id(), endpoint).unwrap();
+
+        attestation.verify().unwrap();
+        attestation.endpoint = "1.1.1.1:47000".into();
+        assert!(attestation.verify().is_err());
+        assert!(EndpointAttestation::signed(&subject, subject.node_id(), endpoint).is_err());
+    }
+
+    #[test]
+    fn attestation_table_deduplicates_observers_rejects_rollback_and_is_bounded() {
+        let now = unix_time_ms().unwrap();
+        let subject = NodeIdentity::generate();
+        let observer_a = NodeIdentity::generate();
+        let observer_b = NodeIdentity::generate();
+        let endpoint: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let mut table = EndpointAttestationTable::new(2);
+
+        let first = EndpointAttestation::signed_at(
+            &observer_a,
+            subject.node_id(),
+            endpoint,
+            now,
+            DEFAULT_ENDPOINT_ATTESTATION_TTL_MS,
+        )
+        .unwrap();
+        table.upsert(first).unwrap();
+        let rollback = EndpointAttestation::signed_at(
+            &observer_a,
+            subject.node_id(),
+            endpoint,
+            now.saturating_sub(1),
+            DEFAULT_ENDPOINT_ATTESTATION_TTL_MS,
+        )
+        .unwrap();
+        assert!(!table.upsert(rollback).unwrap());
+        assert_eq!(
+            table.independent_observer_count(&subject.node_id(), endpoint),
+            1
+        );
+
+        let second = EndpointAttestation::signed_at(
+            &observer_b,
+            subject.node_id(),
+            endpoint,
+            now.saturating_add(1),
+            DEFAULT_ENDPOINT_ATTESTATION_TTL_MS,
+        )
+        .unwrap();
+        table.upsert(second).unwrap();
+        assert_eq!(
+            table.independent_observer_count(&subject.node_id(), endpoint),
+            2
+        );
+
+        let record = PeerRecord::signed_at(
+            &subject,
+            vec![endpoint, "1.1.1.1:47000".parse().unwrap()],
+            now,
+            DEFAULT_RECORD_TTL_MS,
+        )
+        .unwrap();
+        assert_eq!(table.attested_endpoints(&record, 2), vec![endpoint]);
+        assert_eq!(table.len(), 2);
     }
 
     #[test]
