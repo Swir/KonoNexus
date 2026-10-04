@@ -17,9 +17,10 @@ pub mod security;
 pub mod session;
 
 pub use dht::{
-    endpoint_publishable, routing_bucket_index, DhtTable, EndpointAttestation,
-    EndpointAttestationTable, PeerRecord, RoutingPeer, RoutingTable,
-    DHT_ATTESTATION_RESPONSE_LIMIT, DHT_MAX_HOPS, DHT_QUERY_FANOUT, DHT_RESPONSE_LIMIT,
+    endpoint_publishable, node_id_closer_to_target, routing_bucket_index, DhtTable,
+    EndpointAttestation, EndpointAttestationTable, PeerRecord, RoutingPeer, RoutingTable,
+    DHT_ATTESTATION_RESPONSE_LIMIT, DHT_MAX_HOPS, DHT_QUERY_FANOUT, DHT_REPLICATION_FANOUT,
+    DHT_REPLICATION_MAX_HOPS, DHT_RESPONSE_LIMIT, DHT_SYNC_REPLICA_LIMIT,
     MIN_ENDPOINT_ATTESTATION_OBSERVERS,
 };
 pub use identity::NodeIdentity;

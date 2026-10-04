@@ -17,6 +17,9 @@ pub const DHT_BUCKET_COUNT: usize = 256;
 pub const DHT_BUCKET_SIZE: usize = 8;
 pub const DHT_QUERY_FANOUT: usize = 2;
 pub const DHT_MAX_HOPS: u8 = 3;
+pub const DHT_REPLICATION_FANOUT: usize = 2;
+pub const DHT_REPLICATION_MAX_HOPS: u8 = 2;
+pub const DHT_SYNC_REPLICA_LIMIT: usize = 4;
 pub const DHT_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DHT_QUERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_ENDPOINT_ATTESTATION_TTL_MS: u64 = 5 * 60 * 1_000;
@@ -342,6 +345,18 @@ impl PeerRecord {
         Self::signed_at(identity, endpoints, now, DEFAULT_RECORD_TTL_MS)
     }
 
+    pub(crate) fn signed_after(
+        identity: &NodeIdentity,
+        endpoints: Vec<SocketAddr>,
+        previous_sequence: u64,
+    ) -> Result<Self> {
+        let wall_now = unix_time_ms()?;
+        let issued_at = wall_now.max(previous_sequence.saturating_add(1));
+        let record = Self::signed_at(identity, endpoints, issued_at, DEFAULT_RECORD_TTL_MS)?;
+        record.verify_at(wall_now)?;
+        Ok(record)
+    }
+
     fn signed_at(
         identity: &NodeIdentity,
         endpoints: Vec<SocketAddr>,
@@ -455,7 +470,15 @@ impl PeerRecord {
 #[derive(Debug)]
 pub struct DhtTable {
     records: HashMap<String, PeerRecord>,
+    high_watermarks: HashMap<String, RecordHighWatermark>,
     max_records: usize,
+    max_high_watermarks: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordHighWatermark {
+    sequence: u64,
+    retain_until_unix_ms: u64,
 }
 
 impl Default for DhtTable {
@@ -468,23 +491,45 @@ impl DhtTable {
     pub fn new(max_records: usize) -> Self {
         Self {
             records: HashMap::new(),
+            high_watermarks: HashMap::new(),
             max_records: max_records.max(1),
+            max_high_watermarks: max_records.max(1).saturating_mul(2),
         }
     }
 
     pub fn upsert(&mut self, record: PeerRecord) -> Result<bool> {
-        record.verify()?;
+        let now = unix_time_ms()?;
+        self.upsert_at(record, now)
+    }
 
-        if let Some(existing) = self.records.get(&record.node_id) {
-            if record.sequence <= existing.sequence {
-                return Ok(false);
-            }
+    fn upsert_at(&mut self, record: PeerRecord, now: u64) -> Result<bool> {
+        record.verify_at(now)?;
+        self.expire_at(now);
+
+        if self
+            .high_watermarks
+            .get(&record.node_id)
+            .is_some_and(|watermark| watermark.sequence >= record.sequence)
+        {
+            return Ok(false);
+        }
+        if !self.high_watermarks.contains_key(&record.node_id)
+            && self.high_watermarks.len() >= self.max_high_watermarks
+        {
+            bail!("DHT record rollback table is at bounded capacity");
         }
 
         if !self.records.contains_key(&record.node_id) && self.records.len() >= self.max_records {
             self.evict_oldest();
         }
 
+        self.high_watermarks.insert(
+            record.node_id.clone(),
+            RecordHighWatermark {
+                sequence: record.sequence,
+                retain_until_unix_ms: record.issued_unix_ms.saturating_add(MAX_RECORD_TTL_MS),
+            },
+        );
         self.records.insert(record.node_id.clone(), record);
         Ok(true)
     }
@@ -506,9 +551,15 @@ impl DhtTable {
 
     pub fn expire(&mut self) -> usize {
         let now = unix_time_ms().unwrap_or(u64::MAX);
+        self.expire_at(now)
+    }
+
+    fn expire_at(&mut self, now: u64) -> usize {
         let before = self.records.len();
         self.records
             .retain(|_, record| record.expires_unix_ms > now);
+        self.high_watermarks
+            .retain(|_, watermark| watermark.retain_until_unix_ms > now);
         before.saturating_sub(self.records.len())
     }
 
@@ -630,6 +681,16 @@ impl RoutingTable {
 
 pub fn routing_bucket_index(local_node_id: &str, remote_node_id: &str) -> Option<usize> {
     bucket_index(key_hash(local_node_id), key_hash(remote_node_id))
+}
+
+pub fn node_id_closer_to_target(
+    candidate_node_id: &str,
+    local_node_id: &str,
+    target_node_id: &str,
+) -> bool {
+    let target = key_hash(target_node_id);
+    xor_distance(key_hash(candidate_node_id), target)
+        < xor_distance(key_hash(local_node_id), target)
 }
 
 fn bucket_index(local: [u8; 32], remote: [u8; 32]) -> Option<usize> {
@@ -880,6 +941,23 @@ mod tests {
     }
 
     #[test]
+    fn closer_comparison_moves_monotonically_toward_target() {
+        let target = "knp1-target";
+        let local = "knp1-local";
+        let candidates = ["knp1-a", "knp1-b", "knp1-c"];
+        let closest = candidates
+            .iter()
+            .min_by_key(|candidate| xor_distance(key_hash(candidate), key_hash(target)))
+            .unwrap();
+
+        assert_eq!(
+            node_id_closer_to_target(closest, local, target),
+            xor_distance(key_hash(closest), key_hash(target))
+                < xor_distance(key_hash(local), key_hash(target))
+        );
+    }
+
+    #[test]
     fn table_rejects_rollback_and_is_bounded() {
         let now = unix_time_ms().unwrap();
         let a = NodeIdentity::generate();
@@ -914,5 +992,31 @@ mod tests {
         .unwrap();
         table.upsert(second).unwrap();
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn record_high_watermark_blocks_first_seen_rollback_after_newer_expiry() {
+        let now = unix_time_ms().unwrap();
+        let identity = NodeIdentity::generate();
+        let older = PeerRecord::signed_at(
+            &identity,
+            vec!["8.8.8.8:47000".parse().unwrap()],
+            now,
+            DEFAULT_RECORD_TTL_MS,
+        )
+        .unwrap();
+        let newer = PeerRecord::signed_at(
+            &identity,
+            vec!["8.8.4.4:47000".parse().unwrap()],
+            now + 1,
+            2,
+        )
+        .unwrap();
+        let mut table = DhtTable::new(1);
+
+        assert!(table.upsert_at(newer, now + 1).unwrap());
+        assert_eq!(table.expire_at(now + 3), 1);
+        assert!(table.is_empty());
+        assert!(!table.upsert_at(older, now + 3).unwrap());
     }
 }
