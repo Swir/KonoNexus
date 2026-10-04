@@ -622,8 +622,7 @@ mod tests {
     #[test]
     fn dht_store_round_trip_preserves_replication_budget() {
         let identity = NodeIdentity::generate();
-        let record =
-            PeerRecord::signed(&identity, vec!["8.8.8.8:47000".parse().unwrap()]).unwrap();
+        let record = PeerRecord::signed(&identity, vec!["8.8.8.8:47000".parse().unwrap()]).unwrap();
         let payload = SecurePayload::DhtStore {
             record,
             attestations: Vec::new(),

@@ -524,9 +524,7 @@ impl DhtTable {
             record.node_id.clone(),
             RecordHighWatermark {
                 sequence: record.sequence,
-                retain_until_unix_ms: record
-                    .issued_unix_ms
-                    .saturating_add(MAX_RECORD_TTL_MS),
+                retain_until_unix_ms: record.issued_unix_ms.saturating_add(MAX_RECORD_TTL_MS),
             },
         );
         self.records.insert(record.node_id.clone(), record);
