@@ -321,10 +321,16 @@ impl DhtQueryTokenBucket {
             .checked_duration_since(self.last_refill)
             .unwrap_or_default();
         let refill_nanos = refill_interval.as_nanos().max(1);
-        let refills = (elapsed.as_nanos() / refill_nanos).min(u16::MAX as u128) as u16;
+        let refills = elapsed.as_nanos() / refill_nanos;
         if refills > 0 {
-            self.tokens = self.tokens.saturating_add(refills).min(capacity);
-            self.last_refill += refill_interval.saturating_mul(u32::from(refills));
+            let token_refills =
+                u16::try_from(refills.min(u128::from(capacity))).unwrap_or(capacity);
+            self.tokens = self.tokens.saturating_add(token_refills).min(capacity);
+            let remainder_nanos =
+                u64::try_from(elapsed.as_nanos() % refill_nanos).unwrap_or_default();
+            self.last_refill = now
+                .checked_sub(Duration::from_nanos(remainder_nanos))
+                .unwrap_or(now);
         }
         if self.tokens == 0 {
             return false;
@@ -3860,19 +3866,7 @@ impl KonoNode {
         true
     }
 
-    fn allow_dht_query(
-        &mut self,
-        sender_node_id: &str,
-        source: SocketAddr,
-        now: Instant,
-    ) -> bool {
-        self.dht_query_peer_buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
-        });
-        self.dht_query_prefix_buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
-        });
-
+    fn allow_dht_query(&mut self, sender_node_id: &str, source: SocketAddr, now: Instant) -> bool {
         let peer_key = sender_node_id.to_owned();
         let prefix_key = dht_network_group(source.ip());
         if (!self.dht_query_peer_buckets.contains_key(&peer_key)
@@ -3906,6 +3900,15 @@ impl KonoNode {
         self.dht_query_prefix_buckets.insert(prefix_key, prefix);
         self.dht_query_global_bucket = global;
         true
+    }
+
+    fn expire_dht_query_guard_at(&mut self, now: Instant) {
+        self.dht_query_peer_buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION);
+        self.dht_query_prefix_buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION);
+        self.last_dht_forward
+            .retain(|_, last| now.duration_since(*last) < DHT_QUERY_GUARD_RETENTION);
     }
 
     fn allow_dht_record_admission(
@@ -4910,14 +4913,7 @@ impl KonoNode {
         self.dht_replication_rate_windows.retain(|_, window| {
             now.duration_since(window.last_seen) < DHT_REPLICATION_RATE_RETENTION
         });
-        self.dht_query_peer_buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
-        });
-        self.dht_query_prefix_buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
-        });
-        self.last_dht_forward
-            .retain(|_, last| now.duration_since(*last) < DHT_QUERY_GUARD_RETENTION);
+        self.expire_dht_query_guard_at(now);
         self.dht_replication_history
             .retain(|_, history| history.expires_at > now);
         self.pending_dht_replications
@@ -5134,11 +5130,12 @@ mod tests {
             Duration::from_secs(2),
             now + Duration::from_millis(1_999)
         ));
-        assert!(bucket.try_take(
-            2,
-            Duration::from_secs(2),
-            now + Duration::from_secs(2)
-        ));
+        assert!(bucket.try_take(2, Duration::from_secs(2), now + Duration::from_secs(2)));
+
+        let long_idle = now + Duration::from_secs(72 * 60 * 60);
+        assert!(bucket.try_take(2, Duration::from_secs(2), long_idle));
+        assert!(bucket.try_take(2, Duration::from_secs(2), long_idle));
+        assert!(!bucket.try_take(2, Duration::from_secs(2), long_idle));
     }
 
     #[tokio::test]
