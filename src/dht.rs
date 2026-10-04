@@ -8,6 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_DHT_MAX_RECORDS: usize = 4_096;
 pub const DHT_RESPONSE_LIMIT: usize = 8;
+pub const DHT_ATTESTATION_RESPONSE_LIMIT: usize = 4;
+pub const MIN_ENDPOINT_ATTESTATION_OBSERVERS: usize = 2;
 pub const MAX_RECORD_ENDPOINTS: usize = 4;
 pub const DEFAULT_RECORD_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_RECORD_TTL_MS: u64 = 30 * 60 * 1_000;
@@ -113,6 +115,9 @@ impl EndpointAttestation {
             .endpoint
             .parse::<SocketAddr>()
             .context("attested endpoint is not a socket address")?;
+        if endpoint.to_string() != self.endpoint {
+            bail!("attested endpoint is not canonically encoded");
+        }
         if !endpoint_publishable(endpoint) {
             bail!("attested endpoint is not publishable");
         }
@@ -150,7 +155,14 @@ impl EndpointAttestation {
 #[derive(Debug)]
 pub struct EndpointAttestationTable {
     attestations: HashMap<(String, String, String), EndpointAttestation>,
+    high_watermarks: HashMap<(String, String, String), AttestationHighWatermark>,
     max_attestations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttestationHighWatermark {
+    observed_unix_ms: u64,
+    retain_until_unix_ms: u64,
 }
 
 impl Default for EndpointAttestationTable {
@@ -163,28 +175,53 @@ impl EndpointAttestationTable {
     pub fn new(max_attestations: usize) -> Self {
         Self {
             attestations: HashMap::new(),
+            high_watermarks: HashMap::new(),
             max_attestations: max_attestations.max(1),
         }
     }
 
     pub fn upsert(&mut self, attestation: EndpointAttestation) -> Result<bool> {
-        attestation.verify()?;
+        let now = unix_time_ms()?;
+        self.upsert_at(attestation, now)
+    }
+
+    fn upsert_at(&mut self, attestation: EndpointAttestation, now: u64) -> Result<bool> {
+        attestation.verify_at(now)?;
+        self.expire_at(now);
         let key = (
             attestation.subject_node_id.clone(),
             attestation.endpoint.clone(),
             attestation.observer_node_id.clone(),
         );
         if self
-            .attestations
+            .high_watermarks
             .get(&key)
-            .is_some_and(|existing| existing.observed_unix_ms >= attestation.observed_unix_ms)
+            .is_some_and(|watermark| watermark.observed_unix_ms >= attestation.observed_unix_ms)
         {
             return Ok(false);
         }
-        if !self.attestations.contains_key(&key) && self.attestations.len() >= self.max_attestations
+        if !self.high_watermarks.contains_key(&key)
+            && self.high_watermarks.len() >= self.max_attestations
         {
-            self.evict_oldest();
+            bail!("endpoint attestation table is at bounded capacity");
         }
+
+        let rollback_horizon = attestation
+            .observed_unix_ms
+            .saturating_add(MAX_ENDPOINT_ATTESTATION_TTL_MS);
+        let retain_until_unix_ms = self
+            .high_watermarks
+            .get(&key)
+            .map_or(rollback_horizon, |watermark| {
+                watermark.retain_until_unix_ms.max(rollback_horizon)
+            });
+        self.high_watermarks.insert(
+            key.clone(),
+            AttestationHighWatermark {
+                observed_unix_ms: attestation.observed_unix_ms,
+                retain_until_unix_ms,
+            },
+        );
         self.attestations.insert(key, attestation);
         Ok(true)
     }
@@ -219,11 +256,53 @@ impl EndpointAttestationTable {
             .collect()
     }
 
+    pub fn for_record(&self, record: &PeerRecord, limit: usize) -> Vec<EndpointAttestation> {
+        let now = unix_time_ms().unwrap_or(u64::MAX);
+        let limit = limit.min(DHT_ATTESTATION_RESPONSE_LIMIT);
+        let mut selected = Vec::new();
+
+        for endpoint in record.endpoints.iter().take(2) {
+            let mut candidates: Vec<EndpointAttestation> = self
+                .attestations
+                .values()
+                .filter(|attestation| {
+                    attestation.subject_node_id == record.node_id
+                        && attestation.endpoint == *endpoint
+                        && attestation.expires_unix_ms > now
+                })
+                .cloned()
+                .collect();
+            candidates.sort_by(|left, right| {
+                right
+                    .observed_unix_ms
+                    .cmp(&left.observed_unix_ms)
+                    .then(left.observer_node_id.cmp(&right.observer_node_id))
+            });
+            selected.extend(
+                candidates
+                    .into_iter()
+                    .take(MIN_ENDPOINT_ATTESTATION_OBSERVERS),
+            );
+            if selected.len() >= limit {
+                break;
+            }
+        }
+
+        selected.truncate(limit);
+        selected
+    }
+
     pub fn expire(&mut self) -> usize {
         let now = unix_time_ms().unwrap_or(u64::MAX);
+        self.expire_at(now)
+    }
+
+    fn expire_at(&mut self, now: u64) -> usize {
         let before = self.attestations.len();
         self.attestations
             .retain(|_, attestation| attestation.expires_unix_ms > now);
+        self.high_watermarks
+            .retain(|_, watermark| watermark.retain_until_unix_ms > now);
         before.saturating_sub(self.attestations.len())
     }
 
@@ -233,19 +312,6 @@ impl EndpointAttestationTable {
 
     pub fn is_empty(&self) -> bool {
         self.attestations.is_empty()
-    }
-
-    fn evict_oldest(&mut self) {
-        if let Some(key) = self
-            .attestations
-            .iter()
-            .min_by_key(|(_, attestation)| {
-                (attestation.expires_unix_ms, attestation.observed_unix_ms)
-            })
-            .map(|(key, _)| key.clone())
-        {
-            self.attestations.remove(&key);
-        }
     }
 }
 
@@ -711,7 +777,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(table.attested_endpoints(&record, 2), vec![endpoint]);
+        assert_eq!(table.for_record(&record, 1).len(), 1);
         assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn attestation_high_watermark_blocks_replay_after_newer_evidence_expires() {
+        let now = unix_time_ms().unwrap();
+        let subject = NodeIdentity::generate();
+        let observer = NodeIdentity::generate();
+        let endpoint: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let older = EndpointAttestation::signed_at(
+            &observer,
+            subject.node_id(),
+            endpoint,
+            now,
+            DEFAULT_ENDPOINT_ATTESTATION_TTL_MS,
+        )
+        .unwrap();
+        let newer =
+            EndpointAttestation::signed_at(&observer, subject.node_id(), endpoint, now + 1, 2)
+                .unwrap();
+        let mut table = EndpointAttestationTable::new(1);
+
+        assert!(table.upsert_at(newer, now + 1).unwrap());
+        assert_eq!(table.expire_at(now + 3), 1);
+        assert!(table.is_empty());
+        assert!(!table.upsert_at(older, now + 3).unwrap());
     }
 
     #[test]

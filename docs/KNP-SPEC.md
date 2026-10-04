@@ -135,13 +135,16 @@ For a pending NodeID lookup, the origin selects up to 2 nearest active routing p
 
 An intermediate node validates NodeID shape and hop bounds, suppresses duplicate `(origin, query_id)` pairs, returns its current exact/nearest signed records, stores a short-lived reverse route toward the requester, and forwards the query to at most 2 other established encrypted peers when no exact record is known and hops remain.
 
-`DhtNodes` responses are cached after signature/TTL verification. If the node is not the origin, the response is forwarded along the encrypted reverse path. At the origin, only an exact current record for the requested NodeID can activate temporary discovery endpoints.
+`DhtNodes` responses are cached after record and endpoint-attestation signature/TTL verification. If the node is not the origin, the response is forwarded along the encrypted reverse path. At the origin, only an exact current record for the requested NodeID with matching, unexpired attestations from at least two different Ed25519 identities can activate temporary discovery endpoints.
+
+An authenticated peer signs a short-lived `EndpointAttestation` for the public source endpoint it observes after session confirmation and sends that evidence directly to the endpoint owner. Self-attestations are rejected. Attestations bind the subject NodeID, endpoint, observer NodeID/public key, observation time, expiry and signature; their maximum lifetime is ten minutes. Owners attach collected evidence to `DhtStore`, and `DhtNodes` carries at most four matching attestations so the encrypted envelope remains inside the 16 KiB packet bound. Receivers accept evidence only for a currently valid signed peer record containing that exact endpoint. Storage and rollback high-watermarks are bounded, newer observations replace older ones from the same observer, and replay of older still-valid evidence remains rejected after replacement or expiry.
+
+Two independent identities provide reachability corroboration, not Sybil resistance. Stronger observer diversity remains required before production.
 
 To constrain amplification and loops, query state expires after 8 seconds, forwarding from the same immediate peer is throttled, and the seen-query cache is capped. The design intentionally favors bounded reachability over aggressive flooding.
 
 ## 15. Remaining DHT work
 
-- runtime exchange and policy enforcement for endpoint ownership/observation attestations (the bounded signed observation primitive is implemented),
 - replication/refresh strategy,
 - stronger long-window query rate limiting,
 - Sybil-resistant routing diversity,
