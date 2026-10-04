@@ -31,7 +31,7 @@ use crate::session::{respond_handshake, PendingHandshake, SecurePayload, Session
 use anyhow::{anyhow, bail, Context, Result};
 use rand::random;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -49,11 +49,17 @@ const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
+// One first-hop peer can return 1 + 2 + 4 + 8 bounded tree responses at hop depth 3.
+const MAX_DHT_RESPONSES_PER_PEER_QUERY: u8 = 15;
+const DHT_RESPONSE_CACHE_LIMIT: usize = 2;
 const ENDPOINT_ATTESTATION_REFRESH_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const MAX_ENDPOINT_ATTESTATION_REFRESHES_PER_TICK: usize = 8;
 const DHT_REPLICATION_RATE_WINDOW: Duration = Duration::from_secs(60);
 const DHT_REPLICATION_RATE_RETENTION: Duration = Duration::from_secs(10 * 60);
-const MAX_DHT_REPLICATION_EVENTS_PER_PEER_WINDOW: u16 = 32;
+const MAX_DHT_RECORDS_PER_PEER_WINDOW: u16 = 32;
+const MAX_DHT_RECORDS_PER_PREFIX_WINDOW: u16 = 96;
+// Even 33 skew-overlapping one-minute bursts stay below half the rollback watermark table.
+const MAX_DHT_RECORDS_GLOBAL_WINDOW: u16 = 120;
 const MAX_DHT_REPLICATION_RATE_WINDOWS: usize = 4_096;
 const OWN_DHT_RECORD_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
 const MAX_DHT_REPLICATION_HISTORY: usize = 8_192;
@@ -260,12 +266,15 @@ struct PendingFilterConsent {
 #[derive(Debug, Clone)]
 struct ActiveDhtQuery {
     target_node_id: String,
+    expected_responders: HashMap<SocketAddr, u8>,
     expires_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct ReverseDhtRoute {
     previous_endpoint: SocketAddr,
+    target_node_id: String,
+    expected_responders: HashMap<SocketAddr, u8>,
     expires_at: Instant,
 }
 
@@ -286,6 +295,7 @@ struct DhtReplicationRateWindow {
 struct DhtReplicationHistory {
     target_node_ids: HashSet<String>,
     transit_target_node_ids: HashSet<String>,
+    owner_target_node_ids: HashSet<String>,
     expires_at: Instant,
 }
 
@@ -297,6 +307,7 @@ struct PendingDhtReplication {
     attestations: Vec<EndpointAttestation>,
     replication_hops_remaining: u8,
     transit_forward: bool,
+    owner_priority: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1354,6 +1365,19 @@ impl KonoNode {
                     );
                     return Ok(());
                 }
+                if let Err(error) = record.verify() {
+                    debug!(peer = %sender_node_id, %error, "rejected invalid DHT peer record");
+                    return Ok(());
+                }
+                if !self.allow_dht_record_admission(
+                    sender_node_id,
+                    source,
+                    1,
+                    Instant::now(),
+                ) {
+                    debug!(peer = %sender_node_id, "DHT record admission rate-limited");
+                    return Ok(());
+                }
                 let record_node_id = record.node_id.clone();
                 let record_was_new = match self.dht.upsert(record.clone()) {
                     Ok(true) => {
@@ -1381,7 +1405,6 @@ impl KonoNode {
 
                 if replication_hops_remaining > 0
                     && (record_was_new || stored_attestations > 0)
-                    && self.allow_dht_replication(sender_node_id, Instant::now())
                 {
                     if let Some(current) = self.dht.get(&record_node_id).cloned() {
                         self.replicate_dht_record(source, &current, replication_hops_remaining - 1);
@@ -1418,6 +1441,7 @@ impl KonoNode {
                 };
 
                 if stored {
+                    self.queue_own_dht_publication_to(source)?;
                     self.queue_own_dht_publication()?;
                 }
             }
@@ -1458,6 +1482,8 @@ impl KonoNode {
                         query_key.clone(),
                         ReverseDhtRoute {
                             previous_endpoint: source,
+                            target_node_id: target_node_id.clone(),
+                            expected_responders: HashMap::new(),
                             expires_at: now + DHT_QUERY_TIMEOUT,
                         },
                     );
@@ -1528,6 +1554,10 @@ impl KonoNode {
                         )
                         .await?;
 
+                        if let Some(route) = self.reverse_dht_routes.get_mut(&query_key) {
+                            route.expected_responders.insert(candidate.endpoint, 0);
+                        }
+
                         forwarded += 1;
                         if forwarded >= DHT_QUERY_FANOUT {
                             break;
@@ -1555,8 +1585,52 @@ impl KonoNode {
                     return Ok(());
                 }
 
+                let now = Instant::now();
+                if !self.accept_dht_response(
+                    query_id,
+                    &origin_node_id,
+                    &target_node_id,
+                    source,
+                    now,
+                ) {
+                    debug!(peer = %sender_node_id, query_id, "rejected unsolicited DHT response");
+                    return Ok(());
+                }
+                if records.iter().any(|record| record.verify().is_err()) {
+                    debug!(peer = %sender_node_id, query_id, "rejected DHT response with invalid record");
+                    return Ok(());
+                }
+                let mut records_to_cache = Vec::new();
+                if let Some(exact) = records
+                    .iter()
+                    .find(|record| record.node_id == target_node_id)
+                {
+                    records_to_cache.push(exact.clone());
+                }
                 for record in &records {
-                    if self.dht.upsert(record.clone()).is_err() {
+                    if records_to_cache.len() >= DHT_RESPONSE_CACHE_LIMIT {
+                        break;
+                    }
+                    if records_to_cache
+                        .iter()
+                        .any(|cached| cached.node_id == record.node_id)
+                    {
+                        continue;
+                    }
+                    records_to_cache.push(record.clone());
+                }
+                if !self.allow_dht_record_admission(
+                    sender_node_id,
+                    source,
+                    records_to_cache.len().max(1) as u16,
+                    now,
+                ) {
+                    debug!(peer = %sender_node_id, query_id, "DHT response admission rate-limited");
+                    return Ok(());
+                }
+
+                for record in records_to_cache {
+                    if self.dht.upsert(record).is_err() {
                         continue;
                     }
                 }
@@ -3126,6 +3200,7 @@ impl KonoNode {
                 query_id,
                 ActiveDhtQuery {
                     target_node_id: target_node_id.clone(),
+                    expected_responders: HashMap::new(),
                     expires_at: now + DHT_QUERY_TIMEOUT,
                 },
             );
@@ -3152,7 +3227,12 @@ impl KonoNode {
                     )
                     .await
                 {
-                    Ok(()) => sent += 1,
+                    Ok(()) => {
+                        sent += 1;
+                        if let Some(query) = self.active_dht_queries.get_mut(&query_id) {
+                            query.expected_responders.insert(candidate.endpoint, 0);
+                        }
+                    }
                     Err(error) => {
                         debug!(
                             peer = %candidate.node_id,
@@ -3216,6 +3296,12 @@ impl KonoNode {
     async fn sync_dht_peer(&mut self, peer: SocketAddr) -> Result<()> {
         self.issue_endpoint_attestation(peer).await?;
 
+        if let Some(peer_node_id) = self.peers.get(&peer).map(|info| info.node_id.clone()) {
+            for history in self.dht_replication_history.values_mut() {
+                history.target_node_ids.remove(&peer_node_id);
+            }
+        }
+        self.queue_own_dht_publication_to(peer)?;
         self.queue_own_dht_publication()?;
 
         for target_node_id in self.pending_dht_queries.clone() {
@@ -3399,6 +3485,15 @@ impl KonoNode {
         let attestations = self
             .endpoint_attestations
             .for_record(&record, DHT_ATTESTATION_RESPONSE_LIMIT);
+        if self
+            .dht_replication_history
+            .get(&(record.node_id.clone(), record.sequence))
+            .is_some_and(|history| {
+                history.owner_target_node_ids.len() >= DHT_OWNER_REPLICATION_RESERVE
+            })
+        {
+            return Ok(());
+        }
         let local_node_id = self.node_id();
         let candidates = self.routing.nearest(&local_node_id, self.routing.len());
         let mut queued = 0_usize;
@@ -3423,6 +3518,41 @@ impl KonoNode {
                 break;
             }
         }
+        Ok(())
+    }
+
+    fn queue_own_dht_publication_to(&mut self, peer: SocketAddr) -> Result<()> {
+        if !self.confirmed_sessions.contains(&peer) {
+            return Ok(());
+        }
+        let Some(peer_node_id) = self.peers.get(&peer).map(|info| info.node_id.clone()) else {
+            return Ok(());
+        };
+        let Some(record) = self.build_own_dht_record()? else {
+            return Ok(());
+        };
+        if !self.record_has_attested_endpoint(&record) {
+            return Ok(());
+        }
+        let attestations = self
+            .endpoint_attestations
+            .for_record(&record, DHT_ATTESTATION_RESPONSE_LIMIT);
+        let replication_hops_remaining = if self
+            .peer_supports_feature(peer, "bounded-dht-replication-v1")
+        {
+            DHT_REPLICATION_MAX_HOPS
+        } else {
+            0
+        };
+        self.queue_dht_replication(
+            peer,
+            peer_node_id,
+            record,
+            attestations,
+            replication_hops_remaining,
+            false,
+            true,
+        );
         Ok(())
     }
 
@@ -3491,8 +3621,10 @@ impl KonoNode {
         }
 
         let now = Instant::now();
-        self.dht_replication_history
-            .retain(|_, history| history.expires_at > now);
+        self.dht_replication_history.retain(|(node_id, sequence), history| {
+            history.expires_at > now
+                && (node_id != &record.node_id || *sequence == record.sequence)
+        });
         let key = (record.node_id.clone(), record.sequence);
         if !self.dht_replication_history.contains_key(&key)
             && self.dht_replication_history.len() >= MAX_DHT_REPLICATION_HISTORY
@@ -3505,10 +3637,16 @@ impl KonoNode {
                 .or_insert_with(|| DhtReplicationHistory {
                     target_node_ids: HashSet::new(),
                     transit_target_node_ids: HashSet::new(),
+                    owner_target_node_ids: HashSet::new(),
                     expires_at: now + Duration::from_secs(30 * 60),
                 });
         if history.target_node_ids.contains(&target_node_id)
-            || (transit_forward && history.transit_target_node_ids.len() >= DHT_REPLICATION_FANOUT)
+            || (transit_forward
+                && !history.transit_target_node_ids.contains(&target_node_id)
+                && history.transit_target_node_ids.len() >= DHT_REPLICATION_FANOUT)
+            || (owner_priority
+                && !history.owner_target_node_ids.contains(&target_node_id)
+                && history.owner_target_node_ids.len() >= DHT_OWNER_REPLICATION_RESERVE)
         {
             return false;
         }
@@ -3516,6 +3654,11 @@ impl KonoNode {
         if transit_forward {
             history
                 .transit_target_node_ids
+                .insert(target_node_id.clone());
+        }
+        if owner_priority {
+            history
+                .owner_target_node_ids
                 .insert(target_node_id.clone());
         }
 
@@ -3526,6 +3669,7 @@ impl KonoNode {
             attestations,
             replication_hops_remaining,
             transit_forward,
+            owner_priority,
         };
         if owner_priority {
             self.pending_dht_replications.push_front(pending);
@@ -3550,16 +3694,26 @@ impl KonoNode {
                 continue;
             }
 
-            let current_record = pending.record.node_id == self.node_id()
-                || self.dht.get(&pending.record.node_id).is_some_and(|record| {
+            let current_record = if pending.record.node_id == self.node_id() {
+                self.own_dht_record.as_ref().is_some_and(|current| {
+                    current.record.sequence == pending.record.sequence
+                        && current.record.signature == pending.record.signature
+                })
+            } else {
+                self.dht.get(&pending.record.node_id).is_some_and(|record| {
                     record.sequence == pending.record.sequence
                         && record.signature == pending.record.signature
-                });
+                })
+            };
             let eligible = current_record
                 && pending.record.verify().is_ok()
                 && self.record_has_attested_endpoint(&pending.record)
                 && self.confirmed_sessions.contains(&pending.target)
-                && self.peer_supports_feature(pending.target, "bounded-dht-replication-v1");
+                && (pending.replication_hops_remaining == 0
+                    || self.peer_supports_feature(
+                        pending.target,
+                        "bounded-dht-replication-v1",
+                    ));
             if !eligible {
                 if let Some(history) = self
                     .dht_replication_history
@@ -3569,6 +3723,11 @@ impl KonoNode {
                     if pending.transit_forward {
                         history
                             .transit_target_node_ids
+                            .remove(&pending.target_node_id);
+                    }
+                    if pending.owner_priority {
+                        history
+                            .owner_target_node_ids
                             .remove(&pending.target_node_id);
                     }
                 }
@@ -3596,6 +3755,11 @@ impl KonoNode {
                             .transit_target_node_ids
                             .remove(&pending.target_node_id);
                     }
+                    if pending.owner_priority {
+                        history
+                            .owner_target_node_ids
+                            .remove(&pending.target_node_id);
+                    }
                 }
                 debug!(
                     target = %pending.target,
@@ -3607,34 +3771,110 @@ impl KonoNode {
         }
     }
 
-    fn allow_dht_replication(&mut self, sender_node_id: &str, now: Instant) -> bool {
+    fn accept_dht_response(
+        &mut self,
+        query_id: u64,
+        origin_node_id: &str,
+        target_node_id: &str,
+        source: SocketAddr,
+        now: Instant,
+    ) -> bool {
+        if origin_node_id == self.node_id() {
+            let Some(query) = self.active_dht_queries.get_mut(&query_id) else {
+                return false;
+            };
+            if query.expires_at <= now || query.target_node_id != target_node_id {
+                return false;
+            }
+            let Some(responses) = query.expected_responders.get_mut(&source) else {
+                return false;
+            };
+            if *responses >= MAX_DHT_RESPONSES_PER_PEER_QUERY {
+                return false;
+            }
+            *responses += 1;
+            return true;
+        }
+
+        let Some(route) = self
+            .reverse_dht_routes
+            .get_mut(&(origin_node_id.to_owned(), query_id))
+        else {
+            return false;
+        };
+        if route.expires_at <= now || route.target_node_id != target_node_id {
+            return false;
+        }
+        let Some(responses) = route.expected_responders.get_mut(&source) else {
+            return false;
+        };
+        if *responses >= MAX_DHT_RESPONSES_PER_PEER_QUERY {
+            return false;
+        }
+        *responses += 1;
+        true
+    }
+
+    fn allow_dht_record_admission(
+        &mut self,
+        sender_node_id: &str,
+        source: SocketAddr,
+        cost: u16,
+        now: Instant,
+    ) -> bool {
         self.dht_replication_rate_windows.retain(|_, window| {
             now.duration_since(window.last_seen) < DHT_REPLICATION_RATE_RETENTION
         });
-        if !self
-            .dht_replication_rate_windows
-            .contains_key(sender_node_id)
-            && self.dht_replication_rate_windows.len() >= MAX_DHT_REPLICATION_RATE_WINDOWS
+        let keys = [
+            (
+                format!("peer:{sender_node_id}"),
+                MAX_DHT_RECORDS_PER_PEER_WINDOW,
+            ),
+            (
+                format!("prefix:{}", dht_network_group(source.ip())),
+                MAX_DHT_RECORDS_PER_PREFIX_WINDOW,
+            ),
+            ("global".to_owned(), MAX_DHT_RECORDS_GLOBAL_WINDOW),
+        ];
+        let missing = keys
+            .iter()
+            .filter(|(key, _)| !self.dht_replication_rate_windows.contains_key(key))
+            .count();
+        if self.dht_replication_rate_windows.len().saturating_add(missing)
+            > MAX_DHT_REPLICATION_RATE_WINDOWS
         {
             return false;
         }
-        let window = self
-            .dht_replication_rate_windows
-            .entry(sender_node_id.to_owned())
-            .or_insert(DhtReplicationRateWindow {
-                started_at: now,
-                events: 0,
-                last_seen: now,
-            });
-        window.last_seen = now;
-        if now.duration_since(window.started_at) >= DHT_REPLICATION_RATE_WINDOW {
-            window.started_at = now;
-            window.events = 0;
+
+        for (key, limit) in &keys {
+            let events = self
+                .dht_replication_rate_windows
+                .get(key)
+                .filter(|window| {
+                    now.duration_since(window.started_at) < DHT_REPLICATION_RATE_WINDOW
+                })
+                .map_or(0, |window| window.events);
+            if events.saturating_add(cost) > *limit {
+                return false;
+            }
         }
-        if window.events >= MAX_DHT_REPLICATION_EVENTS_PER_PEER_WINDOW {
-            return false;
+
+        for (key, _) in keys {
+            let window = self
+                .dht_replication_rate_windows
+                .entry(key)
+                .or_insert(DhtReplicationRateWindow {
+                    started_at: now,
+                    events: 0,
+                    last_seen: now,
+                });
+            if now.duration_since(window.started_at) >= DHT_REPLICATION_RATE_WINDOW {
+                window.started_at = now;
+                window.events = 0;
+            }
+            window.events = window.events.saturating_add(cost);
+            window.last_seen = now;
         }
-        window.events += 1;
         true
     }
 
@@ -4645,6 +4885,22 @@ fn plausible_node_id(node_id: &str) -> bool {
         && node_id[4..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn dht_network_group(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            format!("v4:{}.{}.{}", octets[0], octets[1], octets[2])
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return dht_network_group(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            format!("v6:{:x}:{:x}:{:x}", segments[0], segments[1], segments[2])
+        }
+    }
+}
+
 fn local_features() -> Vec<String> {
     vec![
         "knp/1".to_owned(),
@@ -4735,7 +4991,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dht_replication_rate_is_bounded_per_authenticated_identity() {
+    async fn dht_record_admission_is_bounded_per_authenticated_identity() {
         let identity = NodeIdentity::generate();
         let mut node = KonoNode::bind(
             identity,
@@ -4746,13 +5002,35 @@ mod tests {
         .await
         .unwrap();
         let sender_node_id = NodeIdentity::generate().node_id();
+        let source: SocketAddr = "8.8.8.8:47000".parse().unwrap();
         let now = Instant::now();
 
-        for _ in 0..MAX_DHT_REPLICATION_EVENTS_PER_PEER_WINDOW {
-            assert!(node.allow_dht_replication(&sender_node_id, now));
+        for _ in 0..MAX_DHT_RECORDS_PER_PEER_WINDOW {
+            assert!(node.allow_dht_record_admission(&sender_node_id, source, 1, now));
         }
-        assert!(!node.allow_dht_replication(&sender_node_id, now));
-        assert!(node.allow_dht_replication(&sender_node_id, now + DHT_REPLICATION_RATE_WINDOW));
+        assert!(!node.allow_dht_record_admission(&sender_node_id, source, 1, now));
+        assert!(node.allow_dht_record_admission(
+            &sender_node_id,
+            source,
+            1,
+            now + DHT_REPLICATION_RATE_WINDOW
+        ));
+    }
+
+    #[test]
+    fn dht_network_groups_normalize_prefixes_and_mapped_ipv4() {
+        assert_eq!(
+            dht_network_group("8.8.8.1".parse().unwrap()),
+            dht_network_group("8.8.8.250".parse().unwrap())
+        );
+        assert_eq!(
+            dht_network_group("::ffff:8.8.8.1".parse().unwrap()),
+            dht_network_group("8.8.8.250".parse().unwrap())
+        );
+        assert_eq!(
+            dht_network_group("2001:db8:abcd::1".parse().unwrap()),
+            dht_network_group("2001:db8:abcd:ffff::1".parse().unwrap())
+        );
     }
 
     #[tokio::test]
