@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_DHT_MAX_RECORDS: usize = 4_096;
@@ -113,7 +115,7 @@ impl EndpointAttestation {
         if observer.node_id() == subject_node_id {
             bail!("endpoint attestation requires an independent observer");
         }
-        if !endpoint_publishable(endpoint) {
+        if !dht_endpoint_publishable(endpoint) {
             bail!("attested endpoint is not publishable");
         }
 
@@ -160,7 +162,7 @@ impl EndpointAttestation {
         if endpoint.to_string() != self.endpoint {
             bail!("attested endpoint is not canonically encoded");
         }
-        if !endpoint_publishable(endpoint) {
+        if !dht_endpoint_publishable(endpoint) {
             bail!("attested endpoint is not publishable");
         }
 
@@ -411,7 +413,7 @@ impl PeerRecord {
 
         let mut endpoints: Vec<String> = endpoints
             .into_iter()
-            .filter(|endpoint| endpoint_publishable(*endpoint))
+            .filter(|endpoint| dht_endpoint_publishable(*endpoint))
             .map(|endpoint| endpoint.to_string())
             .collect();
         endpoints.sort();
@@ -462,7 +464,7 @@ impl PeerRecord {
             let endpoint = endpoint
                 .parse::<SocketAddr>()
                 .context("DHT endpoint is not a socket address")?;
-            if !endpoint_publishable(endpoint) {
+            if !dht_endpoint_publishable(endpoint) {
                 bail!("DHT endpoint is not publishable");
             }
         }
@@ -842,6 +844,61 @@ pub fn endpoint_publishable(endpoint: SocketAddr) -> bool {
                 && !ip.is_multicast()
                 && !ip.is_unique_local()
                 && !ip.is_unicast_link_local()
+        }
+    }
+}
+
+pub(crate) fn dht_endpoint_publishable(endpoint: SocketAddr) -> bool {
+    endpoint_publishable(endpoint) || {
+        #[cfg(test)]
+        {
+            endpoint.port() != 0
+                && endpoint.ip().is_loopback()
+                && test_loopback_dht_endpoints()
+                    .lock()
+                    .expect("test loopback DHT registry poisoned")
+                    .contains(&endpoint)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_loopback_dht_endpoints() -> &'static Mutex<HashSet<SocketAddr>> {
+    static ENDPOINTS: OnceLock<Mutex<HashSet<SocketAddr>>> = OnceLock::new();
+    ENDPOINTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Registers only the exact ephemeral loopback endpoints used by the runtime
+/// integration harness. Public endpoint policy remains unchanged.
+#[cfg(test)]
+pub(crate) struct TestLoopbackDhtEndpoints(Vec<SocketAddr>);
+
+#[cfg(test)]
+impl TestLoopbackDhtEndpoints {
+    pub(crate) fn register(endpoints: Vec<SocketAddr>) -> Self {
+        let mut registry = test_loopback_dht_endpoints()
+            .lock()
+            .expect("test loopback DHT registry poisoned");
+        for endpoint in &endpoints {
+            assert!(endpoint.port() != 0 && endpoint.ip().is_loopback());
+            registry.insert(*endpoint);
+        }
+        Self(endpoints)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLoopbackDhtEndpoints {
+    fn drop(&mut self) {
+        let mut registry = test_loopback_dht_endpoints()
+            .lock()
+            .expect("test loopback DHT registry poisoned");
+        for endpoint in &self.0 {
+            registry.remove(endpoint);
         }
     }
 }

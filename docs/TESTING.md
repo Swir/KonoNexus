@@ -1,4 +1,4 @@
-# KonoNexus Alpha.22 External Test Procedure
+# KonoNexus Alpha.23 External Test Procedure
 
 Status: controlled testing candidate.
 
@@ -165,11 +165,13 @@ A timeout or `FAILED` event is evidence to diagnose, not something to hide by in
 
 ## 9. Current testing limitation
 
-The alpha.22 route tests deterministically cover cooldown-based path changes and recovery, KonoMind-scored relay choice with hysteresis, route/peer health isolation and bounds, and RelayApp ACK route matching. The runtime samples RTT only from an authenticated delivery ACK arriving on the same direct endpoint or established relay circuit as the latest tracked fragment attempt. These tests do not provide WAN or NAT evidence.
+The alpha.23 route tests deterministically cover cooldown-based path changes and recovery, KonoMind-scored relay choice with hysteresis, route/peer health isolation and bounds, and RelayApp ACK route matching. The runtime samples RTT only from an authenticated delivery ACK arriving on the same direct endpoint or established relay circuit as the latest tracked fragment attempt. These tests do not provide WAN or NAT evidence.
 
 Automated CI now passes a real three-node localhost runtime harness. That proves the runtime/API/discovery delivery path works under controlled conditions.
 
-CI also runs a deterministic 64-node algorithm harness over the production routing table, signed peer-record table, and protocol hop/fanout limits. It removes one third of the nodes, reconverges the remaining routing views, re-replicates surviving records, and verifies bounded lookup and state invariants. This is useful large-mesh algorithm evidence, but it does not exercise UDP/session transport, endpoint-attestation admission, real packet loss, or independent networks; the broad large-mesh validation roadmap item therefore remains open.
+CI also runs a 32-node `KonoNode` runtime test over loopback UDP sockets: 30 leaves bootstrap to two hubs, while the hubs learn their leaves from signed HELLO/cookie exchanges. Each node establishes encrypted sessions, observes peer endpoints and exchanges signed endpoint attestations. The harness checks that each node has accepted attestations from at least two distinct observers for its own endpoint, and that valid signed DHT stores and replication traverse the runtime handlers. It selects non-neighbor pairs without a cached exact record, delivers before churn, stops every third node (including one hub), waits for HELLO-based expiry, checks that surviving leaves retain the one surviving hub and that hub sees all 20 surviving leaves, then delivers between a second pair. Both lookups correlate an accepted FIND request with an accepted, attested exact NODES response at the origin.
+
+The harness registers only its exact ephemeral loopback socket addresses under a cfg(test)-only DHT policy, and it asserts that the public production endpoint check still rejects loopback. This is large-mesh runtime convergence and churn evidence for one local topology. It does not exercise WAN/NAT/CGNAT behavior, real packet loss, independent networks, or Sybil-resistant observer diversity. The 64-node algorithm simulator remains supplemental evidence and is not used to close the runtime validation item.
 
 CI also exercises the bounded exact-candidate planner: deduplication and the three-endpoint cap, exact supplied-port preservation, stagger/TTL exhaustion, cross-NodeID rejection, global target-state bounds, cancellation after encrypted-session confirmation, and rendezvous-round exhaustion before relay eligibility. These checks prove deterministic logic and admission invariants; they do not prove that any candidate traverses a real NAT or CGNAT.
 

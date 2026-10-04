@@ -2,7 +2,7 @@ use crate::candidate_group::{
     CandidateAction, CandidateGroup, CANDIDATE_GROUP_TTL, MAX_ACTIVE_CANDIDATE_GROUPS,
 };
 use crate::dht::{
-    dht_network_group, endpoint_publishable, node_id_closer_to_target,
+    dht_endpoint_publishable, dht_network_group, endpoint_publishable, node_id_closer_to_target,
     prioritize_network_group_diversity, DhtNetworkGroup, DhtTable, EndpointAttestation,
     EndpointAttestationTable, PeerRecord, RoutingTable, DHT_ATTESTATION_RESPONSE_LIMIT,
     DHT_BUCKET_SIZE, DHT_MAX_HOPS, DHT_QUERY_FANOUT, DHT_QUERY_RETRY_DELAY, DHT_QUERY_TIMEOUT,
@@ -43,6 +43,8 @@ use rand::random;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -121,6 +123,17 @@ const RELAY_E2E_REKEY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RELAY_E2E_REKEY_MAX_ATTEMPTS: u8 = 4;
 const RELAY_E2E_REKEY_ACK_TTL: Duration = Duration::from_secs(10);
 const MAX_RELAY_E2E_REKEY_ACKS: usize = 256;
+
+#[cfg(test)]
+#[derive(Default)]
+struct RuntimeMeshCounters {
+    replicated_stores: AtomicUsize,
+    attestations: AtomicUsize,
+    finds: std::sync::Mutex<HashSet<(String, String, u64)>>,
+    nodes: std::sync::Mutex<HashSet<(String, String, u64)>>,
+    received_records: std::sync::Mutex<HashSet<(String, String)>>,
+    attestation_observers: std::sync::Mutex<HashMap<(String, String), HashSet<String>>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -626,6 +639,8 @@ pub struct KonoNode {
     relay_app_route_attempts: RelayAppRouteAttempts,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
     diagnostics: Option<Arc<RwLock<NetworkDiagnostics>>>,
+    #[cfg(test)]
+    runtime_mesh_counters: Option<Arc<RuntimeMeshCounters>>,
     local_test_mode: bool,
     hello_interval: Duration,
 }
@@ -717,6 +732,8 @@ impl KonoNode {
             relay_app_route_attempts: RelayAppRouteAttempts::default(),
             punch_relay_candidates: HashMap::new(),
             diagnostics: None,
+            #[cfg(test)]
+            runtime_mesh_counters: None,
             local_test_mode: false,
             hello_interval,
         })
@@ -851,6 +868,11 @@ impl KonoNode {
 
     pub fn dht_record_count(&self) -> usize {
         self.dht.len()
+    }
+
+    #[cfg(test)]
+    fn set_runtime_mesh_counters(&mut self, counters: Arc<RuntimeMeshCounters>) {
+        self.runtime_mesh_counters = Some(counters);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -1750,6 +1772,18 @@ impl KonoNode {
                     }
                 };
 
+                #[cfg(test)]
+                if let Some(counters) = &self.runtime_mesh_counters {
+                    if replication_hops_remaining > 0 {
+                        counters.replicated_stores.fetch_add(1, Ordering::Relaxed);
+                    }
+                    counters
+                        .received_records
+                        .lock()
+                        .expect("mesh record counter poisoned")
+                        .insert((self.node_id(), record_node_id.clone()));
+                }
+
                 let stored_attestations = self.store_dht_attestations(attestations);
 
                 if self.pending_dht_queries.contains(&record_node_id) {
@@ -1777,8 +1811,23 @@ impl KonoNode {
                     return Ok(());
                 }
 
+                #[cfg(test)]
+                let subject_node_id = attestation.subject_node_id.clone();
+                #[cfg(test)]
+                let observer_node_id = attestation.observer_node_id.clone();
                 let stored = match self.endpoint_attestations.upsert(attestation) {
                     Ok(true) => {
+                        #[cfg(test)]
+                        if let Some(counters) = &self.runtime_mesh_counters {
+                            counters.attestations.fetch_add(1, Ordering::Relaxed);
+                            counters
+                                .attestation_observers
+                                .lock()
+                                .expect("mesh attestation counter poisoned")
+                                .entry((self.node_id(), subject_node_id))
+                                .or_default()
+                                .insert(observer_node_id);
+                        }
                         debug!(
                             peer = %sender_node_id,
                             attestations = self.endpoint_attestations.len(),
@@ -1833,6 +1882,15 @@ impl KonoNode {
 
                 self.seen_dht_queries
                     .insert(query_key.clone(), now + DHT_QUERY_TIMEOUT);
+
+                #[cfg(test)]
+                if let Some(counters) = &self.runtime_mesh_counters {
+                    counters
+                        .finds
+                        .lock()
+                        .expect("mesh DHT find counter poisoned")
+                        .insert((origin_node_id.clone(), target_node_id.clone(), query_id));
+                }
 
                 if origin_node_id != self.node_id() {
                     self.reverse_dht_routes.insert(
@@ -1957,10 +2015,15 @@ impl KonoNode {
                     debug!(peer = %sender_node_id, query_id, "rejected unsolicited DHT response");
                     return Ok(());
                 }
+
                 if records.iter().any(|record| record.verify().is_err()) {
                     debug!(peer = %sender_node_id, query_id, "rejected DHT response with invalid record");
                     return Ok(());
                 }
+                #[cfg(test)]
+                let response_has_exact = records
+                    .iter()
+                    .any(|record| record.node_id == target_node_id);
                 let mut records_to_cache = Vec::new();
                 if let Some(exact) = records
                     .iter()
@@ -1991,14 +2054,36 @@ impl KonoNode {
                 }
 
                 for record in records_to_cache {
+                    #[cfg(test)]
+                    let record_node_id = record.node_id.clone();
                     if self.dht.upsert(record).is_err() {
                         continue;
+                    }
+                    #[cfg(test)]
+                    if let Some(counters) = &self.runtime_mesh_counters {
+                        counters
+                            .received_records
+                            .lock()
+                            .expect("mesh record counter poisoned")
+                            .insert((self.node_id(), record_node_id));
                     }
                 }
 
                 self.store_dht_attestations(attestations.clone());
 
                 if origin_node_id == self.node_id() {
+                    #[cfg(test)]
+                    if let (Some(counters), Some(exact_record)) =
+                        (&self.runtime_mesh_counters, self.dht.get(&target_node_id))
+                    {
+                        if response_has_exact && self.record_has_attested_endpoint(exact_record) {
+                            counters
+                                .nodes
+                                .lock()
+                                .expect("mesh DHT nodes counter poisoned")
+                                .insert((origin_node_id.clone(), target_node_id.clone(), query_id));
+                        }
+                    }
                     if self.pending_dht_queries.contains(&target_node_id) {
                         if let Some(current) = self.dht.get(&target_node_id).cloned() {
                             if self.activate_dht_record(&current).await? {
@@ -4493,7 +4578,7 @@ impl KonoNode {
             self.own_dht_record = None;
             return Ok(None);
         };
-        if !endpoint_publishable(endpoint) {
+        if !dht_endpoint_publishable(endpoint) {
             self.own_dht_record = None;
             return Ok(None);
         }
@@ -4578,7 +4663,7 @@ impl KonoNode {
     }
 
     async fn issue_endpoint_attestation(&mut self, peer: SocketAddr) -> Result<()> {
-        if !endpoint_publishable(peer) {
+        if !dht_endpoint_publishable(peer) {
             return Ok(());
         }
         let Some(peer_node_id) = self.peers.get(&peer).map(|info| info.node_id.clone()) else {
@@ -4604,7 +4689,7 @@ impl KonoNode {
             .iter()
             .copied()
             .filter(|peer| {
-                endpoint_publishable(*peer)
+                dht_endpoint_publishable(*peer)
                     && self
                         .last_endpoint_attestation_refresh
                         .get(peer)
@@ -6244,7 +6329,185 @@ fn local_features() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dht::TestLoopbackDhtEndpoints;
     use crate::nat::FilterCellStatus;
+    use std::sync::atomic::Ordering;
+
+    struct MeshTaskGuard(Vec<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>);
+
+    impl Drop for MeshTaskGuard {
+        fn drop(&mut self) {
+            for task in self.0.iter().flatten() {
+                task.abort();
+            }
+        }
+    }
+
+    async fn wait_for_mesh_condition(
+        timeout: Duration,
+        mut condition: impl FnMut() -> bool,
+        message: &str,
+        timeout_detail: impl Fn() -> String,
+    ) {
+        if time::timeout(timeout, async {
+            loop {
+                if condition() {
+                    return;
+                }
+                time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!("timed out waiting for {message}: {}", timeout_detail());
+        }
+    }
+
+    async fn deliver_between_mesh_leaves(
+        sender: &mut RelayAppHandle,
+        receiver: &mut RelayAppHandle,
+        sender_node_id: &str,
+        target_node_id: &str,
+        counters: &RuntimeMeshCounters,
+        payload: Vec<u8>,
+    ) {
+        let message_id = sender
+            .send(target_node_id.to_owned(), payload.clone())
+            .await
+            .unwrap();
+        let (received, receipt) = tokio::join!(
+            time::timeout(Duration::from_secs(45), async {
+                loop {
+                    if let Some(incoming) = receiver.recv().await {
+                        if incoming.peer_node_id == sender_node_id && incoming.data == payload {
+                            break incoming;
+                        }
+                    }
+                }
+            }),
+            time::timeout(Duration::from_secs(45), async {
+                loop {
+                    if let Some(delivered) = sender.recv_receipt().await {
+                        if delivered.peer_node_id == target_node_id
+                            && delivered.message_id == message_id
+                        {
+                            break delivered;
+                        }
+                    }
+                }
+            })
+        );
+        assert!(
+            received.is_ok(),
+            "timed out receiving RelayApp payload from {sender_node_id} to {target_node_id}; correlated FINDs {}; exact NODES responses {}; records received at sender {}",
+            counters
+                .finds
+                .lock()
+                .expect("mesh DHT find counter poisoned")
+                .iter()
+                .filter(|(origin, target, _)| {
+                    origin == sender_node_id && target == target_node_id
+                })
+                .count(),
+            counters
+                .nodes
+                .lock()
+                .expect("mesh DHT nodes counter poisoned")
+                .iter()
+                .filter(|(origin, target, _)| {
+                    origin == sender_node_id && target == target_node_id
+                })
+                .count(),
+            counters
+                .received_records
+                .lock()
+                .expect("mesh record counter poisoned")
+                .contains(&(sender_node_id.to_owned(), target_node_id.to_owned()))
+        );
+        assert_eq!(received.unwrap().data, payload);
+        assert_eq!(receipt.unwrap().message_id, message_id);
+    }
+
+    fn two_mesh_apps_mut(
+        apps: &mut [Option<RelayAppHandle>],
+        source: usize,
+        target: usize,
+    ) -> (&mut RelayAppHandle, &mut RelayAppHandle) {
+        assert_ne!(source, target);
+        if source < target {
+            let (left, right) = apps.split_at_mut(target);
+            (left[source].as_mut().unwrap(), right[0].as_mut().unwrap())
+        } else {
+            let (left, right) = apps.split_at_mut(source);
+            (right[0].as_mut().unwrap(), left[target].as_mut().unwrap())
+        }
+    }
+
+    fn select_mesh_lookup_pair(
+        preferred: (usize, usize),
+        sources: &[usize],
+        targets: &[usize],
+        resolvers: &[usize],
+        node_ids: &[String],
+        counters: &RuntimeMeshCounters,
+    ) -> (usize, usize) {
+        let known_records = counters
+            .received_records
+            .lock()
+            .expect("mesh record counter poisoned");
+        let mut candidates = Vec::new();
+        if sources.contains(&preferred.0)
+            && targets.contains(&preferred.1)
+            && preferred.0 != preferred.1
+        {
+            candidates.push(preferred);
+        }
+        candidates.extend(sources.iter().flat_map(|source| {
+            targets
+                .iter()
+                .copied()
+                .filter(move |target| source != target)
+                .map(move |target| (*source, target))
+        }));
+        candidates
+            .into_iter()
+            .find(|(source, target)| {
+                !known_records.contains(&(node_ids[*source].clone(), node_ids[*target].clone()))
+                    && resolvers.iter().any(|resolver| {
+                        known_records
+                            .contains(&(node_ids[*resolver].clone(), node_ids[*target].clone()))
+                    })
+            })
+            .expect("no non-neighbor leaf pair with an uncached source and a live resolver record")
+    }
+
+    fn assert_mesh_lookup_was_correlated(
+        source_node_id: &str,
+        target_node_id: &str,
+        counters: &RuntimeMeshCounters,
+    ) {
+        let query_ids: Vec<_> = counters
+            .finds
+            .lock()
+            .expect("mesh DHT find counter poisoned")
+            .iter()
+            .filter_map(|(origin, target, query_id)| {
+                (origin == source_node_id && target == target_node_id).then_some(*query_id)
+            })
+            .collect();
+        let responses = counters
+            .nodes
+            .lock()
+            .expect("mesh DHT nodes counter poisoned");
+        assert!(query_ids.iter().any(|query_id| {
+            responses.contains(&(
+                source_node_id.to_owned(),
+                target_node_id.to_owned(),
+                *query_id,
+            ))
+        }));
+    }
 
     #[test]
     fn relay_app_ack_sample_requires_latest_attempt_route_match() {
@@ -7314,5 +7577,272 @@ mod tests {
         }
         assert!(!node.allow_filter_probe_auth_attempt("sender", now));
         assert!(node.allow_filter_probe_auth_attempt("sender", now + FILTER_PROBE_RATE_WINDOW));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_large_mesh_converges_and_recovers_from_churn() {
+        const NODE_COUNT: usize = 32;
+        const LEAF_COUNT: usize = 30;
+        const HUB_COUNT: usize = 2;
+        const HELLO_INTERVAL: Duration = Duration::from_secs(2);
+        const MESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+        assert!(!endpoint_publishable("127.0.0.1:47000".parse().unwrap()));
+        let counters = Arc::new(RuntimeMeshCounters::default());
+        let mut nodes = Vec::with_capacity(NODE_COUNT);
+
+        for _ in 0..NODE_COUNT {
+            let mut node = KonoNode::bind(
+                NodeIdentity::generate(),
+                "127.0.0.1:0".parse().unwrap(),
+                Vec::new(),
+                HELLO_INTERVAL,
+            )
+            .await
+            .unwrap();
+            let node_id = node.node_id();
+            let endpoint = node.local_addr().unwrap();
+            let app = node.configure_relay_app_handle(8).unwrap();
+            let diagnostics = node.configure_diagnostics_handle().unwrap();
+            node.set_runtime_mesh_counters(counters.clone());
+            nodes.push((node, node_id, endpoint, app, diagnostics));
+        }
+
+        let endpoints: Vec<_> = nodes.iter().map(|entry| entry.2).collect();
+        let _loopback_dht_policy = TestLoopbackDhtEndpoints::register(endpoints.clone());
+
+        let hubs: Vec<_> = (LEAF_COUNT..NODE_COUNT).collect();
+        for (node, _, _, _, _) in nodes.iter_mut().take(LEAF_COUNT) {
+            node.bootstrap_peers = hubs.iter().map(|hub| endpoints[*hub]).collect();
+        }
+
+        let node_ids: Vec<_> = nodes.iter().map(|entry| entry.1.clone()).collect();
+        let mut nodes: Vec<_> = nodes.into_iter().map(Some).collect();
+        let mut apps: Vec<_> = (0..NODE_COUNT).map(|_| None).collect();
+        let mut diagnostics: Vec<_> = (0..NODE_COUNT).map(|_| None).collect();
+        let mut tasks: Vec<_> = (0..NODE_COUNT).map(|_| None).collect();
+        for (index, node_slot) in nodes.iter_mut().enumerate().skip(LEAF_COUNT) {
+            let (node, _, _, app, diagnostic) = node_slot.take().unwrap();
+            apps[index] = Some(app);
+            diagnostics[index] = Some(diagnostic);
+            tasks[index] = Some(tokio::spawn(node.run()));
+        }
+        time::sleep(Duration::from_millis(200)).await;
+        for (leaf, node_slot) in nodes.iter_mut().enumerate().take(LEAF_COUNT) {
+            let (node, _, _, app, diagnostic) = node_slot.take().unwrap();
+            apps[leaf] = Some(app);
+            diagnostics[leaf] = Some(diagnostic);
+            tasks[leaf] = Some(tokio::spawn(node.run()));
+            time::sleep(Duration::from_millis(250)).await;
+        }
+        let mut apps: Vec<_> = apps.into_iter().map(Option::unwrap).map(Some).collect();
+        let diagnostics: Vec<_> = diagnostics.into_iter().map(Option::unwrap).collect();
+        let mut tasks = MeshTaskGuard(tasks);
+
+        wait_for_mesh_condition(
+            MESH_TIMEOUT,
+            || {
+                diagnostics
+                    .iter()
+                    .take(LEAF_COUNT)
+                    .all(|handle| handle.snapshot().authenticated_peers == HUB_COUNT)
+                    && diagnostics
+                        .iter()
+                        .skip(LEAF_COUNT)
+                        .all(|handle| handle.snapshot().authenticated_peers == LEAF_COUNT)
+            },
+            "all leaf-to-hub sessions to authenticate",
+            || {
+                let leaf_counts: Vec<_> = diagnostics
+                    .iter()
+                    .take(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                let hub_counts: Vec<_> = diagnostics
+                    .iter()
+                    .skip(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                let finished_tasks: Vec<_> = tasks
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, task)| {
+                        task.as_ref()
+                            .is_some_and(|task| task.is_finished())
+                            .then_some(index)
+                    })
+                    .collect();
+                format!(
+                    "leaf peer counts {leaf_counts:?}; hub peer counts {hub_counts:?}; finished tasks {finished_tasks:?}"
+                )
+            },
+        )
+        .await;
+        wait_for_mesh_condition(
+            MESH_TIMEOUT,
+            || counters.replicated_stores.load(Ordering::Relaxed) > 0,
+            "a bounded DHT replication store to traverse the runtime mesh",
+            || {
+                format!(
+                    "replicated store count {}",
+                    counters.replicated_stores.load(Ordering::Relaxed)
+                )
+            },
+        )
+        .await;
+        wait_for_mesh_condition(
+            MESH_TIMEOUT,
+            || {
+                let observers = counters
+                    .attestation_observers
+                    .lock()
+                    .expect("mesh attestation counter poisoned");
+                node_ids.iter().all(|node_id| {
+                    observers
+                        .get(&(node_id.clone(), node_id.clone()))
+                        .is_some_and(|identities| identities.len() >= 2)
+                })
+            },
+            "two independent accepted attestations for every loopback endpoint",
+            || {
+                format!(
+                    "accepted attestation count {}",
+                    counters.attestations.load(Ordering::Relaxed)
+                )
+            },
+        )
+        .await;
+        assert!(counters.attestations.load(Ordering::Relaxed) >= NODE_COUNT * 2);
+
+        let stopped: HashSet<usize> = (0..NODE_COUNT).filter(|index| index % 3 == 0).collect();
+        let stopped_leaves: Vec<_> = (0..LEAF_COUNT)
+            .filter(|index| stopped.contains(index))
+            .collect();
+        let surviving_leaves: Vec<_> = (0..LEAF_COUNT)
+            .filter(|index| !stopped.contains(index))
+            .collect();
+        let (before_source, before_target) = select_mesh_lookup_pair(
+            (2, 3),
+            &surviving_leaves,
+            &stopped_leaves,
+            &hubs,
+            &node_ids,
+            &counters,
+        );
+        let (before_sender, before_receiver) =
+            two_mesh_apps_mut(&mut apps, before_source, before_target);
+        deliver_between_mesh_leaves(
+            before_sender,
+            before_receiver,
+            &node_ids[before_source],
+            &node_ids[before_target],
+            &counters,
+            b"alpha.23 live mesh before churn".to_vec(),
+        )
+        .await;
+        assert_mesh_lookup_was_correlated(
+            &node_ids[before_source],
+            &node_ids[before_target],
+            &counters,
+        );
+
+        for index in &stopped {
+            if let Some(task) = tasks.0[*index].take() {
+                task.abort();
+                let _ = task.await;
+            }
+            apps[*index] = None;
+        }
+
+        let surviving_leaf_count = (0..LEAF_COUNT)
+            .filter(|index| !stopped.contains(index))
+            .count();
+        let surviving_hubs: Vec<_> = hubs
+            .iter()
+            .copied()
+            .filter(|index| !stopped.contains(index))
+            .collect();
+        wait_for_mesh_condition(
+            MESH_TIMEOUT,
+            || {
+                (0..LEAF_COUNT).all(|index| {
+                    stopped.contains(&index)
+                        || diagnostics[index].snapshot().authenticated_peers == surviving_hubs.len()
+                }) && surviving_hubs.iter().all(|index| {
+                    diagnostics[*index].snapshot().authenticated_peers == surviving_leaf_count
+                })
+            },
+            "HELLO expiry and survivor reconvergence",
+            || {
+                let leaf_counts: Vec<_> = diagnostics
+                    .iter()
+                    .take(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                let hub_counts: Vec<_> = diagnostics
+                    .iter()
+                    .skip(LEAF_COUNT)
+                    .map(|handle| handle.snapshot().authenticated_peers)
+                    .collect();
+                format!("leaf peer counts {leaf_counts:?}; hub peer counts {hub_counts:?}")
+            },
+        )
+        .await;
+
+        let surviving_leaves: Vec<_> = (0..LEAF_COUNT)
+            .filter(|index| !stopped.contains(index))
+            .collect();
+        let (after_source, after_target) = select_mesh_lookup_pair(
+            (1, 17),
+            &surviving_leaves,
+            &surviving_leaves,
+            &surviving_hubs,
+            &node_ids,
+            &counters,
+        );
+        assert!(!stopped.contains(&after_source) && !stopped.contains(&after_target));
+        let (after_sender, after_receiver) =
+            two_mesh_apps_mut(&mut apps, after_source, after_target);
+        deliver_between_mesh_leaves(
+            after_sender,
+            after_receiver,
+            &node_ids[after_source],
+            &node_ids[after_target],
+            &counters,
+            b"alpha.23 live mesh after churn".to_vec(),
+        )
+        .await;
+        assert_mesh_lookup_was_correlated(
+            &node_ids[after_source],
+            &node_ids[after_target],
+            &counters,
+        );
+
+        for (index, diagnostic) in diagnostics.iter().enumerate().take(NODE_COUNT) {
+            if stopped.contains(&index) {
+                continue;
+            }
+            let snapshot = diagnostic.snapshot();
+            if index < LEAF_COUNT {
+                assert!((surviving_hubs.len()..=HUB_COUNT).contains(&snapshot.authenticated_peers));
+            } else {
+                assert_eq!(snapshot.authenticated_peers, surviving_leaf_count);
+            }
+            assert!(snapshot.dht_records <= crate::dht::DEFAULT_DHT_MAX_RECORDS);
+            let stopped_endpoints: HashSet<_> =
+                stopped.iter().map(|index| endpoints[*index]).collect();
+            assert!(snapshot
+                .active_paths
+                .iter()
+                .all(|path| !stopped_endpoints.contains(&path.endpoint)));
+        }
+
+        for task in &mut tasks.0 {
+            if let Some(task) = task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 }

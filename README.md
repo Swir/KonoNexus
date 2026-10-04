@@ -24,8 +24,8 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.22` |
-| Roadmap | **42 / 49 = 85.7%** |
+| Source version | `0.1.0-alpha.23` |
+| Roadmap | **43 / 49 = 87.8%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -88,7 +88,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.22`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.23`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -149,7 +149,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 42 / 49 items complete (**85.7%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 43 / 49 items complete (**87.8%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -174,7 +174,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] In-memory k-bucket-style routing table
 - [x] Persistent authenticated-peer routing hints across restarts
 - [x] Persistent full bounded k-bucket state across restarts
-- [ ] Large-mesh convergence and churn validation
+- [x] Large-mesh convergence and churn validation (32-node localhost runtime)
 - [x] Single-hop cooperative relay circuit/control foundation
 - [x] Bounded opaque relay cell forwarding
 - [x] Authenticated end-to-end inner session over relay
@@ -250,7 +250,7 @@ DHT control messages travel inside the existing encrypted KNP session:
 
 The local table is bounded to 4,096 records and responses to at most 8 records plus 4 matching attestations. Records and evidence expire automatically. KNP may cache nearest records, but it **does not automatically dial arbitrary nearest nodes**. A new network connection is attempted only from an exact valid record for a NodeID that the local user/application is already trying to reach, and only when one exact endpoint has current signatures from at least two independent observer identities.
 
-This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup, persistent bounded k-bucket snapshots, endpoint-attestation exchange/enforcement, bounded replica refresh, and observed-prefix diversity are implemented. Prefix diversity raises the cost of a single-network routing takeover; it is not Sybil resistance. Independent-operator diversity and convergence testing across a large mesh remain future work.
+This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup, persistent bounded k-bucket snapshots, endpoint-attestation exchange/enforcement, bounded replica refresh, and observed-prefix diversity are implemented. Prefix diversity raises the cost of a single-network routing takeover; it is not Sybil resistance. A 32-node localhost runtime test exercises convergence, churn, exact lookup, and application delivery; it is not WAN, NAT, or CGNAT evidence. Independent-operator diversity remains future work.
 
 ### Bounded multi-hop DHT
 
@@ -350,7 +350,7 @@ Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-inde
 
 ## Testing candidate
 
-Alpha.22 is the current build state intended for controlled testing on separate computers.
+Alpha.23 is the current build state intended for controlled testing on separate computers.
 
 Automated CI now includes a live three-node runtime harness:
 
@@ -361,7 +361,11 @@ Automated CI now includes a live three-node runtime harness:
 - C receives the authenticated/decrypted RelayApp payload,
 - B receives the delivery receipt.
 
-The harness uses an explicit **local-test mode** only because loopback addresses are intentionally rejected by production rendezvous security. Local-test mode defaults to `false` and is enabled only by the test harness.
+CI also runs a 32-node localhost KonoNode runtime test: 30 leaves bootstrap to two hubs, and the hubs learn their leaf peers through signed HELLO/cookie admission. Nodes establish authenticated encrypted sessions, exchange endpoint observations and independently signed attestations, and publish bounded signed DHT records. The test delivers between non-neighbor leaves before churn, stops every third node, waits for HELLO-based peer expiry and survivor reconvergence, then delivers between a second leaf pair and checks bounded state. Its counters record accepted attestations and signed DHT stores, plus query-correlated FIND/NODES handlers for lookups that need them. The cfg(test)-only DHT exception registers only the exact ephemeral loopback endpoints; production `endpoint_publishable` continues to reject loopback.
+
+This validates one local runtime topology and localhost UDP behavior. It does not establish behavior across WANs, NATs, carrier networks, or CGNAT, and it does not establish Sybil-resistant observer diversity.
+
+The three-node SDK harness uses an explicit **local-test mode** only because loopback addresses are intentionally rejected by production rendezvous security. Local-test mode defaults to `false` and is enabled only by the test harness.
 
 The next validation phase must use separate machines/networks and will check:
 
