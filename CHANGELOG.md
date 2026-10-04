@@ -13,6 +13,8 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Bumped the active source and external-testing candidate to `0.1.0-alpha.19`, removed stale alpha labels from runtime surfaces and test documentation, and made Windows release naming derive from the package manifest.
+- Reopened roadmap claims for full control-plane/multi-relay migration and runtime-integrated path scoring because the current implementation proves RelayApp migration, bounded relay fallback, and deterministic direct preference rather than those broader guarantees.
 - Added bounded runtime exchange and refresh of signed endpoint attestations; exact DHT activation requires two independent observer identities while explicitly not claiming Sybil resistance.
 - Added stable owner-record refresh, bounded hop/fanout replica propagation, rollback high-watermarks, capability-gated legacy behavior, and paced owner-reserved replication queues.
 - Added DHT query and record admission guards keyed by authenticated peer, observed IPv4 `/24` or IPv6 `/48`, and global budgets; invalid signed-record attempts consume budget before signature verification.

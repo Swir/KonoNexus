@@ -24,8 +24,8 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.16` |
-| Roadmap | **41 / 49 = 83.7%** |
+| Source version | `0.1.0-alpha.19` |
+| Roadmap | **39 / 49 = 79.6%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -88,7 +88,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.16`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.19`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -186,8 +186,8 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Sliding 128-sequence anti-replay windows with UDP reordering tolerance
 - [x] Bounded alternate relay selection across up to 3 encrypted peers
 - [x] Live RelayApp direct↔relay migration with direct preference
-- [x] Multi-relay routing and full control-plane path migration
-- [x] Path scoring and self-healing routing
+- [ ] Multi-relay routing and full control-plane path migration
+- [ ] Runtime path scoring integrated with self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
 - [x] Direct KNP session key rotation with 30-second grace window
@@ -273,7 +273,7 @@ cargo run -- --peer RELAY_IP:47000 --relay-via RELAY_IP:47000=TARGET_KNP_NODE_ID
 
 The relay must already have encrypted KNP sessions with both endpoints. Circuit setup follows `OPEN → OFFER → ACCEPT → READY`. The relay stores at most 256 circuits, expires idle circuits after 120 seconds, validates endpoint identity on both sides, and rejects sequence rollback/replay.
 
-Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per cell, sized to remain within the 16 KiB outer KNP datagram after nested encryption/hex framing. The relay forwards those bytes without interpreting their application meaning. Alpha.10 layers a separate authenticated inner session inside those opaque cells. The inner handshake is signed with each endpoint's Ed25519 identity, bound to the circuit ID and both NodeIDs, and derives fresh X25519/HKDF/ChaCha20-Poly1305 keys. The relay therefore cannot derive the endpoint-to-endpoint session keys. KNP currently validates that session with encrypted inner PING/PONG; a public Konofix application-data API is the next layer.
+Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per cell, sized to remain within the 16 KiB outer KNP datagram after nested encryption/hex framing. The relay forwards those bytes without interpreting their application meaning. Alpha.10 layers a separate authenticated inner session inside those opaque cells. The inner handshake is signed with each endpoint's Ed25519 identity, bound to the circuit ID and both NodeIDs, and derives fresh X25519/HKDF/ChaCha20-Poly1305 keys. The relay therefore cannot derive the endpoint-to-endpoint session keys. RelayApp and the `KonofixTransport` SDK wrapper now expose authenticated application data over this inner session; full KNP control-plane migration remains future work.
 
 ### Automatic direct → punch → relay fallback
 
@@ -340,7 +340,7 @@ Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-inde
 
 ## Testing candidate
 
-Alpha.15 is the first build state intended for controlled testing on separate computers.
+Alpha.19 is the current build state intended for controlled testing on separate computers.
 
 Automated CI now includes a live three-node runtime harness:
 

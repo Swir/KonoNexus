@@ -29,6 +29,15 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Read package version
+        id: package_version
+        shell: pwsh
+        run: |
+          $versionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $versionLine) { throw "Package version not found in Cargo.toml" }
+          $version = $versionLine.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Build self-contained GUI and diagnostic probe
         run: cargo build --release --bin kononexus_tester --bin kononexus_probe
 
@@ -52,12 +61,14 @@ jobs:
 
       - name: Prepare package
         shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.package_version.outputs.version }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\kononexus_tester.exe dist\KonoNexus-Network-Tester.exe
           Copy-Item target\release\kononexus_probe.exe dist\kononexus_probe.exe
           @"
-          KonoNexus 0.1.0-alpha.16 Windows x64 Network Tester
+          KonoNexus $env:PACKAGE_VERSION Windows x64 Network Tester
 
           This package is for controlled external testing.
           The executable is unsigned, so Windows may show a SmartScreen prompt.
@@ -76,27 +87,28 @@ jobs:
           Test procedure:
           https://github.com/Swir/KonoNexus/blob/main/docs/TESTING.md
           "@ | Set-Content -Encoding UTF8 dist\README-TEST.txt
-          Compress-Archive -Path dist\KonoNexus-Network-Tester.exe,dist\kononexus_probe.exe,dist\README-TEST.txt -DestinationPath KonoNexus-alpha.16-Network-Tester-Windows-x64.zip -Force
+          Compress-Archive -Path dist\KonoNexus-Network-Tester.exe,dist\kononexus_probe.exe,dist\README-TEST.txt -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KonoNexus-alpha.16-Network-Tester-Windows-x64
+          name: KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64
           path: |
             dist/KonoNexus-Network-Tester.exe
             dist/kononexus_probe.exe
             dist/README-TEST.txt
-            KonoNexus-alpha.16-Network-Tester-Windows-x64.zip
+            KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64.zip
           if-no-files-found: error
 
       - name: Publish prerelease assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ steps.package_version.outputs.version }}
         run: |
-          $tag = "v0.1.0-alpha.16-tester"
+          $tag = "v$env:PACKAGE_VERSION-tester"
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target "$env:GITHUB_SHA" --title "KonoNexus 0.1.0-alpha.16 Network Tester" --notes "Windows x64 GUI for controlled two-PC WAN/Internet testing. Signed one-code invite, automatic DIRECT → UDP HOLE PUNCH → RELAY path attempt, authenticated delivery RTT/loss, NAT/endpoint evidence, NodeID and technical log. The console probe remains included only for diagnostics. This is a prerelease; real NAT/CGNAT results are evidence, not a universal connectivity guarantee." --prerelease
+            gh release create $tag --target "$env:GITHUB_SHA" --title "KonoNexus $env:PACKAGE_VERSION Network Tester" --notes "Windows x64 GUI for controlled two-PC WAN/Internet testing. Signed one-code invite, automatic DIRECT → UDP HOLE PUNCH → RELAY path attempt, authenticated delivery RTT/loss, NAT/endpoint evidence, NodeID and technical log. The console probe remains included only for diagnostics. This is a prerelease; real NAT/CGNAT results are evidence, not a universal connectivity guarantee." --prerelease
           }
-          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe KonoNexus-alpha.16-Network-Tester-Windows-x64.zip --clobber
+          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" --clobber

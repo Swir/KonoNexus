@@ -66,7 +66,7 @@ async fn run() -> Result<()> {
     let identity_path = args.identity.unwrap_or(default_identity_path()?);
 
     println!("===============================================");
-    println!(" KonoNexus 0.1.0-alpha.15.2 TEST PROBE");
+    println!(" KonoNexus {} TEST PROBE", env!("CARGO_PKG_VERSION"));
     println!(" Windows / multi-PC network test");
     println!("===============================================");
     println!("IDENTITY={}", identity_path.display());
