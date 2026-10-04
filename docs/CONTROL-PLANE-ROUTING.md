@@ -13,14 +13,18 @@ The controller never discovers arbitrary Internet ports, synthesizes port ranges
 
 ## Selection invariants
 
-1. A confirmed direct path always preempts relay transport.
+1. A confirmed direct path preempts relay transport unless that exact route is in its five-second hard-failure cooldown.
 2. Relay candidates are normalized deterministically by address family, endpoint, and circuit ID.
 3. Duplicate relay candidates are removed.
 4. At most three established relay candidates are considered for one selection.
-5. If the currently selected relay still appears in the bounded candidate set, it remains selected. This stickiness avoids path churn caused only by input ordering.
+5. If the currently selected relay remains within the fixed score hysteresis of the best bounded candidate, it remains selected. This avoids churn from small metric changes.
 6. A changed path increments the route generation exactly once. Stable re-selection keeps the generation unchanged.
 
-These rules are deterministic and independent of KonoMind. KonoMind remains advisory-only and cannot alter packet authentication, cryptography, admission, replay validation, or the bounded safety limits above.
+The controller uses KonoMind's deterministic baseline score for the established relay candidates. Route health is keyed by peer and exact route, bounded to 2,048 entries, and uses a sanitized 0.8/0.2 RTT EWMA plus a smoothed success/failure reliability estimate. Reliability feeds both loss and stability; unmeasured relay load stays at a neutral value rather than being presented as observed data. Failed routes are excluded for five seconds. Among relays, the current route remains active when its score is within 0.08 of the best candidate. A healthy confirmed direct route always takes precedence; after its failure cooldown expires it becomes preferred again.
+
+RelayApp route evidence is bounded to 64 outbound messages. For each message, the latest successfully handed-off fragment attempt records its exact route and time. A delivery ACK contributes an RTT and success only when it is authenticated and received over that same direct endpoint or relay endpoint/circuit. An ACK on another route still confirms application delivery but is not used as route evidence. Local UDP send success alone is never scored as path success. Hard send errors and final retry exhaustion or TTL expiry mark the associated route failed.
+
+These rules cannot alter packet authentication, cryptography, admission, replay validation, or the established three-candidate safety limit.
 
 ## Migration and failover
 
@@ -41,6 +45,10 @@ The deterministic unit tests cover:
 - relay ordering and stickiness;
 - failover from a failed relay to another established circuit;
 - the three-candidate selection bound; and
+- cooldown-based selection and direct-path recovery;
+- health-scored relay choice and hysteresis;
+- peer/route health isolation, bounded RTT metrics, and bounded latest-attempt tracking;
+- matching versus mismatching authenticated ACK route samples; and
 - clearing control-plane state after all routes disappear.
 
 CI verifies formatting, Clippy with warnings denied, and the complete Rust test suite. These tests prove the internal route-selection semantics only. They are **not** evidence that arbitrary NAT/CGNAT combinations work in the field.

@@ -51,6 +51,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 const MAX_ACTIVE_PEERS: usize = 2_048;
+const MAX_RELAY_APP_ROUTE_ATTEMPTS: usize = crate::relay_app::MAX_RELAY_APP_OUTBOUND_MESSAGES;
 const MAX_PENDING_PUNCHES: usize = 128;
 const MAX_PENDING_FILTER_PROBES: usize = 64;
 const MAX_PENDING_FILTER_TRIALS: usize = 32;
@@ -481,6 +482,45 @@ struct RelayPath {
     receive_window: SequenceWindow,
 }
 
+#[derive(Debug, Default)]
+struct RelayAppRouteAttempts {
+    entries: HashMap<(String, u64), (ControlRoute, Instant)>,
+    order: VecDeque<(String, u64)>,
+}
+
+impl RelayAppRouteAttempts {
+    fn track(&mut self, key: (String, u64), route: ControlRoute, sent_at: Instant) {
+        if self.entries.contains_key(&key) {
+            self.order.retain(|stored| stored != &key);
+        } else {
+            while self.entries.len() >= MAX_RELAY_APP_ROUTE_ATTEMPTS {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (route, sent_at));
+    }
+
+    fn take(&mut self, key: &(String, u64)) -> Option<(ControlRoute, Instant)> {
+        let attempt = self.entries.remove(key);
+        self.order.retain(|stored| stored != key);
+        attempt
+    }
+
+    fn matching_ack_rtt(
+        &mut self,
+        key: &(String, u64),
+        ack_route: ControlRoute,
+        now: Instant,
+    ) -> Option<(Duration, Instant)> {
+        let (attempted_route, sent_at) = self.take(key)?;
+        (attempted_route == ack_route).then(|| (now.saturating_duration_since(sent_at), sent_at))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingRelayAccept {
     peer_node_id: String,
@@ -583,6 +623,7 @@ pub struct KonoNode {
     relay_app_receipt_tx: Option<mpsc::Sender<RelayAppDeliveryReceipt>>,
     relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
     route_controller: RouteController,
+    relay_app_route_attempts: RelayAppRouteAttempts,
     punch_relay_candidates: HashMap<u64, SocketAddr>,
     diagnostics: Option<Arc<RwLock<NetworkDiagnostics>>>,
     local_test_mode: bool,
@@ -673,6 +714,7 @@ impl KonoNode {
             relay_app_receipt_tx: None,
             relay_app_failure_tx: None,
             route_controller: RouteController::default(),
+            relay_app_route_attempts: RelayAppRouteAttempts::default(),
             punch_relay_candidates: HashMap::new(),
             diagnostics: None,
             local_test_mode: false,
@@ -1659,7 +1701,12 @@ impl KonoNode {
                 self.handle_app_fragment(sender_node_id, fragment).await?;
             }
             SecurePayload::RelayAppAck { message_id } => {
-                self.handle_app_ack(sender_node_id, message_id);
+                self.handle_app_ack(
+                    sender_node_id,
+                    message_id,
+                    ControlRoute::Direct(source),
+                    Instant::now(),
+                );
             }
             SecurePayload::DhtStore {
                 record,
@@ -2867,7 +2914,15 @@ impl KonoNode {
                         self.handle_app_fragment(peer_node_id, fragment).await?;
                     }
                     SecurePayload::RelayAppAck { message_id } => {
-                        self.handle_app_ack(peer_node_id, message_id);
+                        self.handle_app_ack(
+                            peer_node_id,
+                            message_id,
+                            ControlRoute::Relay {
+                                relay_endpoint,
+                                circuit_id,
+                            },
+                            Instant::now(),
+                        );
                     }
                     _ => {
                         debug!(
@@ -2911,8 +2966,22 @@ impl KonoNode {
         Ok(())
     }
 
-    fn handle_app_ack(&mut self, peer_node_id: &str, message_id: u64) {
+    fn handle_app_ack(
+        &mut self,
+        peer_node_id: &str,
+        message_id: u64,
+        route: ControlRoute,
+        now: Instant,
+    ) {
         if self.relay_app.acknowledge(peer_node_id, message_id) {
+            let key = (peer_node_id.to_owned(), message_id);
+            if let Some((rtt, sent_at)) = self
+                .relay_app_route_attempts
+                .matching_ack_rtt(&key, route, now)
+            {
+                self.route_controller
+                    .report_ack_success(peer_node_id, route, rtt, sent_at);
+            }
             if let Some(sender) = self.relay_app_receipt_tx.as_ref() {
                 let receipt = RelayAppDeliveryReceipt {
                     peer_node_id: peer_node_id.to_owned(),
@@ -2940,21 +3009,22 @@ impl KonoNode {
         &mut self,
         peer_node_id: &str,
         payload: SecurePayload,
-    ) -> Result<bool> {
+    ) -> Result<Option<ControlRoute>> {
         let mut relay_attempts = 0_usize;
         let mut last_relay_error = None;
 
         loop {
             let direct = self.direct_app_endpoint_for_peer(peer_node_id);
             let relay_candidates = self.relay_e2e_candidates_for_peer(peer_node_id);
-            let Some(decision) = self.route_controller.select(
+            let Some(decision) = self.route_controller.select_at(
                 peer_node_id,
                 direct,
                 relay_candidates.iter().copied(),
+                Instant::now(),
             ) else {
                 return match last_relay_error {
                     Some(error) => Err(error),
-                    None => Ok(false),
+                    None => Ok(None),
                 };
             };
 
@@ -2969,8 +3039,17 @@ impl KonoNode {
 
             match decision.route {
                 ControlRoute::Direct(endpoint) => {
-                    self.send_secure_payload(endpoint, payload).await?;
-                    return Ok(true);
+                    match self.send_secure_payload(endpoint, payload.clone()).await {
+                        Ok(()) => return Ok(Some(decision.route)),
+                        Err(error) => {
+                            self.route_controller.report_failure(
+                                peer_node_id,
+                                decision.route,
+                                Instant::now(),
+                            );
+                            last_relay_error = Some(error);
+                        }
+                    }
                 }
                 ControlRoute::Relay {
                     relay_endpoint,
@@ -2979,7 +3058,7 @@ impl KonoNode {
                     if relay_attempts >= MAX_RELAY_ROUTE_CANDIDATES {
                         return match last_relay_error {
                             Some(error) => Err(error),
-                            None => Ok(false),
+                            None => Ok(None),
                         };
                     }
                     relay_attempts = relay_attempts.saturating_add(1);
@@ -2989,6 +3068,11 @@ impl KonoNode {
                             .relay_e2e_sessions
                             .get_mut(&(relay_endpoint, circuit_id))
                         else {
+                            self.route_controller.report_failure(
+                                peer_node_id,
+                                decision.route,
+                                Instant::now(),
+                            );
                             self.remove_client_relay_path((relay_endpoint, circuit_id));
                             continue;
                         };
@@ -2999,8 +3083,13 @@ impl KonoNode {
                         .send_relay_inner(relay_endpoint, circuit_id, encoded)
                         .await
                     {
-                        Ok(()) => return Ok(true),
+                        Ok(()) => return Ok(Some(decision.route)),
                         Err(error) => {
+                            self.route_controller.report_failure(
+                                peer_node_id,
+                                decision.route,
+                                Instant::now(),
+                            );
                             let failed_peer =
                                 self.remove_client_relay_path((relay_endpoint, circuit_id));
                             if let Some(failed_peer) = failed_peer {
@@ -3222,6 +3311,11 @@ impl KonoNode {
 
     fn flush_relay_app_failures(&mut self) {
         while let Some(failure) = self.relay_app.peek_failure() {
+            let key = (failure.peer_node_id.clone(), failure.message_id);
+            if let Some((route, _)) = self.relay_app_route_attempts.take(&key) {
+                self.route_controller
+                    .report_failure(&failure.peer_node_id, route, Instant::now());
+            }
             let result = match self.relay_app_failure_tx.as_ref() {
                 Some(sender) => sender.try_send(failure),
                 None => break,
@@ -3303,13 +3397,21 @@ impl KonoNode {
                 fragment: outbound.fragment.clone(),
             };
 
+            let sent_at = Instant::now();
             match self
                 .send_app_secure_payload(&outbound.peer_node_id, payload)
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => break,
+                Ok(Some(route)) => self.track_relay_app_route_attempt(
+                    outbound.peer_node_id.clone(),
+                    outbound.fragment.message_id,
+                    route,
+                    sent_at,
+                ),
+                Ok(None) => break,
                 Err(error) => {
+                    self.relay_app_route_attempts
+                        .take(&(outbound.peer_node_id.clone(), outbound.fragment.message_id));
                     debug!(
                         peer = %outbound.peer_node_id,
                         %error,
@@ -3328,6 +3430,17 @@ impl KonoNode {
                 break;
             }
         }
+    }
+
+    fn track_relay_app_route_attempt(
+        &mut self,
+        peer_node_id: String,
+        message_id: u64,
+        route: ControlRoute,
+        sent_at: Instant,
+    ) {
+        self.relay_app_route_attempts
+            .track((peer_node_id, message_id), route, sent_at);
     }
 
     fn relay_e2e_candidates_for_peer(&self, peer_node_id: &str) -> Vec<RelayRouteCandidate> {
@@ -6132,6 +6245,44 @@ fn local_features() -> Vec<String> {
 mod tests {
     use super::*;
     use crate::nat::FilterCellStatus;
+
+    #[test]
+    fn relay_app_ack_sample_requires_latest_attempt_route_match() {
+        let mut attempts = RelayAppRouteAttempts::default();
+        let key = ("peer".to_owned(), 7);
+        let start = Instant::now();
+        let first = ControlRoute::Relay {
+            relay_endpoint: "127.0.0.1:47000".parse().unwrap(),
+            circuit_id: 1,
+        };
+        let latest = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
+        attempts.track(key.clone(), first, start);
+        attempts.track(key.clone(), latest, start + Duration::from_millis(10));
+
+        assert_eq!(
+            attempts.matching_ack_rtt(&key, first, start + Duration::from_millis(20)),
+            None
+        );
+        assert_eq!(attempts.entries.len(), 0);
+        attempts.track(key.clone(), latest, start + Duration::from_millis(10));
+        assert_eq!(
+            attempts.matching_ack_rtt(&key, latest, start + Duration::from_millis(30)),
+            Some((Duration::from_millis(20), start + Duration::from_millis(10)))
+        );
+    }
+
+    #[test]
+    fn relay_app_route_attempt_tracking_stays_within_outbound_bound() {
+        let mut attempts = RelayAppRouteAttempts::default();
+        let route = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
+        let now = Instant::now();
+        for message_id in 0..=MAX_RELAY_APP_ROUTE_ATTEMPTS {
+            attempts.track(("peer".to_owned(), message_id as u64), route, now);
+        }
+        assert_eq!(attempts.entries.len(), MAX_RELAY_APP_ROUTE_ATTEMPTS);
+        assert_eq!(attempts.order.len(), MAX_RELAY_APP_ROUTE_ATTEMPTS);
+        assert!(!attempts.entries.contains_key(&("peer".to_owned(), 0)));
+    }
 
     #[tokio::test]
     async fn local_test_mode_allows_loopback_rendezvous_only_when_enabled() {

@@ -1,4 +1,4 @@
-# KonoNexus Alpha.21 External Test Procedure
+# KonoNexus Alpha.22 External Test Procedure
 
 Status: controlled testing candidate.
 
@@ -164,6 +164,8 @@ A message test passes only when:
 A timeout or `FAILED` event is evidence to diagnose, not something to hide by increasing timeouts.
 
 ## 9. Current testing limitation
+
+The alpha.22 route tests deterministically cover cooldown-based path changes and recovery, KonoMind-scored relay choice with hysteresis, route/peer health isolation and bounds, and RelayApp ACK route matching. The runtime samples RTT only from an authenticated delivery ACK arriving on the same direct endpoint or established relay circuit as the latest tracked fragment attempt. These tests do not provide WAN or NAT evidence.
 
 Automated CI now passes a real three-node localhost runtime harness. That proves the runtime/API/discovery delivery path works under controlled conditions.
 

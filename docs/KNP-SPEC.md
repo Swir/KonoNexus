@@ -119,7 +119,7 @@ A token alone is insufficient: the punch sender must also prove possession of th
 2. IPv6 direct-path preference,
 3. broader DHT convergence and churn validation,
 4. multi-relay/full-control-plane migration,
-5. route scoring and KonoMind optimization.
+5. KonoMind learning and optimization from real path outcomes.
 
 ## 13. Signed DHT discovery foundation
 
@@ -252,6 +252,14 @@ Because message IDs, reassembly state, delivery ACKs, retransmission state, and 
 
 This migration currently covers RelayApp application traffic. Full migration of all KNP control-plane responsibilities and multi-relay route switching remain future work.
 
-## 25. Versioning
+## 25. Runtime path scoring and failure recovery
+
+The control-plane route selector considers the already-confirmed direct path and at most three established relay E2E circuits. A healthy confirmed direct path is preferred. A hard send error marks that exact route failed and applies a five-second cooldown; if direct sending fails while an established relay is available, the same bounded send operation retries using a relay. Expired cooldowns make the confirmed direct path eligible and preferred again.
+
+Relay candidates use the deterministic KonoMind baseline score. Per-peer, per-route health is retained in a 2,048-entry bounded table and includes saturating success/failure counts plus a finite RTT EWMA. Relay RTT and success evidence comes only from an authenticated RelayApp delivery ACK received on the same route as the latest fragment attempt for that peer/message. The attempt table is capped at 64, matching the outbound-message limit. A valid ACK received over a different route still acknowledges delivery but is excluded from route scoring. A local UDP send does not establish path success. Immediate send errors and terminal RelayApp retries/expiry report route failures. A current relay is retained when its score is within the fixed hysteresis margin of the best candidate.
+
+This is a deterministic local scoring mechanism, not machine learning and not evidence of real NAT/CGNAT reachability. Existing authentication, admission, replay protections, exact endpoint rules, and relay-candidate construction are unchanged.
+
+## 26. Versioning
 
 Unknown protocol versions are rejected in the alpha implementation. Stable KNP will require explicit capability negotiation and documented compatibility semantics.
