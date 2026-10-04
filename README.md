@@ -24,8 +24,8 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.19` |
-| Roadmap | **39 / 49 = 79.6%** |
+| Source version | `0.1.0-alpha.20` |
+| Roadmap | **40 / 49 = 81.6%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -88,7 +88,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.19`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.20`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -147,7 +147,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 39 / 49 items complete (**79.6%**). This number is derived from the checklist below; documentation-only changes do not increase it.
+**Verified roadmap progress:** 40 / 49 items complete (**81.6%**). This number is derived from the checklist below and reflects the implemented, bounded filtering matrix described below; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -163,7 +163,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Signed UDP punch probe/ack primitive
 - [x] Multi-attempt timed hole-punch burst/state machine
 - [x] Consent-based endpoint-independent filtering evidence test
-- [ ] Broader filtering-behavior matrix and negative-result interpretation
+- [x] Broader filtering-behavior matrix and negative-result interpretation
 - [ ] Multi-candidate/path prioritization without unsafe port spraying
 - [x] Bounded automatic selection of encrypted rendezvous peers
 - [ ] IPv6 direct-path preference
@@ -217,7 +217,7 @@ KonoNexus is pre-release networking/security software. Its security and NAT trav
 
 MIT
 
-### Consent-based filtering evidence
+### Consent-based filtering matrix
 
 A controlled positive filtering-evidence test can be requested through a coordinator:
 
@@ -225,7 +225,15 @@ A controlled positive filtering-evidence test can be requested through a coordin
 cargo run -- --peer COORDINATOR_IP:47000 --filter-test COORDINATOR_IP:47000
 ```
 
-The coordinator proposes an independent helper and the exact endpoint it already observes for the tested node. The tested node signs a short-lived Ed25519 authorization binding its NodeID/public key, that endpoint, the helper NodeID, and a random token. Only then may the helper send one signed direct probe. Receiving it is positive evidence that an independent endpoint can reach the mapping. Failure to receive it remains **inconclusive**, not proof of restrictive filtering.
+One consented trial records three separately authorized source relationships against the exact public endpoint already observed by the coordinator:
+
+- **contacted endpoint control** — the coordinator sends from its already-contacted endpoint,
+- **same address, different port** — the coordinator sends one datagram from a temporary source port on the same IP address,
+- **different, previously uncontacted address** — an independent helper whose source IP is absent from the tested node's bounded recent-egress history and direct-peer set sends one datagram.
+
+The tested node signs a short-lived Ed25519 authorization binding its NodeID/public key, target endpoint, coordinator and baseline endpoint, helper, source class, trial ID, and random probe token. Probes are one-shot, source relationships are checked against the class, and authorization, pending-state, replay, rate, and evidence lifetimes are bounded.
+
+Only a successfully observed probe is positive evidence for its cell. A timeout, unavailable helper, or local send failure is retained as an explicitly **inconclusive** result; none proves restrictive filtering. Loopback and CI tests validate protocol logic only. They are not WAN, NAT, or CGNAT evidence, so the separate real multi-network/NAT test-matrix roadmap gate remains open.
 
 ### Signed DHT discovery foundation
 

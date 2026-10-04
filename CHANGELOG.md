@@ -2,9 +2,12 @@
 
 Development log for KonoNexus.
 
-## Unreleased
+## 0.1.0-alpha.20
 
-No changes yet.
+- Bumped the active source and external-testing candidate to `0.1.0-alpha.20`.
+- Expanded consented filtering evidence into a bounded three-cell matrix: exact contacted-endpoint control, same-IP/different-port, and a different previously uncontacted address.
+- Added versioned target-signed authorizations binding the coordinator baseline, helper, source class, trial and one-shot token, with source-relationship validation and bounded replay/rate/state/evidence windows.
+- Kept timeout, unavailable-helper and send-failed outcomes explicitly inconclusive; localhost and CI coverage does not count as WAN/NAT/CGNAT evidence, and the real multi-network validation gate remains open.
 
 ## 0.1.0-alpha.19
 

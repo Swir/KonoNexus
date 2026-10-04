@@ -1,5 +1,5 @@
 use crate::dht::{EndpointAttestation, PeerRecord};
-use crate::nat::FilterProbeAuthorization;
+use crate::nat::{FilterProbeAuthorization, FilterProbeClass, FilteringMatrixAuthorization};
 use crate::relay_app::RelayAppFragment;
 use crate::security::SequenceWindow;
 use anyhow::{anyhow, bail, Context, Result};
@@ -53,6 +53,35 @@ pub enum SecurePayload {
         authorization: FilterProbeAuthorization,
     },
     FilteringTestUnavailable,
+    FilteringMatrixRequest {
+        trial_id: u64,
+    },
+    FilteringMatrixProposal {
+        trial_id: u64,
+        probe_class: FilterProbeClass,
+        helper_node_id: String,
+        target_endpoint: String,
+        probe_token: u64,
+    },
+    FilteringMatrixConsent {
+        authorization: FilteringMatrixAuthorization,
+    },
+    FilteringMatrixSend {
+        authorization: FilteringMatrixAuthorization,
+    },
+    FilteringMatrixSendResult {
+        trial_id: u64,
+        probe_class: FilterProbeClass,
+        probe_token: u64,
+        accepted: bool,
+        failure: Option<FilteringMatrixFailure>,
+    },
+    FilteringMatrixUnavailable {
+        trial_id: u64,
+        probe_class: FilterProbeClass,
+        probe_token: u64,
+        failure: FilteringMatrixFailure,
+    },
     DhtStore {
         record: PeerRecord,
         #[serde(default)]
@@ -118,6 +147,18 @@ pub enum SecurePayload {
         rekey_id: u64,
         ephemeral_public_key: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FilteringMatrixFailure {
+    NoHelper,
+    Capacity,
+    UnsafeTarget,
+    RateLimited,
+    Replay,
+    SendFailed,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -636,6 +677,69 @@ mod tests {
                 .decrypt(&frame.session_id, frame.sequence, &frame.ciphertext)
                 .unwrap(),
             payload
+        );
+    }
+
+    #[test]
+    fn filtering_matrix_secure_payloads_round_trip_through_encryption() {
+        let target_identity = NodeIdentity::generate();
+        let authorization = FilteringMatrixAuthorization::signed(
+            &target_identity,
+            "203.0.113.20:47000".parse().unwrap(),
+            "knp1coordinator".to_owned(),
+            "198.51.100.10:39000".parse().unwrap(),
+            "knp1helper".to_owned(),
+            FilterProbeClass::DifferentAddress,
+            17,
+            23,
+        )
+        .unwrap();
+        let payloads = vec![
+            SecurePayload::FilteringMatrixRequest { trial_id: 17 },
+            SecurePayload::FilteringMatrixProposal {
+                trial_id: 17,
+                probe_class: FilterProbeClass::DifferentAddress,
+                helper_node_id: "knp1helper".to_owned(),
+                target_endpoint: "203.0.113.20:47000".to_owned(),
+                probe_token: 23,
+            },
+            SecurePayload::FilteringMatrixConsent {
+                authorization: authorization.clone(),
+            },
+            SecurePayload::FilteringMatrixSend { authorization },
+            SecurePayload::FilteringMatrixSendResult {
+                trial_id: 17,
+                probe_class: FilterProbeClass::DifferentAddress,
+                probe_token: 23,
+                accepted: true,
+                failure: None,
+            },
+            SecurePayload::FilteringMatrixSendResult {
+                trial_id: 17,
+                probe_class: FilterProbeClass::DifferentAddress,
+                probe_token: 23,
+                accepted: false,
+                failure: Some(FilteringMatrixFailure::Replay),
+            },
+            SecurePayload::FilteringMatrixUnavailable {
+                trial_id: 17,
+                probe_class: FilterProbeClass::DifferentAddress,
+                probe_token: 23,
+                failure: FilteringMatrixFailure::SendFailed,
+            },
+        ];
+        let (mut initiator, mut responder) = session_pair();
+
+        for payload in payloads {
+            let frame = initiator.encrypt(&payload).unwrap();
+            let decoded = responder
+                .decrypt(&frame.session_id, frame.sequence, &frame.ciphertext)
+                .unwrap();
+            assert_eq!(decoded, payload);
+        }
+        assert_eq!(
+            serde_json::to_string(&FilteringMatrixFailure::SendFailed).unwrap(),
+            "\"send_failed\""
         );
     }
 

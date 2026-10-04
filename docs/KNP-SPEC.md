@@ -4,7 +4,7 @@ Status: **Draft 0.1 / experimental**
 
 ## 1. Current scope
 
-KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, and a signed DHT-style peer-record discovery foundation.
+KNP currently implements cryptographic node identity, signed discovery, endpoint cookies, replay filtering, authenticated encrypted sessions, peer-reported external endpoint observations, peer-coordinated UDP rendezvous, a consented three-cell filtering-behavior matrix, and a signed DHT-style peer-record discovery foundation.
 
 Bounded recursive multi-hop DHT routing now exists across established encrypted peers. Alpha.9 persists authenticated-peer routing hints across restarts and added the bounded single-hop cooperative relay circuit foundation. Alpha.10 adds an authenticated end-to-end session inside that relay transport plus deterministic fallback from a failed coordinated punch to the same relay-capable coordinator. Alpha.11 adds a live bounded application API, MTU-aware fragmentation/reassembly, and ACK-based backpressure on top of that relay E2E session. Alpha.12 adds bounded RelayApp retransmission, duplicate-delivery suppression, a 128-sequence sliding anti-replay window that tolerates authenticated UDP reordering, and relay circuit/bandwidth abuse quotas. Alpha.13 adds explicit RelayApp delivery-failure events, bounded direct-session handshake retransmission with cached responder ACKs, responder-side confirmation before deferred encrypted control traffic is flushed, and bounded alternate relay selection across existing encrypted peers. Alpha.14 adds periodic fresh-X25519 rekey for direct KNP sessions with previous-session grace, plus NodeID-centric RelayApp transport migration that prefers confirmed direct sessions and falls back to relay E2E without resetting application message state. The current main branch also rotates relay-inner E2E sessions with the same bounded fresh-X25519 pattern, persists the complete bounded k-bucket membership snapshot for restart bootstrap, exchanges bounded endpoint attestations at runtime, and applies authenticated DHT ingress budgets and observed-prefix routing diversity. Broad convergence testing, multi-network validation, Sybil-resistant observer diversity, and production hardening are not complete.
 
@@ -77,24 +77,25 @@ A node may request a target NodeID without naming a coordinator. KNP considers o
 
 The bounded selector does not discover new peers by itself; DHT discovery is still required for a truly global rendezvous pool.
 
-## 9. Consent-based filtering evidence
+## 9. Consent-based filtering matrix
 
-KNP can gather positive evidence for endpoint-independent inbound filtering using a third helper peer.
+KNP records a bounded three-cell filtering-behavior matrix. Each cell represents the source relationship of one authorized UDP probe to the coordinator endpoint that the target already contacted:
 
-1. The tested node asks coordinator C for a filtering test.
-2. C selects helper H only if H has an encrypted session with C and C observes H on a different IP from the tested node.
-3. C proposes H and the tested node's C-observed endpoint.
-4. The tested node rejects the proposal unless that endpoint exactly matches its existing observation attributed to C and unless it has no existing direct relationship with H.
-5. The tested node creates an Ed25519-signed, short-lived authorization binding its NodeID/public key, target endpoint, H's NodeID, and a random probe token.
-6. C verifies the consent against its pending proposal and forwards it to H.
-7. H independently verifies the signature, NodeID binding, expiry, helper identity, and target endpoint before sending one signed direct FILTER_PROBE.
-8. The tested node counts evidence only if the arriving probe carries the expected signed H identity and token.
+1. **Contacted endpoint control:** coordinator C sends from the exact endpoint already contacted by the target.
+2. **Same address, different port:** C sends one datagram from the same IP address and a temporary, different source port.
+3. **Different, previously uncontacted address:** helper H sends from an address that differs from C and the target and is absent from the target's bounded recent-egress history and direct-peer set.
 
-A successful probe is positive evidence that an independent endpoint reached the mapping. A timeout is only inconclusive; packet loss or helper reachability can cause false negatives.
+The target asks C for a trial over their authenticated encrypted session. C proposes each source class and the exact target endpoint it observes. The target accepts only proposals matching its C-attributed endpoint observation and signs a short-lived, versioned Ed25519 authorization. The authorization binds the target NodeID/public key and endpoint, C's NodeID and baseline endpoint, the helper NodeID, source class, trial ID, random probe token, and validity window.
+
+For the control and same-address cells, C verifies consent against pending coordinator state and sends from its normal socket or a temporary same-family socket respectively. For the different-address cell, C may forward the authorization only to a capability-advertising helper with an authenticated session and a different observed IP. H independently verifies the authorization and sends at most one datagram. Authorization reuse, pending state, per-coordinator, per-target, global send rates, and stored evidence are bounded.
+
+The target accepts a result only when the signed sender, token, trial, class, and actual UDP source relationship match the pending authorization. A successful observation is positive evidence for that cell. Multiple positive different-address observations count as repeated endpoint-independent evidence only when they come from distinct observed IPv4 `/24` or IPv6 `/48` prefixes.
+
+Every negative state remains deliberately non-diagnostic. Timeout, unavailable helper, and send failure are reported as **inconclusive**; even a control-correlated timeout can reflect loss or transient reachability and does not prove restrictive filtering. Localhost and CI coverage proves only protocol/state-machine behavior, not behavior on real WAN, NAT, or CGNAT paths.
 
 ## 10. Current limitations
 
-The punch burst still does not implement port prediction or broad ICE-like candidate prioritization. Filtering evidence currently proves only successful independent-endpoint reachability; it does not infer a restrictive filtering class from non-arrival.
+The punch burst still does not implement port prediction or broad ICE-like candidate prioritization. The filtering matrix records positive reachability across three source relationships, but it does not infer a restrictive filtering class from non-arrival. Real multi-network/NAT/CGNAT field validation remains open.
 
 Destination-specific/symmetric NAT mappings may therefore still fail. Cooperative relay remains the planned fallback.
 
@@ -106,7 +107,7 @@ A token alone is insufficient: the punch sender must also prove possession of th
 
 ## 12. Planned next stages
 
-1. broader filtering-behavior validation,
+1. real multi-network/NAT/CGNAT validation of the filtering matrix,
 2. IPv6 direct-path preference,
 3. safe multi-candidate/path prioritization,
 4. DHT-based peer discovery,
