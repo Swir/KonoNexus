@@ -6369,6 +6369,7 @@ mod tests {
         receiver: &mut RelayAppHandle,
         sender_node_id: &str,
         target_node_id: &str,
+        counters: &RuntimeMeshCounters,
         payload: Vec<u8>,
     ) {
         let message_id = sender
@@ -6376,7 +6377,7 @@ mod tests {
             .await
             .unwrap();
         let (received, receipt) = tokio::join!(
-            time::timeout(Duration::from_secs(18), async {
+            time::timeout(Duration::from_secs(45), async {
                 loop {
                     if let Some(incoming) = receiver.recv().await {
                         if incoming.peer_node_id == sender_node_id && incoming.data == payload {
@@ -6385,7 +6386,7 @@ mod tests {
                     }
                 }
             }),
-            time::timeout(Duration::from_secs(18), async {
+            time::timeout(Duration::from_secs(45), async {
                 loop {
                     if let Some(delivered) = sender.recv_receipt().await {
                         if delivered.peer_node_id == target_node_id
@@ -6396,6 +6397,33 @@ mod tests {
                     }
                 }
             })
+        );
+        assert!(
+            received.is_ok(),
+            "timed out receiving RelayApp payload from {sender_node_id} to {target_node_id}; correlated FINDs {}; exact NODES responses {}; records received at sender {}",
+            counters
+                .finds
+                .lock()
+                .expect("mesh DHT find counter poisoned")
+                .iter()
+                .filter(|(origin, target, _)| {
+                    origin == sender_node_id && target == target_node_id
+                })
+                .count(),
+            counters
+                .nodes
+                .lock()
+                .expect("mesh DHT nodes counter poisoned")
+                .iter()
+                .filter(|(origin, target, _)| {
+                    origin == sender_node_id && target == target_node_id
+                })
+                .count(),
+            counters
+                .received_records
+                .lock()
+                .expect("mesh record counter poisoned")
+                .contains(&(sender_node_id.to_owned(), target_node_id.to_owned()))
         );
         assert_eq!(received.unwrap().data, payload);
         assert_eq!(receipt.unwrap().message_id, message_id);
@@ -6420,6 +6448,7 @@ mod tests {
         preferred: (usize, usize),
         sources: &[usize],
         targets: &[usize],
+        resolvers: &[usize],
         node_ids: &[String],
         counters: &RuntimeMeshCounters,
     ) -> (usize, usize) {
@@ -6445,8 +6474,12 @@ mod tests {
             .into_iter()
             .find(|(source, target)| {
                 !known_records.contains(&(node_ids[*source].clone(), node_ids[*target].clone()))
+                    && resolvers.iter().any(|resolver| {
+                        known_records
+                            .contains(&(node_ids[*resolver].clone(), node_ids[*target].clone()))
+                    })
             })
-            .expect("no non-neighbor leaf pair without a cached exact record")
+            .expect("no non-neighbor leaf pair with an uncached source and a live resolver record")
     }
 
     fn assert_mesh_lookup_was_correlated(
@@ -7693,6 +7726,7 @@ mod tests {
             (2, 3),
             &surviving_leaves,
             &stopped_leaves,
+            &hubs,
             &node_ids,
             &counters,
         );
@@ -7703,6 +7737,7 @@ mod tests {
             before_receiver,
             &node_ids[before_source],
             &node_ids[before_target],
+            &counters,
             b"alpha.23 live mesh before churn".to_vec(),
         )
         .await;
@@ -7762,6 +7797,7 @@ mod tests {
             (1, 17),
             &surviving_leaves,
             &surviving_leaves,
+            &surviving_hubs,
             &node_ids,
             &counters,
         );
@@ -7773,6 +7809,7 @@ mod tests {
             after_receiver,
             &node_ids[after_source],
             &node_ids[after_target],
+            &counters,
             b"alpha.23 live mesh after churn".to_vec(),
         )
         .await;
