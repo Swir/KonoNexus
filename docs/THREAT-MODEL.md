@@ -83,7 +83,7 @@ Punch packets are accepted only for a pending token delivered over an encrypted 
 - stronger long-window per-peer rendezvous/filter-test rate limits,
 - wider NAT/filtering matrix validation and loss-tolerant repeated evidence,
 - relay-inner E2E session key rotation,
-- Sybil-resistant endpoint-attestation quorum/diversity, stronger DHT query rate limits, and routing diversity,
+- Sybil-resistant endpoint-attestation quorum/diversity and DHT routing diversity,
 - selective RelayApp recovery, relay-inner E2E rekey, longer-window relay abuse accounting, adaptive per-peer quotas, and multi-relay/control-plane failover hardening,
 - secure key-file permissions,
 - parser fuzzing and dependency scanning,
