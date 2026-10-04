@@ -2,6 +2,13 @@
 
 Development log for KonoNexus.
 
+## 0.1.0-alpha.22
+
+- Integrated bounded route health with the deterministic KonoMind baseline scorer. Confirmed direct remains preferred unless it has a recent hard failure; relay candidates are scored by sanitized ACK RTT EWMA and observed delivery reliability, with cooldown filtering and route hysteresis.
+- Tracked the latest RelayApp fragment route and send time for at most 64 outbound messages. Only an authenticated ACK received over that same direct endpoint or established relay circuit contributes an RTT/success sample; ambiguous and mismatched ACKs still release valid delivery state but are not scored.
+- Cool down paths after immediate send errors and final RelayApp retry/expiry failures. A hard direct send error can fall back to an already-established relay within the same bounded send call. A local UDP send alone is not considered path success.
+- Added deterministic route cooldown, score, hysteresis, failover/recovery, bounds/isolation, ACK route-match and tracking-cap tests. These establish local state-machine behavior only, not WAN/NAT reachability.
+
 ## 0.1.0-alpha.21
 
 - Bumped the active source and external-testing candidate to `0.1.0-alpha.21`.

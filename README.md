@@ -24,8 +24,8 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.21` |
-| Roadmap | **41 / 49 = 83.7%** |
+| Source version | `0.1.0-alpha.22` |
+| Roadmap | **42 / 49 = 85.7%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -88,7 +88,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.21`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.22`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -149,7 +149,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 41 / 49 items complete (**83.7%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 42 / 49 items complete (**85.7%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -189,7 +189,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Bounded alternate relay selection across up to 3 encrypted peers
 - [x] Live RelayApp direct↔relay migration with direct preference
 - [ ] Multi-relay routing and full control-plane path migration
-- [ ] Runtime path scoring integrated with self-healing routing
+- [x] Runtime path scoring integrated with self-healing routing
 - [x] KonoMind advisory scaffold
 - [ ] KonoMind local learning from real NAT/relay outcomes
 - [x] Direct KNP session key rotation with 30-second grace window
@@ -205,7 +205,7 @@ See [docs/KNP-SPEC.md](docs/KNP-SPEC.md) and [docs/THREAT-MODEL.md](docs/THREAT-
 
 ## KonoMind
 
-KonoMind remains advisory-only. It cannot bypass KNP cryptographic or admission rules. Once real NAT and relay measurements exist, it can use those observations to rank connection strategies.
+KonoMind remains advisory-only. Its deterministic baseline now ranks already-established relay paths from authenticated delivery outcomes, but it cannot bypass KNP cryptographic or admission rules. Learning from broader real NAT and relay measurements remains future work.
 
 ## Why a seed is still needed
 
@@ -350,7 +350,7 @@ Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-inde
 
 ## Testing candidate
 
-Alpha.21 is the current build state intended for controlled testing on separate computers.
+Alpha.22 is the current build state intended for controlled testing on separate computers.
 
 Automated CI now includes a live three-node runtime harness:
 

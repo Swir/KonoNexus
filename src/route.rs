@@ -1,3 +1,4 @@
+use crate::konomind::{KonoMindAdvisor, PathKind, PathMetrics, RouteCandidate};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -5,6 +6,8 @@ use std::time::{Duration, Instant};
 pub const MAX_RELAY_ROUTE_CANDIDATES: usize = 3;
 const MAX_ROUTE_HEALTH_ENTRIES: usize = 2048;
 const ROUTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
+const ROUTE_SWITCH_HYSTERESIS: f32 = 0.08;
+const DEFAULT_RELAY_RTT_MS: f32 = 100.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlRoute {
@@ -55,6 +58,7 @@ struct RouteHealth {
     last_failure: Option<Instant>,
     successes: u32,
     failures: u32,
+    rtt_ewma_ms: Option<f32>,
     touch: u64,
 }
 
@@ -75,6 +79,19 @@ impl RouteController {
     where
         I: IntoIterator<Item = RelayRouteCandidate>,
     {
+        self.select_at(peer_node_id, direct, relay_candidates, Instant::now())
+    }
+
+    pub fn select_at<I>(
+        &mut self,
+        peer_node_id: &str,
+        direct: Option<SocketAddr>,
+        relay_candidates: I,
+        now: Instant,
+    ) -> Option<RouteDecision>
+    where
+        I: IntoIterator<Item = RelayRouteCandidate>,
+    {
         let mut relays: Vec<RelayRouteCandidate> = relay_candidates.into_iter().collect();
         relays.sort_by_key(|candidate| {
             (
@@ -90,28 +107,44 @@ impl RouteController {
         relays.dedup_by_key(|candidate| (candidate.relay_endpoint, candidate.circuit_id));
         relays.truncate(MAX_RELAY_ROUTE_CANDIDATES);
 
-        let desired = if let Some(endpoint) = direct {
-            Some(ControlRoute::Direct(endpoint))
+        let current = self
+            .active
+            .get(peer_node_id)
+            .and_then(|active| active.route);
+        let confirmed_direct = direct
+            .map(ControlRoute::Direct)
+            .filter(|route| !self.route_on_cooldown(peer_node_id, *route, now));
+        let desired = if let Some(route) = confirmed_direct {
+            Some(route)
         } else {
-            let current = self
-                .active
-                .get(peer_node_id)
-                .and_then(|active| active.route);
-            current
-                .and_then(|route| match route {
-                    ControlRoute::Relay {
-                        relay_endpoint,
-                        circuit_id,
-                    } if relays.iter().any(|candidate| {
-                        candidate.relay_endpoint == relay_endpoint
-                            && candidate.circuit_id == circuit_id
-                    }) =>
-                    {
-                        Some(route)
-                    }
-                    _ => None,
+            let mut scored: Vec<(ControlRoute, f32)> = relays
+                .into_iter()
+                .map(|candidate| {
+                    let route = candidate.route();
+                    (route, self.route_score(peer_node_id, route))
                 })
-                .or_else(|| relays.first().copied().map(RelayRouteCandidate::route))
+                .filter(|(route, _)| !self.route_on_cooldown(peer_node_id, *route, now))
+                .collect();
+            scored.sort_by(|(left_route, left_score), (right_route, right_score)| {
+                right_score
+                    .total_cmp(left_score)
+                    .then_with(|| route_order_key(*left_route).cmp(&route_order_key(*right_route)))
+            });
+            let best = scored.first().copied();
+            current
+                .and_then(|route| {
+                    scored
+                        .iter()
+                        .find(|(candidate, _)| *candidate == route)
+                        .copied()
+                })
+                .filter(|(_, current_score)| {
+                    best.is_some_and(|(_, best_score)| {
+                        best_score - *current_score <= ROUTE_SWITCH_HYSTERESIS
+                    })
+                })
+                .or(best)
+                .map(|(route, _)| route)
         };
 
         let Some(route) = desired else {
@@ -195,6 +228,37 @@ impl RouteController {
         self.evict_health_if_needed();
     }
 
+    pub fn report_ack_success(
+        &mut self,
+        peer_node_id: &str,
+        route: ControlRoute,
+        rtt: Duration,
+        sent_at: Instant,
+    ) {
+        self.health_touch = self.health_touch.saturating_add(1);
+        let health = self
+            .health
+            .entry((peer_node_id.to_owned(), route))
+            .or_default();
+        health.successes = health.successes.saturating_add(1);
+        if health
+            .last_failure
+            .is_none_or(|failed_at| failed_at <= sent_at)
+        {
+            health.last_failure = None;
+        }
+        let rtt_ms = rtt.as_secs_f64() * 1000.0;
+        if rtt_ms.is_finite() {
+            let sample = rtt_ms.min(60_000.0) as f32;
+            health.rtt_ewma_ms = Some(match health.rtt_ewma_ms {
+                Some(previous) => previous * 0.8 + sample * 0.2,
+                None => sample,
+            });
+        }
+        health.touch = self.health_touch;
+        self.evict_health_if_needed();
+    }
+
     pub fn report_failure(&mut self, peer_node_id: &str, route: ControlRoute, now: Instant) {
         self.health_touch = self.health_touch.saturating_add(1);
         let health = self
@@ -213,6 +277,44 @@ impl RouteController {
             .and_then(|health| health.last_failure)
             .is_some_and(|failed_at| {
                 now.saturating_duration_since(failed_at) < ROUTE_FAILURE_COOLDOWN
+            })
+    }
+
+    fn route_score(&self, peer_node_id: &str, route: ControlRoute) -> f32 {
+        let health = self.health.get(&(peer_node_id.to_owned(), route));
+        let successes = health.map_or(0, |health| health.successes) as f32;
+        let failures = health.map_or(0, |health| health.failures) as f32;
+        let reliability = (successes + 1.0) / (successes + failures + 2.0);
+        let metrics = PathMetrics {
+            rtt_ms: health
+                .and_then(|health| health.rtt_ewma_ms)
+                .unwrap_or(DEFAULT_RELAY_RTT_MS),
+            packet_loss: 1.0 - reliability,
+            stability: reliability,
+            // Relay load is not yet measured in production, so keep its input neutral.
+            relay_load: 0.5,
+        };
+        KonoMindAdvisor::default()
+            .recommend(&[RouteCandidate {
+                path: match route {
+                    ControlRoute::Direct(_) => PathKind::Direct,
+                    ControlRoute::Relay { .. } => PathKind::Relay,
+                },
+                metrics,
+            }])
+            .map_or(0.0, |recommendation| recommendation.score)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn health_counts(
+        &self,
+        peer_node_id: &str,
+        route: ControlRoute,
+    ) -> (u32, u32, Option<f32>) {
+        self.health
+            .get(&(peer_node_id.to_owned(), route))
+            .map_or((0, 0, None), |health| {
+                (health.successes, health.failures, health.rtt_ewma_ms)
             })
     }
 
@@ -250,13 +352,18 @@ impl RouteController {
     }
 }
 
-fn route_order_key(route: ControlRoute) -> (u8, SocketAddr, u64) {
+fn route_order_key(route: ControlRoute) -> (u8, u8, SocketAddr, u64) {
     match route {
-        ControlRoute::Direct(endpoint) => (0, endpoint, 0),
+        ControlRoute::Direct(endpoint) => (0, if endpoint.is_ipv6() { 0 } else { 1 }, endpoint, 0),
         ControlRoute::Relay {
             relay_endpoint,
             circuit_id,
-        } => (1, relay_endpoint, circuit_id),
+        } => (
+            1,
+            if relay_endpoint.is_ipv6() { 0 } else { 1 },
+            relay_endpoint,
+            circuit_id,
+        ),
     }
 }
 
@@ -407,6 +514,134 @@ mod tests {
 
         controller.report_success(peer, route);
         assert!(!controller.route_on_cooldown(peer, route, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn cooldown_changes_selection_and_direct_recovers_after_expiry() {
+        let mut controller = RouteController::default();
+        let peer = "knp1peer";
+        let direct: SocketAddr = "127.0.0.50:47000".parse().unwrap();
+        let relay = relay("127.0.0.10:47000", 1);
+        let now = Instant::now();
+
+        assert_eq!(
+            controller
+                .select_at(peer, Some(direct), [relay], now)
+                .unwrap()
+                .route,
+            ControlRoute::Direct(direct)
+        );
+        controller.report_failure(peer, ControlRoute::Direct(direct), now);
+
+        assert_eq!(
+            controller
+                .select_at(peer, Some(direct), [relay], now + Duration::from_secs(1))
+                .unwrap()
+                .route,
+            relay.route()
+        );
+        assert_eq!(
+            controller
+                .select_at(peer, Some(direct), [relay], now + Duration::from_secs(5))
+                .unwrap()
+                .route,
+            ControlRoute::Direct(direct)
+        );
+    }
+
+    #[test]
+    fn relay_health_scores_candidates_and_hysteresis_keeps_a_close_active_route() {
+        let mut controller = RouteController::default();
+        let peer = "knp1peer";
+        let slower = relay("127.0.0.10:47000", 1);
+        let faster = relay("127.0.0.11:47000", 2);
+        let now = Instant::now();
+        controller.report_ack_success(peer, faster.route(), Duration::from_millis(20), now);
+        assert_eq!(
+            controller
+                .select_at(peer, None, [slower, faster], now)
+                .unwrap()
+                .route,
+            faster.route()
+        );
+
+        controller.select_at(peer, None, [slower], now).unwrap();
+        controller.report_ack_success(peer, slower.route(), Duration::from_millis(80), now);
+        controller.report_ack_success(peer, faster.route(), Duration::from_millis(300), now);
+        let stable = controller
+            .select_at(peer, None, [slower, faster], now)
+            .unwrap();
+        assert_eq!(stable.route, slower.route());
+        assert!(!stable.changed);
+    }
+
+    #[test]
+    fn failed_relay_falls_back_and_returns_after_cooldown() {
+        let mut controller = RouteController::default();
+        let peer = "knp1peer";
+        let primary = relay("127.0.0.10:47000", 1);
+        let fallback = relay("127.0.0.11:47000", 2);
+        let now = Instant::now();
+        assert_eq!(
+            controller
+                .select_at(peer, None, [primary, fallback], now)
+                .unwrap()
+                .route,
+            primary.route()
+        );
+        controller.report_failure(peer, primary.route(), now);
+        assert_eq!(
+            controller
+                .select_at(
+                    peer,
+                    None,
+                    [primary, fallback],
+                    now + Duration::from_secs(1)
+                )
+                .unwrap()
+                .route,
+            fallback.route()
+        );
+        assert_eq!(
+            controller
+                .select_at(peer, None, [primary], now + Duration::from_secs(5))
+                .unwrap()
+                .route,
+            primary.route()
+        );
+    }
+
+    #[test]
+    fn route_metrics_are_bounded_by_route_and_peer() {
+        let mut controller = RouteController::default();
+        let route = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
+        controller.report_ack_success(
+            "peer-a",
+            route,
+            Duration::from_secs(u64::MAX),
+            Instant::now(),
+        );
+        let (successes, failures, rtt) = controller.health_counts("peer-a", route);
+        assert_eq!((successes, failures), (1, 0));
+        assert!(rtt.is_some_and(|value| value.is_finite() && value <= 60_000.0));
+        assert_eq!(controller.health_counts("peer-b", route), (0, 0, None));
+    }
+
+    #[test]
+    fn stale_ack_does_not_clear_a_newer_route_failure() {
+        let mut controller = RouteController::default();
+        let peer = "knp1peer";
+        let route = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
+        let start = Instant::now();
+        let failed_at = start + Duration::from_secs(2);
+
+        controller.report_failure(peer, route, failed_at);
+        controller.report_ack_success(peer, route, Duration::from_secs(3), start);
+        assert!(controller.route_on_cooldown(peer, route, failed_at + Duration::from_secs(1)));
+
+        let recovered_at = failed_at + Duration::from_secs(1);
+        controller.report_ack_success(peer, route, Duration::from_millis(20), recovered_at);
+        assert!(!controller.route_on_cooldown(peer, route, recovered_at));
     }
 
     #[test]
