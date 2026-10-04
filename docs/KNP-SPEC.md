@@ -119,7 +119,7 @@ A peer record contains NodeID and Ed25519 public key, up to four public socket e
 
 The default lifetime is ten minutes and the maximum accepted lifetime is thirty minutes. Endpoints with port zero, loopback, private/link-local, multicast, broadcast, unspecified, IPv6 unique-local, or IPv6 link-local addresses are not publishable through the global DHT record format.
 
-The local DHT table stores at most 4,096 records. A newer valid sequence replaces an older record for the same NodeID; rollback records are ignored. Expired records are removed.
+The local DHT table stores at most 4,096 records. A newer valid sequence replaces an older record for the same NodeID; rollback records are ignored. Expired records are never returned by exact or nearest reads and are removed during bounded maintenance.
 
 DHT control travels inside encrypted SecurePayload messages: `DhtStore` carries one signed record, `DhtFind` carries a requested NodeID, and `DhtNodes` carries that target plus at most eight records. Responses return an exact record first when available and then a bounded nearest-record set ordered by XOR distance over SHA-256(NodeID).
 
@@ -129,9 +129,9 @@ This deliberately avoids turning untrusted nearest-record gossip into automatic 
 
 ## 14. Bounded multi-hop lookup and routing buckets
 
-Each node maintains an in-memory routing table with 256 XOR-distance buckets derived from SHA-256(NodeID). A bucket stores at most 8 peers and contains only nodes that already have an established encrypted KNP session. Existing entries refresh their endpoint/last-seen time; a full bucket evicts its least-recently-seen entry.
+Each node maintains an in-memory routing table with 256 XOR-distance buckets derived from SHA-256(NodeID). A bucket stores at most 8 peers and at most 2 peers from one observed IPv4 `/24` or IPv6 `/48`; IPv4-mapped IPv6 is normalized to IPv4. Membership is created or refreshed only after an encrypted frame decrypts successfully and its outer sender matches the NodeID bound to that session. A new same-prefix peer replaces only the oldest peer from that prefix; a new prefix entering a full bucket evicts the oldest peer from the most represented prefix, with deterministic tie-breaking.
 
-For a pending NodeID lookup, the origin selects up to 2 nearest active routing peers and sends an encrypted `DhtFind` containing a random query ID, origin NodeID, target NodeID, and hop budget. The initial hop budget is 3.
+For a pending NodeID lookup, the origin orders active routing peers by XOR distance with one peer per observed prefix in the first pass and deterministic same-prefix fallback in the second pass. After session/source/capability filters it selects up to 2 and sends an encrypted `DhtFind` containing a random query ID, origin NodeID, target NodeID, and hop budget. The initial hop budget is 3. Intermediate forwarding and owner/transit replication use the same diverse ordering.
 
 An intermediate node validates NodeID shape and hop bounds, applies ingress limits to the authenticated immediate sender before allocating seen/reverse state or answering, suppresses duplicate `(origin, query_id)` pairs, returns its current exact/nearest signed records, stores a short-lived reverse route toward the requester, and forwards the query to at most 2 other established encrypted peers when no exact record is known and hops remain. Query token buckets are keyed by authenticated NodeID (burst 8, refill one per 2 seconds), observed IPv4 `/24` or IPv6 `/48` (burst 32, refill one per 500 ms), and globally (burst 128, refill one per 125 ms). Peer and prefix state is capped at 4,096 and 1,024 entries, retained for ten minutes, and fails closed at capacity; a claimed origin NodeID never selects the rate-limit bucket.
 
@@ -151,12 +151,12 @@ To constrain amplification and loops, query state expires after 8 seconds, forwa
 
 ## 15. Remaining DHT work
 
-- Sybil-resistant routing diversity,
+- operator/identity diversity stronger than observed-prefix friction,
 - large-mesh convergence and churn testing.
 
 ## 16. Persistent routing bucket snapshot
 
-The runtime persists the complete bounded routing-table membership snapshot: bucket index, NodeID, endpoint, and last-seen time. The file is bound to the local NodeID, stores at most 8 entries in each of the 256 XOR-distance buckets (2,048 entries total), rejects future/stale entries older than seven days, validates that every stored NodeID maps back to the claimed bucket, and keeps atomic replace semantics. Legacy version-1 flat hint caches are accepted and migrated on the next save.
+The runtime persists the complete bounded routing-table membership snapshot: bucket index, NodeID, endpoint, and last-seen time. The file is bound to the local NodeID, stores at most 8 entries and at most 2 entries per observed `/24` or `/48` in each of the 256 XOR-distance buckets (2,048 entries total), independently deduplicates NodeIDs and endpoints, rejects future/stale entries older than seven days, validates that every stored NodeID maps back to the claimed bucket, and keeps atomic replace semantics. Legacy version-1 flat hint caches are accepted only through the same normalization and migrate on the next save.
 
 Restart does **not** restore trust. At most the 256 freshest cached endpoints are promoted to bootstrap probes, and every one must complete the normal signed HELLO, anti-amplification cookie, identity verification, and encrypted-session handshake before it can again participate as an authenticated routing peer. This keeps restart recovery bounded while preserving the full k-bucket layout on disk for safe revalidation.
 

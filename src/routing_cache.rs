@@ -1,8 +1,11 @@
-use crate::dht::{routing_bucket_index, DHT_BUCKET_COUNT, DHT_BUCKET_SIZE};
+use crate::dht::{
+    dht_network_group, routing_bucket_index, DHT_BUCKET_COUNT, DHT_BUCKET_NETWORK_GROUP_LIMIT,
+    DHT_BUCKET_SIZE,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -261,6 +264,26 @@ fn normalize_bucket_entries(
 
     entries.sort_by_key(|entry| {
         (
+            Reverse(entry.last_seen_unix_ms),
+            entry.node_id.clone(),
+            entry.endpoint.clone(),
+            entry.bucket_index,
+        )
+    });
+
+    let mut seen_node_ids = HashSet::new();
+    let mut seen_endpoints = HashSet::new();
+    entries.retain(|entry| {
+        if seen_node_ids.contains(&entry.node_id) || seen_endpoints.contains(&entry.endpoint) {
+            return false;
+        }
+        seen_node_ids.insert(entry.node_id.clone());
+        seen_endpoints.insert(entry.endpoint.clone());
+        true
+    });
+
+    entries.sort_by_key(|entry| {
+        (
             entry.bucket_index,
             Reverse(entry.last_seen_unix_ms),
             entry.node_id.clone(),
@@ -268,8 +291,8 @@ fn normalize_bucket_entries(
         )
     });
 
-    let mut seen = HashSet::new();
     let mut per_bucket = [0_usize; DHT_BUCKET_COUNT];
+    let mut per_bucket_group = HashMap::new();
     let mut normalized = Vec::new();
 
     for entry in entries {
@@ -277,10 +300,18 @@ fn normalize_bucket_entries(
         if bucket >= DHT_BUCKET_COUNT || per_bucket[bucket] >= DHT_BUCKET_SIZE {
             continue;
         }
-        if !seen.insert((entry.node_id.clone(), entry.endpoint.clone())) {
+        let Ok(endpoint) = entry.endpoint.parse::<SocketAddr>() else {
+            continue;
+        };
+        let group_count = per_bucket_group
+            .entry((bucket, dht_network_group(endpoint.ip())))
+            .or_insert(0_usize);
+        if *group_count >= DHT_BUCKET_NETWORK_GROUP_LIMIT {
             continue;
         }
+
         per_bucket[bucket] += 1;
+        *group_count += 1;
         normalized.push(entry);
         if normalized.len() >= MAX_ROUTING_BUCKET_CACHE_ENTRIES {
             break;
@@ -336,6 +367,38 @@ fn unix_time_ms() -> Result<u64> {
 mod tests {
     use super::*;
     use std::env;
+
+    fn node_ids_in_bucket(local_node_id: &str, bucket: usize, count: usize) -> Vec<String> {
+        let mut matching = Vec::new();
+        for index in 1..1_000_000_u64 {
+            let node_id = format!("knp1{index:040x}");
+            if routing_bucket_index(local_node_id, &node_id) == Some(bucket) {
+                matching.push(node_id);
+                if matching.len() == count {
+                    break;
+                }
+            }
+        }
+        assert_eq!(matching.len(), count);
+        matching
+    }
+
+    fn bucket_entry(
+        local_node_id: &str,
+        node_id: String,
+        endpoint: &str,
+        last_seen_unix_ms: u64,
+    ) -> RoutingBucketCacheEntry {
+        RoutingBucketCacheEntry {
+            bucket_index: routing_bucket_index(local_node_id, &node_id)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            node_id,
+            endpoint: endpoint.to_owned(),
+            last_seen_unix_ms,
+        }
+    }
 
     #[test]
     fn cache_round_trip_filters_stale_and_invalid_entries() {
@@ -409,5 +472,133 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_v1_hints_receive_the_same_network_group_cap() {
+        let path = env::temp_dir().join(format!(
+            "kononexus-routing-legacy-diverse-{}-{}.json",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let local = format!("knp1{}", "0".repeat(40));
+        let node_ids = node_ids_in_bucket(&local, 255, DHT_BUCKET_NETWORK_GROUP_LIMIT + 2);
+        let now = unix_time_ms().unwrap();
+        let entries: Vec<RoutingCacheEntry> = node_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, node_id)| RoutingCacheEntry {
+                node_id,
+                endpoint: format!("10.20.30.{}:47000", index + 1),
+                saved_unix_ms: now - index as u64,
+            })
+            .collect();
+
+        save_routing_hints(&path, &entries).unwrap();
+        let loaded = load_routing_bucket_snapshot(&path, &local).unwrap();
+
+        assert_eq!(loaded.len(), DHT_BUCKET_NETWORK_GROUP_LIMIT);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn bucket_snapshot_caps_each_network_group() {
+        let local = format!("knp1{}", "0".repeat(40));
+        let bucket = 255;
+        let node_ids = node_ids_in_bucket(&local, bucket, DHT_BUCKET_NETWORK_GROUP_LIMIT + 2);
+        let now = 1_000_000_u64;
+        let entries: Vec<RoutingBucketCacheEntry> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(index, node_id)| {
+                bucket_entry(
+                    &local,
+                    node_id.clone(),
+                    &format!("8.8.8.{}:47000", index + 1),
+                    now - index as u64,
+                )
+            })
+            .collect();
+
+        let normalized = normalize_bucket_entries(&local, entries, now);
+
+        assert_eq!(normalized.len(), DHT_BUCKET_NETWORK_GROUP_LIMIT);
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|entry| entry.node_id.as_str())
+                .collect::<Vec<_>>(),
+            node_ids[..DHT_BUCKET_NETWORK_GROUP_LIMIT]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn diverse_network_groups_can_fill_a_bucket_snapshot() {
+        let local = format!("knp1{}", "0".repeat(40));
+        let bucket = 255;
+        let node_ids = node_ids_in_bucket(&local, bucket, DHT_BUCKET_SIZE);
+        let now = 1_000_000_u64;
+        let entries: Vec<RoutingBucketCacheEntry> = node_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, node_id)| {
+                bucket_entry(
+                    &local,
+                    node_id,
+                    &format!("8.{}.1.1:47000", index + 1),
+                    now - index as u64,
+                )
+            })
+            .collect();
+
+        let normalized = normalize_bucket_entries(&local, entries, now);
+
+        assert_eq!(normalized.len(), DHT_BUCKET_SIZE);
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|entry| {
+                    let endpoint: SocketAddr = entry.endpoint.parse().unwrap();
+                    dht_network_group(endpoint.ip())
+                })
+                .collect::<HashSet<_>>()
+                .len(),
+            DHT_BUCKET_SIZE
+        );
+    }
+
+    #[test]
+    fn bucket_snapshot_keeps_newest_unique_node_ids_and_endpoints() {
+        let local = format!("knp1{}", "0".repeat(40));
+        let node_ids: Vec<String> = (1..)
+            .map(|index| format!("knp1{index:040x}"))
+            .filter(|node_id| routing_bucket_index(&local, node_id).is_some())
+            .take(3)
+            .collect();
+        let now = 1_000_000_u64;
+        let entries = vec![
+            bucket_entry(&local, node_ids[0].clone(), "8.8.8.1:47000", now - 30),
+            bucket_entry(&local, node_ids[0].clone(), "1.1.1.1:47000", now - 10),
+            bucket_entry(&local, node_ids[1].clone(), "9.9.9.9:47000", now - 20),
+            bucket_entry(&local, node_ids[2].clone(), "9.9.9.9:47000", now - 5),
+        ];
+
+        let normalized = normalize_bucket_entries(&local, entries, now);
+
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized.iter().any(|entry| {
+            entry.node_id == node_ids[0]
+                && entry.endpoint == "1.1.1.1:47000"
+                && entry.last_seen_unix_ms == now - 10
+        }));
+        assert!(normalized.iter().any(|entry| {
+            entry.node_id == node_ids[2]
+                && entry.endpoint == "9.9.9.9:47000"
+                && entry.last_seen_unix_ms == now - 5
+        }));
+        assert!(!normalized.iter().any(|entry| entry.node_id == node_ids[1]));
     }
 }

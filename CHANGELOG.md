@@ -13,6 +13,13 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+- Added bounded runtime exchange and refresh of signed endpoint attestations; exact DHT activation requires two independent observer identities while explicitly not claiming Sybil resistance.
+- Added stable owner-record refresh, bounded hop/fanout replica propagation, rollback high-watermarks, capability-gated legacy behavior, and paced owner-reserved replication queues.
+- Added DHT query and record admission guards keyed by authenticated peer, observed IPv4 `/24` or IPv6 `/48`, and global budgets; invalid signed-record attempts consume budget before signature verification.
+- Prevented expired DHT records from being returned by exact or nearest reads between periodic maintenance ticks.
+- Bound every encrypted outer sender to the NodeID authenticated by its session before secure dispatch or routing admission.
+- Added per-bucket observed-prefix caps and prefix-diverse nearest-peer ordering for DHT lookup and replication, with deterministic same-prefix fallback for availability.
+- Applied the same prefix cap plus independent NodeID/endpoint deduplication to current and legacy persistent routing snapshots.
 - Added version-2 persistence for the full bounded 256×8 DHT k-bucket membership snapshot while keeping restart entries untrusted until normal KNP re-authentication.
 - Added local-NodeID binding, bucket-index validation, seven-day freshness checks, atomic replacement, legacy v1 migration, and a 256-endpoint restart bootstrap cap.
 

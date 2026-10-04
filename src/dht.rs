@@ -3,6 +3,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,7 @@ pub const DEFAULT_RECORD_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const MAX_RECORD_TTL_MS: u64 = 30 * 60 * 1_000;
 pub const DHT_BUCKET_COUNT: usize = 256;
 pub const DHT_BUCKET_SIZE: usize = 8;
+pub const DHT_BUCKET_NETWORK_GROUP_LIMIT: usize = 2;
 pub const DHT_QUERY_FANOUT: usize = 2;
 pub const DHT_MAX_HOPS: u8 = 3;
 pub const DHT_REPLICATION_FANOUT: usize = 2;
@@ -26,6 +28,43 @@ pub const DEFAULT_ENDPOINT_ATTESTATION_TTL_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_ENDPOINT_ATTESTATION_TTL_MS: u64 = 10 * 60 * 1_000;
 pub const DEFAULT_DHT_MAX_ATTESTATIONS: usize = DEFAULT_DHT_MAX_RECORDS * MAX_RECORD_ENDPOINTS;
 const RECORD_CLOCK_SKEW_MS: u64 = 120_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum DhtNetworkGroup {
+    Ipv4([u8; 3]),
+    Ipv6([u16; 3]),
+}
+
+impl fmt::Display for DhtNetworkGroup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ipv4(octets) => {
+                write!(formatter, "v4:{}.{}.{}", octets[0], octets[1], octets[2])
+            }
+            Self::Ipv6(segments) => write!(
+                formatter,
+                "v6:{:x}:{:x}:{:x}",
+                segments[0], segments[1], segments[2]
+            ),
+        }
+    }
+}
+
+pub(crate) fn dht_network_group(ip: IpAddr) -> DhtNetworkGroup {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            DhtNetworkGroup::Ipv4([octets[0], octets[1], octets[2]])
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return dht_network_group(IpAddr::V4(mapped));
+            }
+            let segments = ip.segments();
+            DhtNetworkGroup::Ipv6([segments[0], segments[1], segments[2]])
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EndpointAttestation {
@@ -535,12 +574,20 @@ impl DhtTable {
     }
 
     pub fn get(&self, node_id: &str) -> Option<&PeerRecord> {
-        self.records.get(node_id)
+        let now = unix_time_ms().unwrap_or(u64::MAX);
+        self.records
+            .get(node_id)
+            .filter(|record| record.expires_unix_ms > now)
     }
 
     pub fn nearest(&self, target_node_id: &str, limit: usize) -> Vec<PeerRecord> {
+        let now = unix_time_ms().unwrap_or(u64::MAX);
         let target = key_hash(target_node_id);
-        let mut records: Vec<&PeerRecord> = self.records.values().collect();
+        let mut records: Vec<&PeerRecord> = self
+            .records
+            .values()
+            .filter(|record| record.expires_unix_ms > now)
+            .collect();
         records.sort_by_key(|record| xor_distance(key_hash(&record.node_id), target));
         records
             .into_iter()
@@ -611,41 +658,66 @@ impl RoutingTable {
         };
         let bucket = &mut self.buckets[bucket_index];
 
-        if let Some(existing) = bucket
-            .iter_mut()
-            .find(|peer| peer.node_id == node_id || peer.endpoint == endpoint)
+        bucket.retain(|peer| peer.node_id != node_id && peer.endpoint != endpoint);
+
+        let peer = RoutingPeer {
+            node_id,
+            endpoint,
+            last_seen: now,
+        };
+        let network_group = dht_network_group(peer.endpoint.ip());
+        let same_group: Vec<usize> = bucket
+            .iter()
+            .enumerate()
+            .filter_map(|(index, existing)| {
+                (dht_network_group(existing.endpoint.ip()) == network_group).then_some(index)
+            })
+            .collect();
+
+        if same_group.len() >= DHT_BUCKET_NETWORK_GROUP_LIMIT
+            || (bucket.len() >= DHT_BUCKET_SIZE && !same_group.is_empty())
         {
-            existing.node_id = node_id;
-            existing.endpoint = endpoint;
-            existing.last_seen = now;
+            if let Some(oldest_index) = oldest_peer_index(bucket, same_group.into_iter()) {
+                bucket[oldest_index] = peer;
+            }
             return;
         }
 
         if bucket.len() >= DHT_BUCKET_SIZE {
-            if let Some(oldest_index) = bucket
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, peer)| peer.last_seen)
-                .map(|(index, _)| index)
-            {
+            let mut group_counts = HashMap::new();
+            for existing in bucket.iter() {
+                *group_counts
+                    .entry(dht_network_group(existing.endpoint.ip()))
+                    .or_insert(0_usize) += 1;
+            }
+            let most_represented = group_counts.values().copied().max().unwrap_or_default();
+            let candidates = bucket.iter().enumerate().filter_map(|(index, existing)| {
+                (group_counts
+                    .get(&dht_network_group(existing.endpoint.ip()))
+                    .copied()
+                    .unwrap_or_default()
+                    == most_represented)
+                    .then_some(index)
+            });
+            if let Some(oldest_index) = oldest_peer_index(bucket, candidates) {
                 bucket.remove(oldest_index);
             }
         }
 
-        bucket.push(RoutingPeer {
-            node_id,
-            endpoint,
-            last_seen: now,
-        });
+        bucket.push(peer);
     }
 
     pub fn nearest(&self, target_node_id: &str, limit: usize) -> Vec<RoutingPeer> {
-        let target = key_hash(target_node_id);
-        let mut peers: Vec<RoutingPeer> = self.buckets.iter().flatten().cloned().collect();
-
-        peers.sort_by_key(|peer| xor_distance(key_hash(&peer.node_id), target));
+        let mut peers = self.sorted_peers(target_node_id);
         peers.truncate(limit);
         peers
+    }
+
+    pub fn nearest_diverse(&self, target_node_id: &str, limit: usize) -> Vec<RoutingPeer> {
+        let peers = self.sorted_peers(target_node_id);
+        let mut diverse = prioritize_network_group_diversity(peers);
+        diverse.truncate(limit);
+        diverse
     }
 
     pub fn remove_endpoint(&mut self, endpoint: SocketAddr) {
@@ -677,6 +749,50 @@ impl RoutingTable {
             })
             .collect()
     }
+
+    fn sorted_peers(&self, target_node_id: &str) -> Vec<RoutingPeer> {
+        let target = key_hash(target_node_id);
+        let mut peers: Vec<RoutingPeer> = self.buckets.iter().flatten().cloned().collect();
+        peers.sort_by(|left, right| {
+            xor_distance(key_hash(&left.node_id), target)
+                .cmp(&xor_distance(key_hash(&right.node_id), target))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+                .then_with(|| left.endpoint.cmp(&right.endpoint))
+        });
+        peers
+    }
+}
+
+pub(crate) fn prioritize_network_group_diversity(peers: Vec<RoutingPeer>) -> Vec<RoutingPeer> {
+    let mut seen_groups = HashSet::new();
+    let mut diverse = Vec::with_capacity(peers.len());
+    let mut repeated = Vec::new();
+
+    for peer in peers {
+        if seen_groups.insert(dht_network_group(peer.endpoint.ip())) {
+            diverse.push(peer);
+        } else {
+            repeated.push(peer);
+        }
+    }
+
+    diverse.extend(repeated);
+    diverse
+}
+
+fn oldest_peer_index(
+    bucket: &[RoutingPeer],
+    candidates: impl Iterator<Item = usize>,
+) -> Option<usize> {
+    candidates.min_by(|left, right| {
+        let left_peer = &bucket[*left];
+        let right_peer = &bucket[*right];
+        left_peer
+            .last_seen
+            .cmp(&right_peer.last_seen)
+            .then_with(|| left_peer.node_id.cmp(&right_peer.node_id))
+            .then_with(|| left_peer.endpoint.cmp(&right_peer.endpoint))
+    })
 }
 
 pub fn routing_bucket_index(local_node_id: &str, remote_node_id: &str) -> Option<usize> {
@@ -758,6 +874,21 @@ fn unix_time_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node_ids_in_bucket(local_node_id: &str, bucket: usize, count: usize) -> Vec<String> {
+        let mut matching = Vec::new();
+        for index in 0..1_000_000_u32 {
+            let node_id = format!("knp1-candidate-{index}");
+            if bucket_index(key_hash(local_node_id), key_hash(&node_id)) == Some(bucket) {
+                matching.push(node_id);
+                if matching.len() == count {
+                    break;
+                }
+            }
+        }
+        assert_eq!(matching.len(), count);
+        matching
+    }
 
     #[test]
     fn signed_record_verifies_and_tampering_fails() {
@@ -876,36 +1007,231 @@ mod tests {
     }
 
     #[test]
+    fn network_groups_normalize_prefixes_and_mapped_ipv4() {
+        assert_eq!(
+            dht_network_group("8.8.8.1".parse().unwrap()),
+            dht_network_group("8.8.8.250".parse().unwrap())
+        );
+        assert_ne!(
+            dht_network_group("8.8.8.1".parse().unwrap()),
+            dht_network_group("8.8.9.1".parse().unwrap())
+        );
+        assert_eq!(
+            dht_network_group("::ffff:8.8.8.1".parse().unwrap()),
+            dht_network_group("8.8.8.250".parse().unwrap())
+        );
+        assert_eq!(
+            dht_network_group("2001:db8:abcd::1".parse().unwrap()),
+            dht_network_group("2001:db8:abcd:ffff::1".parse().unwrap())
+        );
+        assert_ne!(
+            dht_network_group("2001:db8:abcd::1".parse().unwrap()),
+            dht_network_group("2001:db8:abce::1".parse().unwrap())
+        );
+        assert_eq!(
+            dht_network_group("8.8.8.1".parse().unwrap()).to_string(),
+            "v4:8.8.8"
+        );
+    }
+
+    #[test]
     fn routing_table_keeps_only_bucket_limit_and_refreshes_peers() {
         let local = "knp1-local";
         let desired_bucket = 255;
-        let mut matching = Vec::new();
-
-        for index in 0..100_000_u32 {
-            let node_id = format!("knp1-candidate-{index}");
-            if bucket_index(key_hash(local), key_hash(&node_id)) == Some(desired_bucket) {
-                matching.push(node_id);
-                if matching.len() == DHT_BUCKET_SIZE + 2 {
-                    break;
-                }
-            }
-        }
-
-        assert_eq!(matching.len(), DHT_BUCKET_SIZE + 2);
+        let matching = node_ids_in_bucket(local, desired_bucket, DHT_BUCKET_SIZE + 2);
 
         let mut routing = RoutingTable::new(local);
         let now = Instant::now();
         for (index, node_id) in matching.into_iter().enumerate() {
             routing.observe(
                 node_id,
-                format!("8.8.8.{}:47000", (index % 200) + 1)
-                    .parse()
-                    .unwrap(),
+                format!("8.{}.1.1:47000", index + 1).parse().unwrap(),
                 now + Duration::from_millis(index as u64),
             );
         }
 
         assert_eq!(routing.len(), DHT_BUCKET_SIZE);
+    }
+
+    #[test]
+    fn routing_table_caps_each_network_group_per_bucket() {
+        let local = "knp1-local";
+        let desired_bucket = 255;
+        let matching =
+            node_ids_in_bucket(local, desired_bucket, DHT_BUCKET_NETWORK_GROUP_LIMIT + 3);
+        let mut routing = RoutingTable::new(local);
+        let now = Instant::now();
+
+        for (index, node_id) in matching.iter().enumerate() {
+            routing.observe(
+                node_id.clone(),
+                format!("8.8.8.{}:47000", index + 1).parse().unwrap(),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+
+        let entries: Vec<RoutingPeer> = routing
+            .bucket_entries()
+            .into_iter()
+            .filter_map(|(bucket, peer)| (bucket == desired_bucket).then_some(peer))
+            .collect();
+        assert_eq!(entries.len(), DHT_BUCKET_NETWORK_GROUP_LIMIT);
+        assert!(entries.iter().all(|peer| {
+            dht_network_group(peer.endpoint.ip()) == dht_network_group("8.8.8.1".parse().unwrap())
+        }));
+        assert_eq!(
+            entries
+                .iter()
+                .map(|peer| peer.node_id.as_str())
+                .collect::<HashSet<_>>(),
+            matching[matching.len() - DHT_BUCKET_NETWORK_GROUP_LIMIT..]
+                .iter()
+                .map(String::as_str)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn routing_table_same_group_churn_preserves_other_groups() {
+        let local = "knp1-local";
+        let desired_bucket = 255;
+        let matching = node_ids_in_bucket(local, desired_bucket, DHT_BUCKET_SIZE + 1);
+        let mut routing = RoutingTable::new(local);
+        let now = Instant::now();
+
+        for (index, node_id) in matching.iter().take(DHT_BUCKET_SIZE).enumerate() {
+            routing.observe(
+                node_id.clone(),
+                format!("8.{}.1.1:47000", index + 1).parse().unwrap(),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        routing.observe(
+            matching[DHT_BUCKET_SIZE].clone(),
+            "8.1.1.2:47000".parse().unwrap(),
+            now + Duration::from_secs(1),
+        );
+
+        let entries: Vec<RoutingPeer> = routing
+            .bucket_entries()
+            .into_iter()
+            .filter_map(|(bucket, peer)| (bucket == desired_bucket).then_some(peer))
+            .collect();
+        let groups: HashSet<DhtNetworkGroup> = entries
+            .iter()
+            .map(|peer| dht_network_group(peer.endpoint.ip()))
+            .collect();
+        assert_eq!(entries.len(), DHT_BUCKET_SIZE);
+        assert_eq!(groups.len(), DHT_BUCKET_SIZE);
+        assert!(!entries.iter().any(|peer| peer.node_id == matching[0]));
+        assert!(entries
+            .iter()
+            .any(|peer| peer.node_id == matching[DHT_BUCKET_SIZE]));
+        assert!(matching[1..DHT_BUCKET_SIZE]
+            .iter()
+            .all(|node_id| entries.iter().any(|peer| &peer.node_id == node_id)));
+    }
+
+    #[test]
+    fn routing_table_new_group_evicts_an_overrepresented_group_first() {
+        let local = "knp1-local";
+        let desired_bucket = 255;
+        let matching = node_ids_in_bucket(local, desired_bucket, DHT_BUCKET_SIZE + 1);
+        let endpoints = [
+            "8.8.8.1:47000",
+            "8.8.8.2:47000",
+            "9.9.9.1:47000",
+            "9.9.9.2:47000",
+            "1.1.1.1:47000",
+            "2.2.2.2:47000",
+            "3.3.3.3:47000",
+            "4.4.4.4:47000",
+        ];
+        let mut routing = RoutingTable::new(local);
+        let now = Instant::now();
+
+        for (index, (node_id, endpoint)) in matching
+            .iter()
+            .take(DHT_BUCKET_SIZE)
+            .zip(endpoints)
+            .enumerate()
+        {
+            routing.observe(
+                node_id.clone(),
+                endpoint.parse().unwrap(),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        let oldest_singleton = matching[4].clone();
+        routing.observe(
+            matching[DHT_BUCKET_SIZE].clone(),
+            "5.5.5.5:47000".parse().unwrap(),
+            now + Duration::from_secs(1),
+        );
+
+        let entries: Vec<RoutingPeer> = routing
+            .bucket_entries()
+            .into_iter()
+            .filter_map(|(bucket, peer)| (bucket == desired_bucket).then_some(peer))
+            .collect();
+        let groups: HashSet<DhtNetworkGroup> = entries
+            .iter()
+            .map(|peer| dht_network_group(peer.endpoint.ip()))
+            .collect();
+        assert_eq!(entries.len(), DHT_BUCKET_SIZE);
+        assert_eq!(groups.len(), 7);
+        assert!(entries.iter().any(|peer| peer.node_id == oldest_singleton));
+        assert!(entries
+            .iter()
+            .any(|peer| peer.node_id == matching[DHT_BUCKET_SIZE]));
+    }
+
+    #[test]
+    fn routing_table_group_eviction_is_deterministic_on_equal_timestamps() {
+        let local = "knp1-local";
+        let desired_bucket = 255;
+        let mut matching =
+            node_ids_in_bucket(local, desired_bucket, DHT_BUCKET_NETWORK_GROUP_LIMIT + 1);
+        matching[..DHT_BUCKET_NETWORK_GROUP_LIMIT].sort();
+        let expected_evicted = matching[0].clone();
+        let mut routing = RoutingTable::new(local);
+        let now = Instant::now();
+
+        for (index, node_id) in matching.iter().enumerate() {
+            routing.observe(
+                node_id.clone(),
+                format!("8.8.8.{}:47000", index + 1).parse().unwrap(),
+                now,
+            );
+        }
+
+        let node_ids: HashSet<String> = routing
+            .bucket_entries()
+            .into_iter()
+            .map(|(_, peer)| peer.node_id)
+            .collect();
+        assert_eq!(node_ids.len(), DHT_BUCKET_NETWORK_GROUP_LIMIT);
+        assert!(!node_ids.contains(&expected_evicted));
+        assert!(node_ids.contains(matching.last().unwrap()));
+    }
+
+    #[test]
+    fn routing_table_refresh_replaces_the_existing_membership() {
+        let node_id = "knp1-peer".to_owned();
+        let first_endpoint: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let second_endpoint: SocketAddr = "1.1.1.1:47000".parse().unwrap();
+        let now = Instant::now();
+        let refreshed_at = now + Duration::from_secs(1);
+        let mut routing = RoutingTable::new("knp1-local");
+
+        routing.observe(node_id.clone(), first_endpoint, now);
+        routing.observe(node_id.clone(), second_endpoint, refreshed_at);
+
+        let entries = routing.bucket_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.node_id, node_id);
+        assert_eq!(entries[0].1.endpoint, second_endpoint);
+        assert_eq!(entries[0].1.last_seen, refreshed_at);
     }
 
     #[test]
@@ -938,6 +1264,99 @@ mod tests {
             nearest.first().map(|peer| peer.node_id.as_str()),
             Some("knp1-a")
         );
+    }
+
+    #[test]
+    fn routing_table_nearest_diverse_prefers_unique_groups_then_falls_back() {
+        let target = "knp1-target";
+        let mut routing = RoutingTable::new("knp1-local");
+        let now = Instant::now();
+        routing.observe(target.into(), "8.8.8.8:47000".parse().unwrap(), now);
+        routing.observe(
+            "knp1-same-prefix".into(),
+            "8.8.8.9:47000".parse().unwrap(),
+            now,
+        );
+        routing.observe(
+            "knp1-other-prefix".into(),
+            "1.1.1.1:47000".parse().unwrap(),
+            now,
+        );
+
+        let diverse = routing.nearest_diverse(target, 2);
+        assert_eq!(
+            diverse.first().map(|peer| peer.node_id.as_str()),
+            Some(target)
+        );
+        assert_eq!(
+            diverse
+                .iter()
+                .map(|peer| dht_network_group(peer.endpoint.ip()))
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+
+        let mut single_group = RoutingTable::new("knp1-local");
+        single_group.observe(target.into(), "8.8.8.8:47000".parse().unwrap(), now);
+        single_group.observe(
+            "knp1-same-prefix".into(),
+            "8.8.8.9:47000".parse().unwrap(),
+            now,
+        );
+        let fallback = single_group.nearest_diverse(target, 2);
+        assert_eq!(fallback.len(), 2);
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|peer| dht_network_group(peer.endpoint.ip()))
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn filtered_candidates_are_diversified_before_truncation() {
+        let now = Instant::now();
+        let candidates = vec![
+            RoutingPeer {
+                node_id: "a1".into(),
+                endpoint: "8.8.8.1:47000".parse().unwrap(),
+                last_seen: now,
+            },
+            RoutingPeer {
+                node_id: "b1".into(),
+                endpoint: "1.1.1.1:47000".parse().unwrap(),
+                last_seen: now,
+            },
+            RoutingPeer {
+                node_id: "a2".into(),
+                endpoint: "8.8.8.2:47000".parse().unwrap(),
+                last_seen: now,
+            },
+            RoutingPeer {
+                node_id: "b2".into(),
+                endpoint: "1.1.1.2:47000".parse().unwrap(),
+                last_seen: now,
+            },
+        ];
+        let eligible: Vec<RoutingPeer> = candidates
+            .into_iter()
+            .filter(|peer| peer.node_id != "b1")
+            .collect();
+
+        let selected = prioritize_network_group_diversity(eligible);
+
+        assert_eq!(
+            selected
+                .iter()
+                .take(DHT_QUERY_FANOUT)
+                .map(|peer| peer.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "b2"]
+        );
+        assert_eq!(selected[2].node_id, "a2");
     }
 
     #[test]
@@ -992,6 +1411,22 @@ mod tests {
         .unwrap();
         table.upsert(second).unwrap();
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn expired_records_are_never_returned_between_maintenance_ticks() {
+        let current = unix_time_ms().unwrap();
+        let issued = current.saturating_sub(1_000);
+        let identity = NodeIdentity::generate();
+        let record =
+            PeerRecord::signed_at(&identity, vec!["8.8.8.8:47000".parse().unwrap()], issued, 1)
+                .unwrap();
+        let mut table = DhtTable::new(1);
+
+        assert!(table.upsert_at(record, issued).unwrap());
+        assert_eq!(table.len(), 1);
+        assert!(table.get(&identity.node_id()).is_none());
+        assert!(table.nearest(&identity.node_id(), 1).is_empty());
     }
 
     #[test]

@@ -240,11 +240,11 @@ DHT control messages travel inside the existing encrypted KNP session:
 
 The local table is bounded to 4,096 records and responses to at most 8 records plus 4 matching attestations. Records and evidence expire automatically. KNP may cache nearest records, but it **does not automatically dial arbitrary nearest nodes**. A new network connection is attempted only from an exact valid record for a NodeID that the local user/application is already trying to reach, and only when one exact endpoint has current signatures from at least two independent observer identities.
 
-This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup, persistent bounded k-bucket snapshots, endpoint-attestation exchange/enforcement, and bounded replica refresh are implemented; Sybil-resistant diversity and convergence testing across a large mesh remain future work.
+This remains an intentionally bounded DHT rather than a complete Kademlia implementation. Multi-hop lookup, persistent bounded k-bucket snapshots, endpoint-attestation exchange/enforcement, bounded replica refresh, and observed-prefix diversity are implemented. Prefix diversity raises the cost of a single-network routing takeover; it is not Sybil resistance. Independent-operator diversity and convergence testing across a large mesh remain future work.
 
 ### Bounded multi-hop DHT
 
-Alpha.8 adds an in-memory 256-bucket routing table populated only by peers that already completed an encrypted KNP session. Each bucket stores at most 8 active peers and refreshes/evicts by last-seen time.
+Alpha.8 adds an in-memory 256-bucket routing table. A peer enters or refreshes this table only after a frame decrypts successfully under the session-bound NodeID. Each bucket stores at most 8 active peers and at most 2 peers from one observed IPv4 `/24` or IPv6 `/48`; IPv4-mapped IPv6 is normalized to IPv4. Nearest-peer selection takes one peer per observed prefix before deterministically filling any remaining slots from duplicate prefixes, preserving availability when only one prefix exists.
 
 A lookup is recursive but deliberately bounded:
 
@@ -259,7 +259,7 @@ The lookup walks only existing encrypted mesh edges. It does **not** open connec
 
 ### Persistent routing buckets
 
-KNP persists the complete bounded routing-table membership snapshot in `routing-cache.json`: bucket index, peer NodeID, endpoint, and last-seen time. The snapshot is bound to the local NodeID, validates bucket membership on load, rejects stale/future entries, and preserves the 8-entry limit for each of 256 XOR-distance buckets. Version-1 flat routing-hint files remain readable and migrate on the next save.
+KNP persists the complete bounded routing-table membership snapshot in `routing-cache.json`: bucket index, peer NodeID, endpoint, and last-seen time. The snapshot is bound to the local NodeID, validates bucket membership on load, rejects stale/future entries, preserves the 8-entry and 2-per-observed-prefix limits for each of 256 XOR-distance buckets, and deduplicates NodeIDs and endpoints independently. Version-1 flat routing-hint files remain readable and pass through the same normalization before migration on the next save.
 
 Restart never restores authentication from disk. Only the 256 freshest cached endpoints are used as bounded bootstrap hints; every peer must pass signed HELLO, endpoint-cookie admission, identity verification, and a fresh X25519 session handshake before it can re-enter the live routing table. The cache is metadata, not secret key material. Operators can override its path with `--routing-cache`.
 
