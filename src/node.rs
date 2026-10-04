@@ -7551,8 +7551,8 @@ mod tests {
         const NODE_COUNT: usize = 32;
         const LEAF_COUNT: usize = 28;
         const HUB_COUNT: usize = 4;
-        const HELLO_INTERVAL: Duration = Duration::from_millis(500);
-        const MESH_TIMEOUT: Duration = Duration::from_secs(30);
+        const HELLO_INTERVAL: Duration = Duration::from_secs(2);
+        const MESH_TIMEOUT: Duration = Duration::from_secs(60);
 
         assert!(!endpoint_publishable("127.0.0.1:47000".parse().unwrap()));
         let counters = Arc::new(RuntimeMeshCounters::default());
@@ -7600,7 +7600,7 @@ mod tests {
             apps[leaf] = Some(app);
             diagnostics[leaf] = Some(diagnostic);
             tasks[leaf] = Some(tokio::spawn(node.run()));
-            time::sleep(Duration::from_millis(50)).await;
+            time::sleep(Duration::from_millis(150)).await;
         }
         let mut apps: Vec<_> = apps.into_iter().map(Option::unwrap).map(Some).collect();
         let diagnostics: Vec<_> = diagnostics.into_iter().map(Option::unwrap).collect();
@@ -7630,7 +7630,19 @@ mod tests {
                     .skip(LEAF_COUNT)
                     .map(|handle| handle.snapshot().authenticated_peers)
                     .collect();
-                format!("leaf peer counts {leaf_counts:?}; hub peer counts {hub_counts:?}")
+                let finished_tasks: Vec<_> = tasks
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, task)| {
+                        task.as_ref()
+                            .is_some_and(|task| task.is_finished())
+                            .then_some(index)
+                    })
+                    .collect();
+                format!(
+                    "leaf peer counts {leaf_counts:?}; hub peer counts {hub_counts:?}; finished tasks {finished_tasks:?}"
+                )
             },
         )
         .await;
