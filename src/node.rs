@@ -3213,10 +3213,9 @@ impl KonoNode {
             return Ok(false);
         }
 
-        let attested_endpoints = self.endpoint_attestations.attested_endpoints(
-            record,
-            MIN_ENDPOINT_ATTESTATION_OBSERVERS,
-        );
+        let attested_endpoints = self
+            .endpoint_attestations
+            .attested_endpoints(record, MIN_ENDPOINT_ATTESTATION_OBSERVERS);
         if attested_endpoints.is_empty() {
             debug!(
                 target = %record.node_id,

@@ -256,11 +256,7 @@ impl EndpointAttestationTable {
             .collect()
     }
 
-    pub fn for_record(
-        &self,
-        record: &PeerRecord,
-        limit: usize,
-    ) -> Vec<EndpointAttestation> {
+    pub fn for_record(&self, record: &PeerRecord, limit: usize) -> Vec<EndpointAttestation> {
         let now = unix_time_ms().unwrap_or(u64::MAX);
         let limit = limit.min(DHT_ATTESTATION_RESPONSE_LIMIT);
         let mut selected = Vec::new();
@@ -282,7 +278,11 @@ impl EndpointAttestationTable {
                     .cmp(&left.observed_unix_ms)
                     .then(left.observer_node_id.cmp(&right.observer_node_id))
             });
-            selected.extend(candidates.into_iter().take(MIN_ENDPOINT_ATTESTATION_OBSERVERS));
+            selected.extend(
+                candidates
+                    .into_iter()
+                    .take(MIN_ENDPOINT_ATTESTATION_OBSERVERS),
+            );
             if selected.len() >= limit {
                 break;
             }
@@ -313,7 +313,6 @@ impl EndpointAttestationTable {
     pub fn is_empty(&self) -> bool {
         self.attestations.is_empty()
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -796,14 +795,9 @@ mod tests {
             DEFAULT_ENDPOINT_ATTESTATION_TTL_MS,
         )
         .unwrap();
-        let newer = EndpointAttestation::signed_at(
-            &observer,
-            subject.node_id(),
-            endpoint,
-            now + 1,
-            2,
-        )
-        .unwrap();
+        let newer =
+            EndpointAttestation::signed_at(&observer, subject.node_id(), endpoint, now + 1, 2)
+                .unwrap();
         let mut table = EndpointAttestationTable::new(1);
 
         assert!(table.upsert_at(newer, now + 1).unwrap());
