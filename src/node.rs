@@ -6738,7 +6738,7 @@ mod tests {
         assert!(node.activate_dht_record(&record).await.unwrap());
         assert_eq!(
             node.connect_candidate_groups[&target_node_id].candidates(),
-            &[ipv6_first, ipv4_first, ipv4_second]
+            &[ipv6_first, ipv4_second, ipv4_first]
         );
     }
 
