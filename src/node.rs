@@ -49,6 +49,15 @@ const FILTER_PROBE_STATE_TTL: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const DHT_FORWARD_COOLDOWN: Duration = Duration::from_millis(250);
 const MAX_SEEN_DHT_QUERIES: usize = 2_048;
+const DHT_QUERY_GUARD_RETENTION: Duration = Duration::from_secs(10 * 60);
+const MAX_DHT_QUERY_PEER_BUCKETS: usize = 4_096;
+const MAX_DHT_QUERY_PREFIX_BUCKETS: usize = 1_024;
+const DHT_QUERY_PEER_BURST: u16 = 8;
+const DHT_QUERY_PREFIX_BURST: u16 = 32;
+const DHT_QUERY_GLOBAL_BURST: u16 = 128;
+const DHT_QUERY_PEER_REFILL: Duration = Duration::from_secs(2);
+const DHT_QUERY_PREFIX_REFILL: Duration = Duration::from_millis(500);
+const DHT_QUERY_GLOBAL_REFILL: Duration = Duration::from_millis(125);
 // One first-hop peer can return 1 + 2 + 4 + 8 bounded tree responses at hop depth 3.
 const MAX_DHT_RESPONSES_PER_PEER_QUERY: u8 = 15;
 const DHT_RESPONSE_CACHE_LIMIT: usize = 2;
@@ -292,6 +301,41 @@ struct DhtReplicationRateWindow {
 }
 
 #[derive(Debug, Clone)]
+struct DhtQueryTokenBucket {
+    tokens: u16,
+    last_refill: Instant,
+    last_seen: Instant,
+}
+
+impl DhtQueryTokenBucket {
+    fn full(capacity: u16, now: Instant) -> Self {
+        Self {
+            tokens: capacity,
+            last_refill: now,
+            last_seen: now,
+        }
+    }
+
+    fn try_take(&mut self, capacity: u16, refill_interval: Duration, now: Instant) -> bool {
+        let elapsed = now
+            .checked_duration_since(self.last_refill)
+            .unwrap_or_default();
+        let refill_nanos = refill_interval.as_nanos().max(1);
+        let refills = (elapsed.as_nanos() / refill_nanos).min(u16::MAX as u128) as u16;
+        if refills > 0 {
+            self.tokens = self.tokens.saturating_add(refills).min(capacity);
+            self.last_refill += refill_interval.saturating_mul(u32::from(refills));
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        self.last_seen = now;
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
 struct DhtReplicationHistory {
     target_node_ids: HashSet<String>,
     transit_target_node_ids: HashSet<String>,
@@ -391,6 +435,9 @@ pub struct KonoNode {
     endpoint_attestations: EndpointAttestationTable,
     last_endpoint_attestation_refresh: HashMap<SocketAddr, Instant>,
     dht_replication_rate_windows: HashMap<String, DhtReplicationRateWindow>,
+    dht_query_peer_buckets: HashMap<String, DhtQueryTokenBucket>,
+    dht_query_prefix_buckets: HashMap<String, DhtQueryTokenBucket>,
+    dht_query_global_bucket: DhtQueryTokenBucket,
     dht_replication_history: HashMap<(String, u64), DhtReplicationHistory>,
     pending_dht_replications: VecDeque<PendingDhtReplication>,
     own_dht_record: Option<OwnDhtRecord>,
@@ -438,6 +485,7 @@ impl KonoNode {
             .await
             .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
 
+        let now = Instant::now();
         Ok(Self {
             identity,
             socket: Arc::new(socket),
@@ -467,6 +515,9 @@ impl KonoNode {
             endpoint_attestations: EndpointAttestationTable::default(),
             last_endpoint_attestation_refresh: HashMap::new(),
             dht_replication_rate_windows: HashMap::new(),
+            dht_query_peer_buckets: HashMap::new(),
+            dht_query_prefix_buckets: HashMap::new(),
+            dht_query_global_bucket: DhtQueryTokenBucket::full(DHT_QUERY_GLOBAL_BURST, now),
             dht_replication_history: HashMap::new(),
             pending_dht_replications: VecDeque::new(),
             own_dht_record: None,
@@ -1458,6 +1509,10 @@ impl KonoNode {
                 }
 
                 let now = Instant::now();
+                if !self.allow_dht_query(sender_node_id, source, now) {
+                    debug!(peer = %sender_node_id, "DHT query ingress rate-limited");
+                    return Ok(());
+                }
                 self.seen_dht_queries
                     .retain(|_, expires_at| *expires_at > now);
                 self.reverse_dht_routes
@@ -3805,6 +3860,54 @@ impl KonoNode {
         true
     }
 
+    fn allow_dht_query(
+        &mut self,
+        sender_node_id: &str,
+        source: SocketAddr,
+        now: Instant,
+    ) -> bool {
+        self.dht_query_peer_buckets.retain(|_, bucket| {
+            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
+        });
+        self.dht_query_prefix_buckets.retain(|_, bucket| {
+            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
+        });
+
+        let peer_key = sender_node_id.to_owned();
+        let prefix_key = dht_network_group(source.ip());
+        if (!self.dht_query_peer_buckets.contains_key(&peer_key)
+            && self.dht_query_peer_buckets.len() >= MAX_DHT_QUERY_PEER_BUCKETS)
+            || (!self.dht_query_prefix_buckets.contains_key(&prefix_key)
+                && self.dht_query_prefix_buckets.len() >= MAX_DHT_QUERY_PREFIX_BUCKETS)
+        {
+            return false;
+        }
+
+        let mut peer = self
+            .dht_query_peer_buckets
+            .get(&peer_key)
+            .cloned()
+            .unwrap_or_else(|| DhtQueryTokenBucket::full(DHT_QUERY_PEER_BURST, now));
+        let mut prefix = self
+            .dht_query_prefix_buckets
+            .get(&prefix_key)
+            .cloned()
+            .unwrap_or_else(|| DhtQueryTokenBucket::full(DHT_QUERY_PREFIX_BURST, now));
+        let mut global = self.dht_query_global_bucket.clone();
+
+        if !peer.try_take(DHT_QUERY_PEER_BURST, DHT_QUERY_PEER_REFILL, now)
+            || !prefix.try_take(DHT_QUERY_PREFIX_BURST, DHT_QUERY_PREFIX_REFILL, now)
+            || !global.try_take(DHT_QUERY_GLOBAL_BURST, DHT_QUERY_GLOBAL_REFILL, now)
+        {
+            return false;
+        }
+
+        self.dht_query_peer_buckets.insert(peer_key, peer);
+        self.dht_query_prefix_buckets.insert(prefix_key, prefix);
+        self.dht_query_global_bucket = global;
+        true
+    }
+
     fn allow_dht_record_admission(
         &mut self,
         sender_node_id: &str,
@@ -4807,6 +4910,14 @@ impl KonoNode {
         self.dht_replication_rate_windows.retain(|_, window| {
             now.duration_since(window.last_seen) < DHT_REPLICATION_RATE_RETENTION
         });
+        self.dht_query_peer_buckets.retain(|_, bucket| {
+            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
+        });
+        self.dht_query_prefix_buckets.retain(|_, bucket| {
+            now.duration_since(bucket.last_seen) < DHT_QUERY_GUARD_RETENTION
+        });
+        self.last_dht_forward
+            .retain(|_, last| now.duration_since(*last) < DHT_QUERY_GUARD_RETENTION);
         self.dht_replication_history
             .retain(|_, history| history.expires_at > now);
         self.pending_dht_replications
@@ -5008,6 +5119,61 @@ mod tests {
             1,
             now + DHT_REPLICATION_RATE_WINDOW
         ));
+    }
+
+    #[test]
+    fn dht_query_token_bucket_refills_at_exact_boundary() {
+        let now = Instant::now();
+        let mut bucket = DhtQueryTokenBucket::full(2, now);
+
+        assert!(bucket.try_take(2, Duration::from_secs(2), now));
+        assert!(bucket.try_take(2, Duration::from_secs(2), now));
+        assert!(!bucket.try_take(2, Duration::from_secs(2), now));
+        assert!(!bucket.try_take(
+            2,
+            Duration::from_secs(2),
+            now + Duration::from_millis(1_999)
+        ));
+        assert!(bucket.try_take(
+            2,
+            Duration::from_secs(2),
+            now + Duration::from_secs(2)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dht_query_guard_shares_prefix_budget_and_retains_peer_debt() {
+        let identity = NodeIdentity::generate();
+        let mut node = KonoNode::bind(
+            identity,
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let now = Instant::now();
+        let source: SocketAddr = "8.8.8.8:47000".parse().unwrap();
+        let first = NodeIdentity::generate().node_id();
+
+        for _ in 0..DHT_QUERY_PEER_BURST {
+            assert!(node.allow_dht_query(&first, source, now));
+        }
+        assert!(!node.allow_dht_query(&first, "8.8.8.8:47001".parse().unwrap(), now));
+
+        for port in 47_002..47_005 {
+            let peer = NodeIdentity::generate().node_id();
+            let endpoint = format!("8.8.8.9:{port}").parse().unwrap();
+            for _ in 0..DHT_QUERY_PEER_BURST {
+                assert!(node.allow_dht_query(&peer, endpoint, now));
+            }
+        }
+        assert!(!node.allow_dht_query(
+            &NodeIdentity::generate().node_id(),
+            "8.8.8.10:47006".parse().unwrap(),
+            now
+        ));
+        assert!(node.allow_dht_query(&first, source, now + DHT_QUERY_PEER_REFILL));
     }
 
     #[test]

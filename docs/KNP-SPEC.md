@@ -133,7 +133,7 @@ Each node maintains an in-memory routing table with 256 XOR-distance buckets der
 
 For a pending NodeID lookup, the origin selects up to 2 nearest active routing peers and sends an encrypted `DhtFind` containing a random query ID, origin NodeID, target NodeID, and hop budget. The initial hop budget is 3.
 
-An intermediate node validates NodeID shape and hop bounds, suppresses duplicate `(origin, query_id)` pairs, returns its current exact/nearest signed records, stores a short-lived reverse route toward the requester, and forwards the query to at most 2 other established encrypted peers when no exact record is known and hops remain.
+An intermediate node validates NodeID shape and hop bounds, applies ingress limits to the authenticated immediate sender before allocating seen/reverse state or answering, suppresses duplicate `(origin, query_id)` pairs, returns its current exact/nearest signed records, stores a short-lived reverse route toward the requester, and forwards the query to at most 2 other established encrypted peers when no exact record is known and hops remain. Query token buckets are keyed by authenticated NodeID (burst 8, refill one per 2 seconds), observed IPv4 `/24` or IPv6 `/48` (burst 32, refill one per 500 ms), and globally (burst 128, refill one per 125 ms). Peer and prefix state is capped at 4,096 and 1,024 entries, retained for ten minutes, and fails closed at capacity; a claimed origin NodeID never selects the rate-limit bucket.
 
 `DhtNodes` is accepted only from a child endpoint to which that exact query and target were forwarded; each child may contribute at most the 15 responses possible in the bounded fanout-2/depth-3 tree. All returned records are verified before forwarding, while local cache admission is exact-target-first and limited to 2 records per response. If the node is not the origin, the original bounded response is forwarded along the encrypted reverse path. At the origin, only an exact current record for the requested NodeID with matching, unexpired attestations from at least two different Ed25519 identities can activate temporary discovery endpoints.
 
@@ -147,11 +147,10 @@ Topology refresh is also bounded: when a capable encrypted session is confirmed,
 
 Before any `DhtStore` or locally cached `DhtNodes` record can consume a DHT rollback watermark, a weighted admission guard charges the authenticated sender identity, its observed IPv4 `/24` or IPv6 `/48`, and a global bucket. The fixed 60-second bounds are respectively 32, 96, and 120 admitted records; at most 4,096 guard states survive for ten minutes. Combined with the 2-record response-cache limit, this preserves normal maximum-depth lookup fan-in while keeping sustained new-identity tombstones below half of the 8,192-entry rollback table's capacity, including the accepted clock-skew horizon.
 
-To constrain amplification and loops, query state expires after 8 seconds, forwarding from the same immediate peer is throttled, and the seen-query cache is capped. The design intentionally favors bounded reachability over aggressive flooding.
+To constrain amplification and loops, query state expires after 8 seconds, forwarding from the same immediate peer is throttled, the seen-query cache is capped, and stale forwarding cooldown state is removed. The design intentionally favors bounded reachability over aggressive flooding.
 
 ## 15. Remaining DHT work
 
-- stronger long-window query rate limiting,
 - Sybil-resistant routing diversity,
 - large-mesh convergence and churn testing.
 
