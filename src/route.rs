@@ -1,6 +1,4 @@
-use crate::konomind::{
-    KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate,
-};
+use crate::konomind::{KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -333,10 +331,7 @@ impl RouteController {
     }
 
     #[cfg(test)]
-    pub(crate) fn path_learning(
-        &self,
-        path: PathKind,
-    ) -> crate::konomind::PathLearningSnapshot {
+    pub(crate) fn path_learning(&self, path: PathKind) -> crate::konomind::PathLearningSnapshot {
         self.advisor.path_learning(path)
     }
 
