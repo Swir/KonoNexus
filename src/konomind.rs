@@ -107,13 +107,9 @@ impl PathLearningState {
             self.ewma_rtt_ms = observation.rtt_ms;
             self.ewma_packet_loss = observation.packet_loss;
         } else {
-            self.ewma_rtt_ms =
-                ewma(self.ewma_rtt_ms, observation.rtt_ms, EWMA_ALPHA);
-            self.ewma_packet_loss = ewma(
-                self.ewma_packet_loss,
-                observation.packet_loss,
-                EWMA_ALPHA,
-            );
+            self.ewma_rtt_ms = ewma(self.ewma_rtt_ms, observation.rtt_ms, EWMA_ALPHA);
+            self.ewma_packet_loss =
+                ewma(self.ewma_packet_loss, observation.packet_loss, EWMA_ALPHA);
         }
     }
 
@@ -175,8 +171,7 @@ impl KonoMindAdvisor {
             return 0.0;
         }
 
-        let confidence =
-            (learned.samples as f32 / LEARNING_CONFIDENCE_SAMPLES).clamp(0.0, 1.0);
+        let confidence = (learned.samples as f32 / LEARNING_CONFIDENCE_SAMPLES).clamp(0.0, 1.0);
         let latency_score = 1.0 / (1.0 + learned.average_rtt_ms / 50.0);
         let quality = (learned.success_rate * 0.55)
             + ((1.0 - learned.average_packet_loss) * 0.30)
@@ -196,8 +191,7 @@ fn baseline_score(metrics: PathMetrics) -> f32 {
     let stability_score = metrics.stability;
     let load_score = 1.0 - metrics.relay_load;
 
-    (latency_score * 0.35) + (loss_score * 0.30) + (stability_score * 0.25)
-        + (load_score * 0.10)
+    (latency_score * 0.35) + (loss_score * 0.30) + (stability_score * 0.25) + (load_score * 0.10)
 }
 
 fn sanitize_rtt(value: f32) -> f32 {
