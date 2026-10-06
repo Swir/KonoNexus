@@ -28,7 +28,8 @@ pub use identity::NodeIdentity;
 pub use invite::InviteCode;
 pub use konofix_sdk::{KonofixSdkConfig, KonofixTransport};
 pub use konomind::{
-    KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate, RouteRecommendation,
+    KonoMindAdvisor, NetworkObservation, PathKind, PathLearningSnapshot, PathMetrics,
+    RouteCandidate, RouteRecommendation,
 };
 pub use nat::{
     FilterCellStatus, FilterMatrixSnapshot, FilterProbeAuthorization, NatFilteringEvidence,
