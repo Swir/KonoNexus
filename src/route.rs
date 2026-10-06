@@ -1,4 +1,6 @@
-use crate::konomind::{KonoMindAdvisor, PathKind, PathMetrics, RouteCandidate};
+use crate::konomind::{
+    KonoMindAdvisor, NetworkObservation, PathKind, PathMetrics, RouteCandidate,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -67,6 +69,7 @@ pub struct RouteController {
     active: HashMap<String, ActiveRoute>,
     health: HashMap<(String, ControlRoute), RouteHealth>,
     health_touch: u64,
+    advisor: KonoMindAdvisor,
 }
 
 impl RouteController {
@@ -232,6 +235,7 @@ impl RouteController {
         &mut self,
         peer_node_id: &str,
         route: ControlRoute,
+        path: PathKind,
         rtt: Duration,
         sent_at: Instant,
     ) {
@@ -257,6 +261,12 @@ impl RouteController {
         }
         health.touch = self.health_touch;
         self.evict_health_if_needed();
+        self.advisor.observe(NetworkObservation {
+            path,
+            success: true,
+            rtt_ms: rtt_ms as f32,
+            packet_loss: 0.0,
+        });
     }
 
     pub fn report_failure(&mut self, peer_node_id: &str, route: ControlRoute, now: Instant) {
@@ -269,6 +279,23 @@ impl RouteController {
         health.last_failure = Some(now);
         health.touch = self.health_touch;
         self.evict_health_if_needed();
+    }
+
+    pub fn report_delivery_failure(
+        &mut self,
+        peer_node_id: &str,
+        route: ControlRoute,
+        path: PathKind,
+        elapsed: Duration,
+        now: Instant,
+    ) {
+        self.report_failure(peer_node_id, route, now);
+        self.advisor.observe(NetworkObservation {
+            path,
+            success: false,
+            rtt_ms: (elapsed.as_secs_f64() * 1000.0) as f32,
+            packet_loss: 1.0,
+        });
     }
 
     pub fn route_on_cooldown(&self, peer_node_id: &str, route: ControlRoute, now: Instant) -> bool {
@@ -294,7 +321,7 @@ impl RouteController {
             // Relay load is not yet measured in production, so keep its input neutral.
             relay_load: 0.5,
         };
-        KonoMindAdvisor::default()
+        self.advisor
             .recommend(&[RouteCandidate {
                 path: match route {
                     ControlRoute::Direct(_) => PathKind::Direct,
@@ -303,6 +330,14 @@ impl RouteController {
                 metrics,
             }])
             .map_or(0.0, |recommendation| recommendation.score)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_learning(
+        &self,
+        path: PathKind,
+    ) -> crate::konomind::PathLearningSnapshot {
+        self.advisor.path_learning(path)
     }
 
     #[cfg(test)]
@@ -556,7 +591,13 @@ mod tests {
         let slower = relay("127.0.0.10:47000", 1);
         let faster = relay("127.0.0.11:47000", 2);
         let now = Instant::now();
-        controller.report_ack_success(peer, faster.route(), Duration::from_millis(20), now);
+        controller.report_ack_success(
+            peer,
+            faster.route(),
+            PathKind::Relay,
+            Duration::from_millis(20),
+            now,
+        );
         assert_eq!(
             controller
                 .select_at(peer, None, [slower, faster], now)
@@ -566,8 +607,20 @@ mod tests {
         );
 
         controller.select_at(peer, None, [slower], now).unwrap();
-        controller.report_ack_success(peer, slower.route(), Duration::from_millis(80), now);
-        controller.report_ack_success(peer, faster.route(), Duration::from_millis(300), now);
+        controller.report_ack_success(
+            peer,
+            slower.route(),
+            PathKind::Relay,
+            Duration::from_millis(80),
+            now,
+        );
+        controller.report_ack_success(
+            peer,
+            faster.route(),
+            PathKind::Relay,
+            Duration::from_millis(300),
+            now,
+        );
         let stable = controller
             .select_at(peer, None, [slower, faster], now)
             .unwrap();
@@ -618,6 +671,7 @@ mod tests {
         controller.report_ack_success(
             "peer-a",
             route,
+            PathKind::Direct,
             Duration::from_secs(u64::MAX),
             Instant::now(),
         );
@@ -636,12 +690,51 @@ mod tests {
         let failed_at = start + Duration::from_secs(2);
 
         controller.report_failure(peer, route, failed_at);
-        controller.report_ack_success(peer, route, Duration::from_secs(3), start);
+        controller.report_ack_success(peer, route, PathKind::Direct, Duration::from_secs(3), start);
         assert!(controller.route_on_cooldown(peer, route, failed_at + Duration::from_secs(1)));
 
         let recovered_at = failed_at + Duration::from_secs(1);
-        controller.report_ack_success(peer, route, Duration::from_millis(20), recovered_at);
+        controller.report_ack_success(
+            peer,
+            route,
+            PathKind::Direct,
+            Duration::from_millis(20),
+            recovered_at,
+        );
         assert!(!controller.route_on_cooldown(peer, route, recovered_at));
+    }
+
+    #[test]
+    fn authenticated_delivery_outcomes_feed_path_local_learning() {
+        let mut controller = RouteController::default();
+        let direct = ControlRoute::Direct("127.0.0.2:47000".parse().unwrap());
+        let relay = relay("127.0.0.3:47000", 7).route();
+        let now = Instant::now();
+
+        controller.report_ack_success(
+            "peer-a",
+            direct,
+            PathKind::HolePunch,
+            Duration::from_millis(25),
+            now,
+        );
+        controller.report_delivery_failure(
+            "peer-b",
+            relay,
+            PathKind::Relay,
+            Duration::from_secs(2),
+            now,
+        );
+
+        let punched = controller.path_learning(PathKind::HolePunch);
+        assert_eq!((punched.samples, punched.successes), (1, 1));
+        assert_eq!(punched.average_rtt_ms, 25.0);
+        assert_eq!(punched.average_packet_loss, 0.0);
+
+        let relayed = controller.path_learning(PathKind::Relay);
+        assert_eq!((relayed.samples, relayed.successes), (1, 0));
+        assert_eq!(relayed.average_rtt_ms, 2_000.0);
+        assert_eq!(relayed.average_packet_loss, 1.0);
     }
 
     #[test]
