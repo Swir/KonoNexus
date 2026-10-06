@@ -6556,12 +6556,7 @@ mod tests {
 
         node.punched_endpoints.insert(endpoint);
         node.track_relay_app_route_attempt(peer.to_owned(), message_id, route, sent_at);
-        node.handle_app_ack(
-            peer,
-            message_id,
-            route,
-            sent_at + Duration::from_millis(25),
-        );
+        node.handle_app_ack(peer, message_id, route, sent_at + Duration::from_millis(25));
 
         let learned = node.route_controller.path_learning(PathKind::HolePunch);
         assert_eq!((learned.samples, learned.successes), (1, 1));
