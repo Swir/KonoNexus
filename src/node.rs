@@ -10,6 +10,7 @@ use crate::dht::{
     MIN_ENDPOINT_ATTESTATION_OBSERVERS,
 };
 use crate::identity::NodeIdentity;
+use crate::konomind::PathKind;
 use crate::nat::{
     FilterMatrixSnapshot, FilterProbeClass, FilterProbeOutcome, FilteringMatrixAuthorization,
     NatFilteringEvidence, NatMappingBehavior, NatProfile, FILTERING_MATRIX_AUTH_TTL_MS,
@@ -3064,8 +3065,9 @@ impl KonoNode {
                 .relay_app_route_attempts
                 .matching_ack_rtt(&key, route, now)
             {
+                let path = self.konomind_path_for_route(route);
                 self.route_controller
-                    .report_ack_success(peer_node_id, route, rtt, sent_at);
+                    .report_ack_success(peer_node_id, route, path, rtt, sent_at);
             }
             if let Some(sender) = self.relay_app_receipt_tx.as_ref() {
                 let receipt = RelayAppDeliveryReceipt {
@@ -3206,6 +3208,16 @@ impl KonoNode {
         self.confirmed_sessions
             .contains(&endpoint)
             .then_some(endpoint)
+    }
+
+    fn konomind_path_for_route(&self, route: ControlRoute) -> PathKind {
+        match route {
+            ControlRoute::Direct(endpoint) if self.punched_endpoints.contains(&endpoint) => {
+                PathKind::HolePunch
+            }
+            ControlRoute::Direct(_) => PathKind::Direct,
+            ControlRoute::Relay { .. } => PathKind::Relay,
+        }
     }
 
     fn handle_relay_app_command(&mut self, command: RelayAppCommand) {
@@ -3404,9 +3416,16 @@ impl KonoNode {
     fn flush_relay_app_failures(&mut self) {
         while let Some(failure) = self.relay_app.peek_failure() {
             let key = (failure.peer_node_id.clone(), failure.message_id);
-            if let Some((route, _)) = self.relay_app_route_attempts.take(&key) {
-                self.route_controller
-                    .report_failure(&failure.peer_node_id, route, Instant::now());
+            if let Some((route, sent_at)) = self.relay_app_route_attempts.take(&key) {
+                let now = Instant::now();
+                let path = self.konomind_path_for_route(route);
+                self.route_controller.report_delivery_failure(
+                    &failure.peer_node_id,
+                    route,
+                    path,
+                    now.saturating_duration_since(sent_at),
+                    now,
+                );
             }
             let result = match self.relay_app_failure_tx.as_ref() {
                 Some(sender) => sender.try_send(failure),
@@ -6514,6 +6533,72 @@ mod tests {
                 *query_id,
             ))
         }));
+    }
+
+    #[tokio::test]
+    async fn authenticated_app_ack_learns_the_actual_punched_path() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer = "knp1peer";
+        let endpoint: SocketAddr = "127.0.0.2:47000".parse().unwrap();
+        let route = ControlRoute::Direct(endpoint);
+        let sent_at = Instant::now();
+        let message_id = node
+            .relay_app
+            .queue(peer.to_owned(), vec![1_u8], sent_at)
+            .unwrap();
+
+        node.punched_endpoints.insert(endpoint);
+        node.track_relay_app_route_attempt(peer.to_owned(), message_id, route, sent_at);
+        node.handle_app_ack(peer, message_id, route, sent_at + Duration::from_millis(25));
+
+        let learned = node.route_controller.path_learning(PathKind::HolePunch);
+        assert_eq!((learned.samples, learned.successes), (1, 1));
+        assert_eq!(learned.average_rtt_ms, 25.0);
+        assert_eq!(learned.average_packet_loss, 0.0);
+        assert!(node.relay_app_route_attempts.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_delivery_learns_the_actual_relay_path() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer = "knp1peer";
+        let route = ControlRoute::Relay {
+            relay_endpoint: "127.0.0.3:47000".parse().unwrap(),
+            circuit_id: 9,
+        };
+        let sent_at = Instant::now();
+        let message_id = node
+            .relay_app
+            .queue(peer.to_owned(), vec![1_u8], sent_at)
+            .unwrap();
+        node.track_relay_app_route_attempt(peer.to_owned(), message_id, route, sent_at);
+        let (_events, expired) = node
+            .relay_app
+            .expire(sent_at + Duration::from_secs(24 * 60 * 60));
+        assert_eq!(expired, 1);
+        let (failure_tx, _failure_rx) = mpsc::channel(1);
+        node.relay_app_failure_tx = Some(failure_tx);
+
+        node.flush_relay_app_failures();
+
+        let learned = node.route_controller.path_learning(PathKind::Relay);
+        assert_eq!((learned.samples, learned.successes), (1, 0));
+        assert_eq!(learned.average_packet_loss, 1.0);
+        assert!(node.relay_app_route_attempts.entries.is_empty());
     }
 
     #[test]

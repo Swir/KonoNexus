@@ -25,7 +25,7 @@
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
 | Source version | `0.1.0-alpha.23` |
-| Roadmap | **43 / 49 = 87.8%** |
+| Roadmap | **44 / 49 = 89.8%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -161,7 +161,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 43 / 49 items complete (**87.8%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 44 / 49 items complete (**89.8%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -203,7 +203,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [ ] Multi-relay routing and full control-plane path migration
 - [x] Runtime path scoring integrated with self-healing routing
 - [x] KonoMind advisory scaffold
-- [ ] KonoMind local learning from real NAT/relay outcomes
+- [x] KonoMind local learning from authenticated runtime NAT/relay outcomes
 - [x] Direct KNP session key rotation with 30-second grace window
 - [x] Relay-inner E2E session key rotation
 - [x] Three-node live runtime mesh harness
@@ -217,7 +217,7 @@ See [docs/KNP-SPEC.md](docs/KNP-SPEC.md) and [docs/THREAT-MODEL.md](docs/THREAT-
 
 ## KonoMind
 
-KonoMind remains advisory-only. Its deterministic baseline now ranks already-established relay paths from authenticated delivery outcomes, but it cannot bypass KNP cryptographic or admission rules. Learning from broader real NAT and relay measurements remains future work.
+KonoMind remains advisory-only. Authenticated RelayApp ACKs and bounded delivery-failure outcomes now update persistent per-path local learning from the actual route and measured RTT or timeout; learned relay quality feeds later route scoring. It cannot bypass KNP cryptographic or admission rules, and this runtime wiring does not replace the separate real multi-network/NAT validation gate.
 
 ## Why a seed is still needed
 
