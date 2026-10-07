@@ -4,6 +4,12 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+## 0.1.0-alpha.25
+
+- Added a deterministic two-endpoint WAN evidence bundle that verifies both signed reports, reciprocal NodeIDs, canonical report SHA-256 digests, timestamp skew, scenario metadata and matrix-row eligibility.
+- Extended `kononexus_probe` with pair creation and verification commands. A bundle is eligible only when both endpoint reports are independently WAN-eligible and no more than one hour apart; it is one physical matrix-row artifact, not proof of the full WAN/NAT matrix.
+- Added pair round-trip, non-reciprocal rejection, embedded tamper/digest rejection and stale-pair ineligibility tests, plus packaged operator instructions.
+
 ## 0.1.0-alpha.24
 
 - Added versioned Ed25519-signed WAN test JSON reports with signer/NodeID binding, balanced delivery counters, selected-path and NAT evidence, and a separate eligibility verdict that cannot turn local-only success into WAN matrix evidence.
