@@ -6945,13 +6945,10 @@ mod tests {
         node.record_peer(&ipv4_envelope, ipv4);
         node.confirmed_sessions.insert(ipv4);
         assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv4));
+        let direct = node.direct_app_endpoint_for_peer(&peer_node_id);
         let first = node
             .route_controller
-            .select(
-                &peer_node_id,
-                node.direct_app_endpoint_for_peer(&peer_node_id),
-                std::iter::empty(),
-            )
+            .select(&peer_node_id, direct, std::iter::empty())
             .unwrap();
         assert_eq!(first.route, ControlRoute::Direct(ipv4));
         assert_eq!(first.generation, 1);
@@ -6961,13 +6958,10 @@ mod tests {
         assert!(node.peers.contains_key(&ipv4));
         assert!(node.peers.contains_key(&ipv6));
         assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv6));
+        let direct = node.direct_app_endpoint_for_peer(&peer_node_id);
         let preferred = node
             .route_controller
-            .select(
-                &peer_node_id,
-                node.direct_app_endpoint_for_peer(&peer_node_id),
-                std::iter::empty(),
-            )
+            .select(&peer_node_id, direct, std::iter::empty())
             .unwrap();
         assert_eq!(preferred.route, ControlRoute::Direct(ipv6));
         assert_eq!(preferred.generation, 2);
@@ -6975,13 +6969,10 @@ mod tests {
 
         node.confirmed_sessions.remove(&ipv6);
         assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv4));
+        let direct = node.direct_app_endpoint_for_peer(&peer_node_id);
         let fallback = node
             .route_controller
-            .select(
-                &peer_node_id,
-                node.direct_app_endpoint_for_peer(&peer_node_id),
-                std::iter::empty(),
-            )
+            .select(&peer_node_id, direct, std::iter::empty())
             .unwrap();
         assert_eq!(fallback.route, ControlRoute::Direct(ipv4));
         assert_eq!(fallback.generation, 3);
