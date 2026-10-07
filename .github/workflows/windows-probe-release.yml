@@ -101,6 +101,11 @@ jobs:
           Verify a copied report with:
           kononexus_probe.exe --verify-report <report.json>
 
+          Pair two reciprocal endpoint reports for one matrix row:
+          kononexus_probe.exe --pair-report <pc-a.json> <pc-b.json> --scenario home_nat_pair --network-label "ISP A / ISP B" --pair-output <pair.json>
+          kononexus_probe.exe --verify-pair <pair.json>
+          Pair metadata describes one operator-observed run; it does not prove the full matrix.
+
           WAN note:
           Two fresh nodes behind NAT still need at least one mutually reachable KonoNexus
           bootstrap/coordinator for universal hole-punch and relay fallback. The GUI reports
