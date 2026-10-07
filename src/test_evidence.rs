@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
@@ -18,6 +19,8 @@ pub const WAN_TEST_REPORT_VERSION: u8 = 1;
 pub const WAN_TEST_PAIR_DOMAIN: &str = "kononexus/wan-test-pair";
 pub const WAN_TEST_PAIR_VERSION: u8 = 1;
 pub const WAN_TEST_PAIR_MAX_SKEW_MS: u64 = 60 * 60 * 1_000;
+pub const WAN_TEST_MATRIX_DOMAIN: &str = "kononexus/wan-test-matrix";
+pub const WAN_TEST_MATRIX_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WanPathEvidence {
@@ -68,7 +71,7 @@ pub struct SignedWanTestReport {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum WanTestScenario {
     SameLan,
@@ -78,6 +81,18 @@ pub enum WanTestScenario {
     PublicIpv6,
     DirectInterruption,
     RestartReconnect,
+}
+
+impl WanTestScenario {
+    pub const ALL: [Self; 7] = [
+        Self::SameLan,
+        Self::HomeNatPair,
+        Self::HomeToMobile,
+        Self::DualMobileCgnat,
+        Self::PublicIpv6,
+        Self::DirectInterruption,
+        Self::RestartReconnect,
+    ];
 }
 
 impl fmt::Display for WanTestScenario {
@@ -127,6 +142,18 @@ pub struct WanTestPairBundle {
     pub timestamp_skew_ms: u64,
     pub reciprocal_node_ids: bool,
     pub matrix_row_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WanTestMatrixManifest {
+    pub domain: String,
+    pub version: u8,
+    pub generated_unix_ms: u64,
+    pub bundles: Vec<WanTestPairBundle>,
+    pub bundle_sha256: Vec<String>,
+    pub missing_scenarios: Vec<WanTestScenario>,
+    pub ineligible_scenarios: Vec<WanTestScenario>,
+    pub ready_for_manual_review: bool,
 }
 
 impl WanTestPairBundle {
@@ -246,6 +273,145 @@ impl WanTestPairBundle {
         let file_name = path
             .file_name()
             .context("WAN pair output must include a file name")?
+            .to_string_lossy();
+        let temporary_path = path.with_file_name(format!(".{file_name}.tmp"));
+        fs::write(&temporary_path, self.to_pretty_json()?)
+            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+        fs::rename(&temporary_path, path)
+            .with_context(|| format!("failed to publish {}", path.display()))
+    }
+
+    pub fn read_verified(path: &Path) -> Result<Self> {
+        let encoded = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Self::from_json_verified(&encoded)
+    }
+}
+
+impl WanTestMatrixManifest {
+    pub fn new(bundles: Vec<WanTestPairBundle>) -> Result<Self> {
+        let generated_unix_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        Self::at(bundles, generated_unix_ms)
+    }
+
+    pub fn at(mut bundles: Vec<WanTestPairBundle>, generated_unix_ms: u64) -> Result<Self> {
+        for bundle in &bundles {
+            bundle.verify()?;
+        }
+        bundles.sort_by_key(|bundle| bundle.scenario);
+        let bundle_sha256 = bundles
+            .iter()
+            .map(bundle_sha256)
+            .collect::<Result<Vec<_>>>()?;
+        let missing_scenarios = WanTestScenario::ALL
+            .into_iter()
+            .filter(|scenario| !bundles.iter().any(|bundle| bundle.scenario == *scenario))
+            .collect::<Vec<_>>();
+        let ineligible_scenarios = bundles
+            .iter()
+            .filter(|bundle| !bundle.matrix_row_eligible)
+            .map(|bundle| bundle.scenario)
+            .collect::<Vec<_>>();
+        let ready_for_manual_review =
+            missing_scenarios.is_empty() && ineligible_scenarios.is_empty();
+        let manifest = Self {
+            domain: WAN_TEST_MATRIX_DOMAIN.to_owned(),
+            version: WAN_TEST_MATRIX_VERSION,
+            generated_unix_ms,
+            bundles,
+            bundle_sha256,
+            missing_scenarios,
+            ineligible_scenarios,
+            ready_for_manual_review,
+        };
+        manifest.verify()?;
+        Ok(manifest)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        if self.domain != WAN_TEST_MATRIX_DOMAIN || self.version != WAN_TEST_MATRIX_VERSION {
+            bail!("unsupported WAN test matrix schema");
+        }
+        if self.bundles.len() > WanTestScenario::ALL.len()
+            || self.bundle_sha256.len() != self.bundles.len()
+        {
+            bail!("invalid WAN test matrix bundle count");
+        }
+
+        let mut seen_scenarios = BTreeSet::new();
+        let mut seen_reports = BTreeSet::new();
+        let mut previous_scenario = None;
+        for (bundle, digest) in self.bundles.iter().zip(&self.bundle_sha256) {
+            bundle.verify()?;
+            if previous_scenario.is_some_and(|previous| previous >= bundle.scenario) {
+                bail!("WAN matrix bundles must use canonical scenario order");
+            }
+            previous_scenario = Some(bundle.scenario);
+            if !seen_scenarios.insert(bundle.scenario) {
+                bail!("WAN matrix contains a duplicate scenario");
+            }
+            if !seen_reports.insert(bundle.report_a_sha256.as_str())
+                || !seen_reports.insert(bundle.report_b_sha256.as_str())
+            {
+                bail!("WAN matrix reuses an endpoint report across scenarios");
+            }
+            if digest != &bundle_sha256(bundle)? {
+                bail!("WAN matrix bundle digest mismatch");
+            }
+        }
+
+        let expected_missing = WanTestScenario::ALL
+            .into_iter()
+            .filter(|scenario| !seen_scenarios.contains(scenario))
+            .collect::<Vec<_>>();
+        let expected_ineligible = self
+            .bundles
+            .iter()
+            .filter(|bundle| !bundle.matrix_row_eligible)
+            .map(|bundle| bundle.scenario)
+            .collect::<Vec<_>>();
+        if self.missing_scenarios != expected_missing
+            || self.ineligible_scenarios != expected_ineligible
+        {
+            bail!("WAN matrix status does not match embedded evidence");
+        }
+        let expected_ready = expected_missing.is_empty() && expected_ineligible.is_empty();
+        if self.ready_for_manual_review != expected_ready {
+            bail!("WAN matrix manual-review readiness mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        self.verify()?;
+        serde_json::to_string_pretty(self).context("failed to encode WAN test matrix")
+    }
+
+    pub fn from_json_verified(encoded: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(encoded).context("failed to decode WAN test matrix")?;
+        manifest.verify()?;
+        Ok(manifest)
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<()> {
+        self.verify()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file_name = path
+            .file_name()
+            .context("WAN matrix output must include a file name")?
             .to_string_lossy();
         let temporary_path = path.with_file_name(format!(".{file_name}.tmp"));
         fs::write(&temporary_path, self.to_pretty_json()?)
@@ -513,6 +679,10 @@ fn report_sha256(report: &SignedWanTestReport) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(report)?)))
 }
 
+fn bundle_sha256(bundle: &WanTestPairBundle) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(bundle)?)))
+}
+
 fn validate_network_label(label: &str) -> Result<()> {
     if label.trim().is_empty() || label.len() > 128 || label.chars().any(char::is_control) {
         bail!("network label must contain 1-128 printable bytes");
@@ -636,6 +806,18 @@ mod tests {
         )
         .unwrap();
         (report_a, report_b)
+    }
+
+    fn eligible_bundle(scenario: WanTestScenario, generated: u64) -> WanTestPairBundle {
+        let (report_a, report_b) = reciprocal_reports(generated, generated + 1_000);
+        WanTestPairBundle::at(
+            report_a,
+            report_b,
+            scenario,
+            format!("network-{scenario}"),
+            generated + 2_000,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -803,5 +985,62 @@ mod tests {
 
         bundle.verify().unwrap();
         assert!(!bundle.matrix_row_eligible);
+    }
+
+    #[test]
+    fn partial_wan_matrix_reports_missing_scenarios() {
+        let manifest = WanTestMatrixManifest::at(
+            vec![eligible_bundle(WanTestScenario::SameLan, 1_000)],
+            10_000,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.bundles.len(), 1);
+        assert_eq!(manifest.missing_scenarios.len(), 6);
+        assert!(manifest.ineligible_scenarios.is_empty());
+        assert!(!manifest.ready_for_manual_review);
+        let encoded = manifest.to_pretty_json().unwrap();
+        assert_eq!(
+            WanTestMatrixManifest::from_json_verified(&encoded).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn complete_fresh_wan_matrix_is_ready_for_manual_review() {
+        let bundles = WanTestScenario::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, scenario)| eligible_bundle(scenario, 10_000 * index as u64 + 1_000))
+            .collect();
+        let manifest = WanTestMatrixManifest::at(bundles, 100_000).unwrap();
+
+        assert!(manifest.missing_scenarios.is_empty());
+        assert!(manifest.ineligible_scenarios.is_empty());
+        assert!(manifest.ready_for_manual_review);
+        assert_eq!(manifest.bundle_sha256.len(), WanTestScenario::ALL.len());
+    }
+
+    #[test]
+    fn wan_matrix_rejects_duplicate_scenario_or_reused_report() {
+        let first = eligible_bundle(WanTestScenario::SameLan, 1_000);
+        let second = eligible_bundle(WanTestScenario::SameLan, 10_000);
+        assert!(WanTestMatrixManifest::at(vec![first.clone(), second], 20_000).is_err());
+
+        let mut relabeled = first.clone();
+        relabeled.scenario = WanTestScenario::HomeNatPair;
+        relabeled.verify().unwrap();
+        assert!(WanTestMatrixManifest::at(vec![first, relabeled], 20_000).is_err());
+    }
+
+    #[test]
+    fn wan_matrix_rejects_tampered_bundle_digest() {
+        let mut manifest = WanTestMatrixManifest::at(
+            vec![eligible_bundle(WanTestScenario::HomeToMobile, 1_000)],
+            10_000,
+        )
+        .unwrap();
+        manifest.bundle_sha256[0] = "00".to_owned();
+        assert!(manifest.verify().is_err());
     }
 }
