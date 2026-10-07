@@ -3359,17 +3359,23 @@ impl KonoNode {
 
     fn diagnostics_snapshot(&self) -> Result<NetworkDiagnostics> {
         let now = Instant::now();
+        let authenticated_peer_ids: HashSet<String> = self
+            .confirmed_sessions
+            .iter()
+            .filter_map(|endpoint| self.peers.get(endpoint))
+            .map(|peer| peer.node_id.clone())
+            .collect();
         let mut active_paths = Vec::new();
-        for endpoint in &self.confirmed_sessions {
-            if let Some(peer) = self.peers.get(endpoint) {
+        for peer_node_id in &authenticated_peer_ids {
+            if let Some(endpoint) = self.direct_app_endpoint_for_peer(peer_node_id) {
                 active_paths.push(PathDiagnostic {
-                    peer_node_id: peer.node_id.clone(),
-                    method: if self.punched_endpoints.contains(endpoint) {
+                    peer_node_id: peer_node_id.clone(),
+                    method: if self.punched_endpoints.contains(&endpoint) {
                         PathMethod::HolePunch
                     } else {
                         PathMethod::Direct
                     },
-                    endpoint: *endpoint,
+                    endpoint,
                 });
             }
         }
@@ -3394,7 +3400,7 @@ impl KonoNode {
             nat_behavior: self.nat_behavior(),
             filtering_evidence: self.nat_filtering_evidence(),
             filtering_matrix: self.nat_profile.filter_matrix_snapshot(),
-            authenticated_peers: self.confirmed_sessions.len(),
+            authenticated_peers: authenticated_peer_ids.len(),
             dht_records: self.dht_record_count(),
             active_paths,
             pending_punches: self.pending_punches.len(),
@@ -6966,6 +6972,16 @@ mod tests {
         assert_eq!(preferred.route, ControlRoute::Direct(ipv6));
         assert_eq!(preferred.generation, 2);
         assert!(preferred.changed);
+        let diagnostics = node.diagnostics_snapshot().unwrap();
+        assert_eq!(diagnostics.authenticated_peers, 1);
+        assert_eq!(
+            diagnostics.active_paths,
+            vec![PathDiagnostic {
+                peer_node_id: peer_node_id.clone(),
+                method: PathMethod::Direct,
+                endpoint: ipv6,
+            }]
+        );
 
         node.confirmed_sessions.remove(&ipv6);
         assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv4));
@@ -6977,6 +6993,14 @@ mod tests {
         assert_eq!(fallback.route, ControlRoute::Direct(ipv4));
         assert_eq!(fallback.generation, 3);
         assert!(fallback.changed);
+        assert_eq!(
+            node.diagnostics_snapshot().unwrap().active_paths,
+            vec![PathDiagnostic {
+                peer_node_id,
+                method: PathMethod::Direct,
+                endpoint: ipv4,
+            }]
+        );
     }
 
     #[tokio::test]
