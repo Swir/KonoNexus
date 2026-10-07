@@ -367,7 +367,6 @@ fn filter_cell_code(status: FilterCellStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::{FilterMatrixSnapshot, PathDiagnostic};
-    use std::collections::HashSet;
 
     fn snapshot(peer_node_id: String, external: Option<SocketAddr>) -> NetworkDiagnostics {
         NetworkDiagnostics {
