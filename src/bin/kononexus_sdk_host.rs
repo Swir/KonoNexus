@@ -161,9 +161,7 @@ fn read_bounded_line_with_limit(
         if !ended {
             drain_line(reader)?;
         }
-        return Ok(Some(Err(format!(
-            "SDK request line exceeds {limit} bytes"
-        ))));
+        return Ok(Some(Err(format!("SDK request line exceeds {limit} bytes"))));
     }
 
     Ok(Some(String::from_utf8(bytes).map_err(|_| {
