@@ -2,9 +2,7 @@
 //!
 //! This is a local SDK boundary. It does not change the KNP network wire format.
 
-use crate::{
-    KonofixTransport, RelayAppEvent, RelayAppFailureReason, MAX_RELAY_APP_MESSAGE_BYTES,
-};
+use crate::{KonofixTransport, RelayAppEvent, RelayAppFailureReason, MAX_RELAY_APP_MESSAGE_BYTES};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -362,7 +360,10 @@ mod tests {
     fn send_request_has_stable_json_and_strict_validation() {
         let request = KonofixSdkRequest::new_send("send-1", node_id('a'), b"hello\0world");
         let json = request.to_json().unwrap();
-        assert_eq!(KonofixSdkRequest::from_json_verified(&json).unwrap(), request);
+        assert_eq!(
+            KonofixSdkRequest::from_json_verified(&json).unwrap(),
+            request
+        );
         assert!(json.contains("\"type\":\"send\""));
         assert!(json.contains("\"data_base64\":\"aGVsbG8Ad29ybGQ=\""));
 
@@ -427,13 +428,12 @@ mod tests {
 
     #[test]
     fn event_round_trip_preserves_binary_and_failure_reason() {
-        let message = KonofixSdkEventEnvelope::from_relay_event(RelayAppEvent::Message(
-            RelayAppMessage {
+        let message =
+            KonofixSdkEventEnvelope::from_relay_event(RelayAppEvent::Message(RelayAppMessage {
                 peer_node_id: node_id('e'),
                 message_id: 42,
                 data: vec![0, 1, 254, 255],
-            },
-        ));
+            }));
         let json = message.to_json().unwrap();
         assert_eq!(
             KonofixSdkEventEnvelope::from_json_verified(&json).unwrap(),
