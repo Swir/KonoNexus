@@ -236,7 +236,10 @@ impl WanTestPairBundle {
 
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
         self.verify()?;
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
@@ -721,7 +724,10 @@ mod tests {
         assert_eq!(bundle.timestamp_skew_ms, 1_000);
         assert_eq!(bundle.report_a_sha256.len(), 64);
         let encoded = bundle.to_pretty_json().unwrap();
-        assert_eq!(WanTestPairBundle::from_json_verified(&encoded).unwrap(), bundle);
+        assert_eq!(
+            WanTestPairBundle::from_json_verified(&encoded).unwrap(),
+            bundle
+        );
     }
 
     #[test]
@@ -732,10 +738,7 @@ mod tests {
         let unrelated = SignedWanTestReport::signed_at(
             &unrelated_identity,
             &unrelated_target,
-            &snapshot(
-                unrelated_target,
-                Some("192.0.2.40:47000".parse().unwrap()),
-            ),
+            &snapshot(unrelated_target, Some("192.0.2.40:47000".parse().unwrap())),
             10,
             10,
             0,
@@ -785,8 +788,7 @@ mod tests {
 
     #[test]
     fn excessive_pair_skew_is_valid_but_not_matrix_row_eligible() {
-        let (report_a, report_b) =
-            reciprocal_reports(1_000, 1_000 + WAN_TEST_PAIR_MAX_SKEW_MS + 1);
+        let (report_a, report_b) = reciprocal_reports(1_000, 1_000 + WAN_TEST_PAIR_MAX_SKEW_MS + 1);
         let bundle = WanTestPairBundle::at(
             report_a,
             report_b,
