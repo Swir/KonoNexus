@@ -614,7 +614,7 @@ mod tests {
         let report_a = SignedWanTestReport::signed_at(
             &identity_a,
             &node_b,
-            &snapshot(node_b, Some("203.0.113.10:47000".parse().unwrap())),
+            &snapshot(node_b.clone(), Some("203.0.113.10:47000".parse().unwrap())),
             10,
             9,
             1,
@@ -626,7 +626,7 @@ mod tests {
         let report_b = SignedWanTestReport::signed_at(
             &identity_b,
             &node_a,
-            &snapshot(node_a, Some("198.51.100.20:47000".parse().unwrap())),
+            &snapshot(node_a.clone(), Some("198.51.100.20:47000".parse().unwrap())),
             10,
             10,
             0,
@@ -738,7 +738,10 @@ mod tests {
         let unrelated = SignedWanTestReport::signed_at(
             &unrelated_identity,
             &unrelated_target,
-            &snapshot(unrelated_target, Some("192.0.2.40:47000".parse().unwrap())),
+            &snapshot(
+                unrelated_target.clone(),
+                Some("192.0.2.40:47000".parse().unwrap()),
+            ),
             10,
             10,
             0,
