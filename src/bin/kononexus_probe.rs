@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use kononexus::{
-    KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport, WanTestPairBundle,
-    WanTestMatrixManifest, WanTestScenario,
+    KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport, WanTestMatrixManifest,
+    WanTestPairBundle, WanTestScenario,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
