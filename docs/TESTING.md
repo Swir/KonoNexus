@@ -134,6 +134,15 @@ After copying both endpoint reports to one machine, create a reciprocal matrix-r
 
 The supported scenarios are `same_lan`, `home_nat_pair`, `home_to_mobile`, `dual_mobile_cgnat`, `public_ipv6`, `direct_interruption`, and `restart_reconnect`. Pair creation rejects reports unless their signed local/target NodeIDs are reciprocal. `MATRIX_ROW_ELIGIBLE=1` additionally requires both endpoint reports to be WAN-eligible and no more than one hour apart. The bundle records canonical SHA-256 digests for both signed reports; its scenario and network label are operator-supplied metadata, not endpoint-signed claims. One eligible bundle documents one physical run only and never closes the full matrix by itself.
 
+Collect available row bundles into a deterministic manifest. Repeat `--matrix-pair` for each file; partial manifests are valid and print what is still missing:
+
+```powershell
+.\kononexus_probe.exe --matrix-pair .\same-lan.json --matrix-pair .\home-nat-pair.json --matrix-output .\wan-matrix.json
+.\kononexus_probe.exe --verify-matrix .\wan-matrix.json
+```
+
+The manifest rejects duplicate scenarios, modified bundles and any endpoint report reused under another scenario. It prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and logs; it is not an automatic claim that the roadmap gate is closed.
+
 ## 6. Different-network diagnostic probe test
 
 For the first WAN test, at least one initial seed endpoint must actually be reachable from the other machine.
