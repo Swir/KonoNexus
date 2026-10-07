@@ -6943,10 +6943,8 @@ mod tests {
         let peer_node_id = peer.node_id();
         let ipv4: SocketAddr = "192.0.2.10:47000".parse().unwrap();
         let ipv6: SocketAddr = "[2001:db8::10]:47000".parse().unwrap();
-        let ipv4_envelope =
-            WireEnvelope::signed(&peer, 1, MessageBody::Ping { token: 1 }).unwrap();
-        let ipv6_envelope =
-            WireEnvelope::signed(&peer, 2, MessageBody::Ping { token: 2 }).unwrap();
+        let ipv4_envelope = WireEnvelope::signed(&peer, 1, MessageBody::Ping { token: 1 }).unwrap();
+        let ipv6_envelope = WireEnvelope::signed(&peer, 2, MessageBody::Ping { token: 2 }).unwrap();
 
         node.record_peer(&ipv4_envelope, ipv4);
         node.confirmed_sessions.insert(ipv4);
@@ -7020,8 +7018,7 @@ mod tests {
 
         let old_v4_envelope =
             WireEnvelope::signed(&peer, 1, MessageBody::Ping { token: 1 }).unwrap();
-        let v6_envelope =
-            WireEnvelope::signed(&peer, 2, MessageBody::Ping { token: 2 }).unwrap();
+        let v6_envelope = WireEnvelope::signed(&peer, 2, MessageBody::Ping { token: 2 }).unwrap();
         let new_v4_envelope =
             WireEnvelope::signed(&peer, 3, MessageBody::Ping { token: 3 }).unwrap();
 
