@@ -16,6 +16,7 @@ pub mod route;
 pub mod routing_cache;
 pub mod security;
 pub mod session;
+pub mod test_evidence;
 
 pub use dht::{
     endpoint_publishable, node_id_closer_to_target, routing_bucket_index, DhtTable,
@@ -69,4 +70,8 @@ pub use routing_cache::{
 pub use security::SequenceWindow;
 pub use session::{
     respond_handshake, EncryptedFrame, PendingHandshake, SecurePayload, SecureSession, SessionSlot,
+};
+pub use test_evidence::{
+    SignedWanTestReport, WanNatEvidence, WanPathEvidence, WanTestEvidence, WanTestMetrics,
+    WAN_TEST_REPORT_DOMAIN, WAN_TEST_REPORT_VERSION,
 };
