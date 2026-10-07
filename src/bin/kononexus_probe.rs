@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent};
+use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -37,17 +37,24 @@ struct Args {
 
     #[arg(long, default_value_t = 3600)]
     run_seconds: u64,
+
+    #[arg(long, value_name = "PATH")]
+    verify_report: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() {
+    let interactive = std::env::args_os().len() == 1;
     if let Err(error) = run().await {
         eprintln!();
         eprintln!("KONONEXUS ERROR: {error:#}");
-        eprintln!();
-        eprintln!("Nacisnij ENTER aby zamknac okno...");
-        let mut line = String::new();
-        let _ = io::stdin().read_line(&mut line);
+        if interactive {
+            eprintln!();
+            eprintln!("Nacisnij ENTER aby zamknac okno...");
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+        }
+        std::process::exit(1);
     }
 }
 
@@ -63,6 +70,28 @@ async fn run() -> Result<()> {
 
     let args = Args::parse();
     let interactive = std::env::args_os().len() == 1;
+
+    if let Some(path) = args.verify_report.as_deref() {
+        let report = SignedWanTestReport::read_verified(path)?;
+        println!("REPORT_VALID=1");
+        println!("REPORT_SCHEMA={}@{}", report.evidence.domain, report.evidence.version);
+        println!("LOCAL_NODE_ID={}", report.evidence.local_node_id);
+        println!("TARGET_NODE_ID={}", report.evidence.target_node_id);
+        println!("DELIVERY_PASSED={}", u8::from(report.evidence.delivery_passed));
+        println!(
+            "WAN_MATRIX_ELIGIBLE={}",
+            u8::from(report.evidence.eligible_for_wan_matrix)
+        );
+        println!(
+            "SAMPLES={}/{} LOSS_PERCENT={:.1} RTT_MS={:.1}",
+            report.evidence.metrics.delivered,
+            report.evidence.metrics.sent,
+            report.evidence.metrics.packet_loss_percent,
+            report.evidence.metrics.average_rtt_ms
+        );
+        return Ok(());
+    }
+
     let identity_path = args.identity.unwrap_or(default_identity_path()?);
 
     println!("===============================================");
