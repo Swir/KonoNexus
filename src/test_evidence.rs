@@ -312,9 +312,6 @@ fn validate_node_id(node_id: &str) -> Result<()> {
     let Some(encoded) = node_id.strip_prefix("knp1") else {
         bail!("invalid KNP NodeID prefix");
     };
-    if hex::decode(encoded).is_err_and(|raw| raw.len() != 20) {
-        bail!("invalid KNP NodeID");
-    }
     let raw = hex::decode(encoded).context("invalid KNP NodeID encoding")?;
     if raw.len() != 20 {
         bail!("invalid KNP NodeID length");
