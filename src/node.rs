@@ -2358,19 +2358,18 @@ impl KonoNode {
                 } else if let Some(peer_node_id) =
                     self.remove_client_relay_path((source, circuit_id))
                 {
-                    if self.direct_app_endpoint_for_peer(&peer_node_id).is_none() {
-                        self.schedule_auto_relay_failover(
-                            peer_node_id.clone(),
-                            source,
-                            Instant::now(),
-                        );
-                    }
+                    let recovery_scheduled = self.schedule_auto_relay_failover_if_needed(
+                        peer_node_id.clone(),
+                        source,
+                        Instant::now(),
+                    );
 
                     info!(
                         relay = %sender_node_id,
                         peer = %peer_node_id,
                         circuit_id,
-                        "relay path closed; bounded failover scheduled"
+                        recovery_scheduled,
+                        "relay path closed; control-plane recovery evaluated"
                     );
                 }
             }
@@ -2380,21 +2379,18 @@ impl KonoNode {
 
                 if let Some((relay_endpoint, target_node_id)) = rejected {
                     if relay_endpoint == source {
-                        if let Some(state) = self.auto_relay_fallbacks.get_mut(&target_node_id) {
-                            state.tried.insert(source);
-                            state.next_attempt_at = Instant::now();
-                        } else {
-                            self.schedule_auto_relay_failover(
-                                target_node_id,
-                                source,
-                                Instant::now(),
-                            );
-                        }
+                        self.schedule_auto_relay_failover_if_needed(
+                            target_node_id,
+                            source,
+                            Instant::now(),
+                        );
                     }
                 } else if let Some(peer_node_id) = removed_peer {
-                    if self.direct_app_endpoint_for_peer(&peer_node_id).is_none() {
-                        self.schedule_auto_relay_failover(peer_node_id, source, Instant::now());
-                    }
+                    self.schedule_auto_relay_failover_if_needed(
+                        peer_node_id,
+                        source,
+                        Instant::now(),
+                    );
                 }
 
                 debug!(relay = %sender_node_id, circuit_id, "relay request rejected");
@@ -3180,7 +3176,7 @@ impl KonoNode {
                             let failed_peer =
                                 self.remove_client_relay_path((relay_endpoint, circuit_id));
                             if let Some(failed_peer) = failed_peer {
-                                self.schedule_auto_relay_failover(
+                                self.schedule_auto_relay_failover_if_needed(
                                     failed_peer,
                                     relay_endpoint,
                                     Instant::now(),
@@ -5407,6 +5403,14 @@ impl KonoNode {
             });
     }
 
+    fn has_usable_relay_path_for_peer(&self, peer_node_id: &str, now: Instant) -> bool {
+        self.relay_e2e_sessions.keys().any(|key| {
+            self.relay_paths
+                .get(key)
+                .is_some_and(|path| path.peer_node_id == peer_node_id && path.expires_at > now)
+        })
+    }
+
     fn schedule_auto_relay_failover(
         &mut self,
         target_node_id: String,
@@ -5420,16 +5424,30 @@ impl KonoNode {
         }
     }
 
+    fn schedule_auto_relay_failover_if_needed(
+        &mut self,
+        target_node_id: String,
+        failed_relay: SocketAddr,
+        now: Instant,
+    ) -> bool {
+        if self.direct_app_endpoint_for_peer(&target_node_id).is_some()
+            || self.has_usable_relay_path_for_peer(&target_node_id, now)
+        {
+            self.auto_relay_fallbacks.remove(&target_node_id);
+            return false;
+        }
+
+        self.schedule_auto_relay_failover(target_node_id, failed_relay, now);
+        true
+    }
+
     async fn drive_auto_relay_fallbacks(&mut self) {
         let now = Instant::now();
         let targets: Vec<String> = self.auto_relay_fallbacks.keys().cloned().collect();
 
         for target_node_id in targets {
             if self.direct_app_endpoint_for_peer(&target_node_id).is_some()
-                || self
-                    .relay_paths
-                    .values()
-                    .any(|path| path.peer_node_id == target_node_id && path.expires_at > now)
+                || self.has_usable_relay_path_for_peer(&target_node_id, now)
             {
                 self.auto_relay_fallbacks.remove(&target_node_id);
                 continue;
@@ -7040,6 +7058,120 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn relay_loss_migrates_to_authenticated_sibling_without_redial() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer_node_id = NodeIdentity::generate().node_id();
+        let relay_one: SocketAddr = "127.0.0.10:47000".parse().unwrap();
+        let relay_two: SocketAddr = "127.0.0.11:47000".parse().unwrap();
+        let now = Instant::now();
+
+        for (relay_endpoint, circuit_id) in [(relay_one, 1_u64), (relay_two, 2_u64)] {
+            let local_node_id = node.node_id();
+            let pending = PendingHandshake::new(local_node_id.clone());
+            let (session, _) = respond_handshake(
+                &local_node_id,
+                &peer_node_id,
+                pending.handshake_id(),
+                &pending.public_key_hex(),
+            )
+            .unwrap();
+            node.relay_paths.insert(
+                (relay_endpoint, circuit_id),
+                RelayPath {
+                    peer_node_id: peer_node_id.clone(),
+                    expires_at: now + RELAY_CIRCUIT_TTL,
+                    next_send_sequence: 0,
+                    receive_window: SequenceWindow::default(),
+                },
+            );
+            node.relay_e2e_sessions
+                .insert((relay_endpoint, circuit_id), SessionSlot::new(session));
+        }
+
+        let first_candidates = node.relay_e2e_candidates_for_peer(&peer_node_id);
+        let first = node
+            .route_controller
+            .select(&peer_node_id, None, first_candidates)
+            .unwrap();
+        assert_eq!(
+            first.route,
+            ControlRoute::Relay {
+                relay_endpoint: relay_one,
+                circuit_id: 1,
+            }
+        );
+
+        assert_eq!(
+            node.remove_client_relay_path((relay_one, 1)).as_deref(),
+            Some(peer_node_id.as_str())
+        );
+        assert!(!node.schedule_auto_relay_failover_if_needed(peer_node_id.clone(), relay_one, now,));
+        assert!(!node.auto_relay_fallbacks.contains_key(&peer_node_id));
+
+        let second_candidates = node.relay_e2e_candidates_for_peer(&peer_node_id);
+        let second = node
+            .route_controller
+            .select(&peer_node_id, None, second_candidates)
+            .unwrap();
+        assert_eq!(
+            second.route,
+            ControlRoute::Relay {
+                relay_endpoint: relay_two,
+                circuit_id: 2,
+            }
+        );
+        assert!(second.changed);
+        assert!(second.generation > first.generation);
+
+        node.remove_client_relay_path((relay_two, 2));
+        assert!(node.schedule_auto_relay_failover_if_needed(peer_node_id.clone(), relay_two, now,));
+        assert_eq!(
+            node.auto_relay_fallbacks[&peer_node_id].tried,
+            HashSet::from([relay_two])
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_path_without_e2e_session_does_not_suppress_recovery() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer_node_id = NodeIdentity::generate().node_id();
+        let relay_endpoint: SocketAddr = "127.0.0.12:47000".parse().unwrap();
+        let now = Instant::now();
+
+        node.relay_paths.insert(
+            (relay_endpoint, 7),
+            RelayPath {
+                peer_node_id: peer_node_id.clone(),
+                expires_at: now + RELAY_CIRCUIT_TTL,
+                next_send_sequence: 0,
+                receive_window: SequenceWindow::default(),
+            },
+        );
+
+        assert!(!node.has_usable_relay_path_for_peer(&peer_node_id, now));
+        assert!(node.schedule_auto_relay_failover_if_needed(
+            peer_node_id.clone(),
+            relay_endpoint,
+            now,
+        ));
+        assert!(node.auto_relay_fallbacks.contains_key(&peer_node_id));
     }
 
     #[tokio::test]

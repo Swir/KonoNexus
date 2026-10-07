@@ -25,7 +25,7 @@
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
 | Source version | `0.1.0-alpha.23` |
-| Roadmap | **45 / 49 = 91.8%** |
+| Roadmap | **46 / 49 = 93.9%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -200,7 +200,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Sliding 128-sequence anti-replay windows with UDP reordering tolerance
 - [x] Bounded alternate relay selection across up to 3 encrypted peers
 - [x] Live RelayApp direct↔relay migration with direct preference
-- [ ] Multi-relay routing and full control-plane path migration
+- [x] Multi-relay routing and full control-plane path migration
 - [x] Runtime path scoring integrated with self-healing routing
 - [x] KonoMind advisory scaffold
 - [x] KonoMind local learning from authenticated runtime NAT/relay outcomes
@@ -295,7 +295,7 @@ cargo run -- --peer RELAY_IP:47000 --relay-via RELAY_IP:47000=TARGET_KNP_NODE_ID
 
 The relay must already have encrypted KNP sessions with both endpoints. Circuit setup follows `OPEN → OFFER → ACCEPT → READY`. The relay stores at most 256 circuits, expires idle circuits after 120 seconds, validates endpoint identity on both sides, and rejects sequence rollback/replay.
 
-Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per cell, sized to remain within the 16 KiB outer KNP datagram after nested encryption/hex framing. The relay forwards those bytes without interpreting their application meaning. Alpha.10 layers a separate authenticated inner session inside those opaque cells. The inner handshake is signed with each endpoint's Ed25519 identity, bound to the circuit ID and both NodeIDs, and derives fresh X25519/HKDF/ChaCha20-Poly1305 keys. The relay therefore cannot derive the endpoint-to-endpoint session keys. RelayApp and the `KonofixTransport` SDK wrapper now expose authenticated application data over this inner session; full KNP control-plane migration remains future work.
+Relay data is carried as `RelayCell` with at most 3 KiB of **opaque bytes** per cell, sized to remain within the 16 KiB outer KNP datagram after nested encryption/hex framing. The relay forwards those bytes without interpreting their application meaning. Alpha.10 layers a separate authenticated inner session inside those opaque cells. The inner handshake is signed with each endpoint's Ed25519 identity, bound to the circuit ID and both NodeIDs, and derives fresh X25519/HKDF/ChaCha20-Poly1305 keys. The relay therefore cannot derive the endpoint-to-endpoint session keys. RelayApp and the `KonofixTransport` SDK wrapper expose authenticated application data over this inner session. The bounded application control-plane migrates that traffic across direct and multiple established relay paths; unrelated outer KNP maintenance messages are not tunneled through relay-inner cells.
 
 ### Automatic direct → punch → relay fallback
 
@@ -340,7 +340,7 @@ When direct UDP punching fails, the preferred relay remains the rendezvous coord
 
 ### Bounded multi-relay control-plane migration
 
-Application traffic now uses a bounded control-plane selector across confirmed direct KNP sessions and already-established relay E2E circuits. Direct transport preempts relay; otherwise relay selection is deterministic and sticky, considers at most three established circuits, and can migrate to another existing relay after close/reject/send failure. The selector does not probe arbitrary ports or create new unauthenticated paths. See [docs/CONTROL-PLANE-ROUTING.md](docs/CONTROL-PLANE-ROUTING.md) for the invariants and test scope.
+Application traffic now uses a bounded control-plane selector across confirmed direct KNP sessions and already-established relay E2E circuits. Direct transport preempts relay; otherwise relay selection is deterministic and sticky, considers at most three established circuits, and migrates to another usable relay after close/reject/send failure without redundant circuit setup. A stale relay-path record without its authenticated E2E session cannot suppress bounded recovery. The selector does not probe arbitrary ports or create new unauthenticated paths. See [docs/CONTROL-PLANE-ROUTING.md](docs/CONTROL-PLANE-ROUTING.md) for the invariants and test scope.
 
 ### Direct and relay-inner session key rotation
 
