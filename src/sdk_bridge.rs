@@ -13,6 +13,7 @@ pub const KONOFIX_SDK_BRIDGE_DOMAIN: &str = "kononexus/sdk-bridge";
 pub const KONOFIX_SDK_BRIDGE_VERSION: u8 = 1;
 pub const MAX_SDK_REQUEST_ID_BYTES: usize = 64;
 pub const MAX_SDK_CONNECT_ENDPOINTS: usize = 3;
+pub const MAX_SDK_JSON_LINE_BYTES: usize = MAX_RELAY_APP_MESSAGE_BYTES * 4 / 3 + 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -205,10 +206,48 @@ impl KonofixSdkRequest {
 }
 
 impl KonofixSdkResponse {
+    pub fn rejected(
+        request_id: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain: KONOFIX_SDK_BRIDGE_DOMAIN.to_owned(),
+            version: KONOFIX_SDK_BRIDGE_VERSION,
+            request_id: request_id.into(),
+            result: KonofixSdkResult::Rejected {
+                code: code.into(),
+                message: message.into(),
+            },
+        }
+    }
+
+    pub fn from_json_verified(json: &str) -> Result<Self> {
+        let response: Self = serde_json::from_str(json).context("invalid SDK response JSON")?;
+        response.verify()?;
+        Ok(response)
+    }
+
     pub fn to_json(&self) -> Result<String> {
+        self.verify()?;
+        serde_json::to_string(self).context("unable to encode SDK response JSON")
+    }
+
+    pub fn verify(&self) -> Result<()> {
         verify_envelope(&self.domain, self.version)?;
         verify_request_id(&self.request_id)?;
-        serde_json::to_string(self).context("unable to encode SDK response JSON")
+        match &self.result {
+            KonofixSdkResult::Rejected { code, message } => {
+                if code.is_empty() || code.chars().any(char::is_control) {
+                    bail!("rejection code must not be empty or contain control characters");
+                }
+                if message.chars().any(char::is_control) {
+                    bail!("rejection message must not contain control characters");
+                }
+            }
+            KonofixSdkResult::Sent { .. } | KonofixSdkResult::Connected => {}
+        }
+        Ok(())
     }
 }
 
@@ -452,5 +491,19 @@ mod tests {
             .to_json()
             .unwrap()
             .contains("\"reason\":\"retries_exhausted\""));
+    }
+
+    #[test]
+    fn rejected_response_round_trips_with_correlation_id() {
+        let response = KonofixSdkResponse::rejected(
+            "bad-request-9",
+            "invalid_request",
+            "unsupported SDK bridge version 2",
+        );
+        let json = response.to_json().unwrap();
+        assert_eq!(
+            KonofixSdkResponse::from_json_verified(&json).unwrap(),
+            response
+        );
     }
 }
