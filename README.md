@@ -24,7 +24,7 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.24` |
+| Source version | `0.1.0-alpha.25` |
 | Roadmap | **46 / 49 = 93.9%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
@@ -100,7 +100,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.24`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.25`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -362,9 +362,9 @@ Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-inde
 
 ## Testing candidate
 
-Alpha.24 is the current build state intended for controlled testing on separate computers.
+Alpha.25 is the current build state intended for controlled testing on separate computers.
 
-The Windows GUI now writes an Ed25519-signed JSON result after every completed test. The bundled console probe independently verifies the report signature, signer/NodeID binding, counters and WAN-evidence eligibility. This makes physical test results durable and tamper-evident, but it does not replace the required runs on independent networks.
+The Windows GUI writes an Ed25519-signed JSON result after every completed test. The bundled console probe independently verifies each result and can combine two reciprocal, fresh reports into a matrix-row bundle with canonical report digests. The scenario and network label remain operator-supplied metadata; the embedded endpoint reports are independently signed. This makes physical test results durable and reviewable, but it does not replace the required runs on independent networks.
 
 Automated CI now includes a live three-node runtime harness:
 
