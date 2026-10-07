@@ -125,6 +125,15 @@ Verify a copied report without trusting the machine or text editor that supplied
 
 A valid file prints `REPORT_VALID=1`. Any changed signed field, public key, NodeID or signature causes a non-zero exit. Matrix eligibility is evidence for one endpoint only; closing a matrix row still requires reports from both physical hosts plus the tested network description. A valid local-only report remains ineligible and cannot close the WAN/NAT roadmap gate.
 
+After copying both endpoint reports to one machine, create a reciprocal matrix-row bundle:
+
+```powershell
+.\kononexus_probe.exe --pair-report .\pc-a.json .\pc-b.json --scenario home_nat_pair --network-label "ISP A / ISP B" --pair-output .\home-nat-pair.json
+.\kononexus_probe.exe --verify-pair .\home-nat-pair.json
+```
+
+The supported scenarios are `same_lan`, `home_nat_pair`, `home_to_mobile`, `dual_mobile_cgnat`, `public_ipv6`, `direct_interruption`, and `restart_reconnect`. Pair creation rejects reports unless their signed local/target NodeIDs are reciprocal. `MATRIX_ROW_ELIGIBLE=1` additionally requires both endpoint reports to be WAN-eligible and no more than one hour apart. The bundle records canonical SHA-256 digests for both signed reports; its scenario and network label are operator-supplied metadata, not endpoint-signed claims. One eligible bundle documents one physical run only and never closes the full matrix by itself.
+
 ## 6. Different-network diagnostic probe test
 
 For the first WAN test, at least one initial seed endpoint must actually be reachable from the other machine.
