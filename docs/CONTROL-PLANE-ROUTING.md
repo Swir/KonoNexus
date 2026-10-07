@@ -35,7 +35,7 @@ RelayApp transmission asks the controller for a route at send time.
 - **relay → relay:** when an active relay circuit is closed, rejected, expires, or a send fails, its client-side path state is removed and invalidated before another selection. A remaining established relay may then be selected.
 - **no usable path:** the application message stays under the existing bounded RelayApp queue/backpressure/TTL behavior; no unbounded dialing loop is introduced.
 
-A relay send failure also feeds the existing bounded automatic relay-fallback state. That fallback may attempt only already-authenticated relay peers under the existing three-candidate/30-second limits.
+A close, reject, or send failure feeds the existing bounded automatic relay-fallback state only when no other usable authenticated relay E2E circuit remains. An established sibling circuit is selected immediately without redundant relay setup. If no usable path remains, fallback may attempt only already-authenticated relay peers under the existing three-candidate/30-second limits.
 
 ## Evidence
 
@@ -48,7 +48,9 @@ The deterministic unit tests cover:
 - cooldown-based selection and direct-path recovery;
 - health-scored relay choice and hysteresis;
 - peer/route health isolation, bounded RTT metrics, and bounded latest-attempt tracking;
-- matching versus mismatching authenticated ACK route samples; and
+- matching versus mismatching authenticated ACK route samples;
+- node-runtime relay → relay migration without redundant redial;
+- rejecting stale relay-path entries that lack an E2E session as recovery blockers; and
 - clearing control-plane state after all routes disappear.
 
 CI verifies formatting, Clippy with warnings denied, and the complete Rust test suite. These tests prove the internal route-selection semantics only. They are **not** evidence that arbitrary NAT/CGNAT combinations work in the field.
