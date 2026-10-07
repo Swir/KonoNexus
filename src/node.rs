@@ -1242,6 +1242,12 @@ impl KonoNode {
                     }
                 };
 
+                // A fresh frame that passed signature, identity binding, AEAD
+                // and replay checks proves this admitted peer is still active.
+                // Rejected/replayed traffic must never extend its idle lease.
+                if let Some(peer) = self.peers.get_mut(&source) {
+                    peer.last_seen = Instant::now();
+                }
                 let newly_confirmed = self.confirmed_sessions.insert(source);
                 self.routing
                     .observe(sender_node_id.clone(), source, Instant::now());
@@ -6945,6 +6951,121 @@ mod tests {
         assert!(!node.connect_candidate_groups.contains_key(&target_node_id));
         assert!(!node.discovery_candidates.contains_key(&first));
         assert!(!node.discovery_candidates.contains_key(&second));
+    }
+
+    #[tokio::test]
+    async fn authenticated_encrypted_activity_refreshes_peer_liveness_only_after_validation() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let peer = NodeIdentity::generate();
+        let endpoint: SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        let pending = PendingHandshake::new(node.node_id());
+        let (local_session, public_key) = respond_handshake(
+            &node.node_id(),
+            &peer.node_id(),
+            pending.handshake_id(),
+            &pending.public_key_hex(),
+        )
+        .unwrap();
+        let mut remote_session = pending.complete(&peer.node_id(), &public_key).unwrap();
+        let admission = WireEnvelope::signed(&peer, 1, MessageBody::Ping { token: 1 }).unwrap();
+        node.record_peer(&admission, endpoint);
+        node.sessions
+            .insert(endpoint, SessionSlot::new(local_session));
+        node.confirmed_sessions.insert(endpoint);
+        // Advance the recorded age, not the runtime clock or timeout. No sleep,
+        // extra HELLO, weaker peer TTL or external network is needed.
+        let old = Instant::now() - Duration::from_secs(2);
+        node.peers.get_mut(&endpoint).unwrap().last_seen = old;
+        let frame = remote_session
+            .encrypt(&SecurePayload::Pong { token: 7 })
+            .unwrap();
+        let body = MessageBody::Encrypted {
+            session_id: frame.session_id,
+            sequence: frame.sequence,
+            ciphertext: frame.ciphertext,
+        };
+        let valid = WireEnvelope::signed(&peer, 2, body.clone())
+            .unwrap()
+            .encode()
+            .unwrap();
+        let before = Instant::now();
+        node.handle_datagram(&valid, endpoint).await.unwrap();
+        assert!(
+            node.peers[&endpoint].last_seen >= before,
+            "authenticated encrypted activity must refresh the peer lease"
+        );
+        node.expire_stale_state();
+        assert!(node.peers.contains_key(&endpoint));
+        assert!(node.sessions.contains_key(&endpoint));
+
+        node.peers.get_mut(&endpoint).unwrap().last_seen = old;
+        assert!(node.handle_datagram(&valid, endpoint).await.is_err());
+        assert_eq!(
+            node.peers[&endpoint].last_seen, old,
+            "replayed outer packet cannot renew"
+        );
+        let replay = WireEnvelope::signed(&peer, 3, body.clone())
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert!(node.handle_datagram(&replay, endpoint).await.is_err());
+        assert_eq!(
+            node.peers[&endpoint].last_seen, old,
+            "replayed session frame cannot renew"
+        );
+
+        let impostor = NodeIdentity::generate();
+        let wrong_peer = WireEnvelope::signed(&impostor, 4, body.clone())
+            .unwrap()
+            .encode()
+            .unwrap();
+        node.handle_datagram(&wrong_peer, endpoint).await.unwrap();
+        assert_eq!(
+            node.peers[&endpoint].last_seen, old,
+            "unbound identity cannot renew"
+        );
+        let unknown: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let unadmitted = WireEnvelope::signed(&peer, 5, body)
+            .unwrap()
+            .encode()
+            .unwrap();
+        node.handle_datagram(&unadmitted, unknown).await.unwrap();
+        assert!(!node.peers.contains_key(&unknown));
+        assert_eq!(node.peers[&endpoint].last_seen, old);
+
+        let frame = remote_session
+            .encrypt(&SecurePayload::Pong { token: 8 })
+            .unwrap();
+        let tampered = WireEnvelope::signed(
+            &peer,
+            6,
+            MessageBody::Encrypted {
+                session_id: frame.session_id,
+                sequence: frame.sequence,
+                ciphertext: "00".into(),
+            },
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        assert!(node.handle_datagram(&tampered, endpoint).await.is_err());
+        assert_eq!(
+            node.peers[&endpoint].last_seen, old,
+            "invalid ciphertext cannot renew"
+        );
+        node.expire_stale_state();
+        assert!(
+            !node.peers.contains_key(&endpoint),
+            "rejected traffic cannot keep an idle peer alive"
+        );
+        assert!(!node.sessions.contains_key(&endpoint));
     }
 
     #[tokio::test]
