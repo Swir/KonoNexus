@@ -24,7 +24,7 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.26` |
+| Source version | `0.1.0-alpha.27` |
 | Roadmap | **46 / 49 = 93.9%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
@@ -83,6 +83,8 @@ kononexus = { git = "https://github.com/Swir/KonoNexus.git", default-features = 
 The default `tester-gui` feature keeps the tester enabled for normal builds. Disable default features for SDK integration; for example, `cargo check --no-default-features --lib` checks only the core library without `eframe`, `arboard` or `image`.
 Production consumers should also pin `rev` to an exact reviewed commit instead of following a moving branch.
 
+Native hosts that need a language-neutral boundary can use the strict, versioned JSON SDK bridge documented in [`docs/SDK-BRIDGE.md`](docs/SDK-BRIDGE.md). The bridge maps local send/connect commands and delivery events onto `KonofixTransport`; it does not alter the public KNP network wire format or by itself complete the Windows/Android application integrations.
+
 ## Requirements / compatibility
 
 - **Core:** Rust 2021.
@@ -100,7 +102,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.26`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.27`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -161,7 +163,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 45 / 49 items complete (**91.8%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 46 / 49 items complete (**93.9%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
