@@ -1,4 +1,8 @@
-use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use kononexus::{
+    KonofixSdkConfig, KonofixSdkEvent, KonofixSdkEventEnvelope, KonofixSdkRequest,
+    KonofixSdkResult, KonofixTransport, RelayAppEvent,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time;
@@ -59,6 +63,42 @@ async fn wait_for_receipt(transport: &mut KonofixTransport, peer_node_id: &str, 
     .expect("timed out waiting for KonoNexus delivery receipt");
 }
 
+async fn wait_for_sdk_message(
+    transport: &mut KonofixTransport,
+    peer_node_id: &str,
+    expected: &[u8],
+) {
+    time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = transport
+                .next_event()
+                .await
+                .map(KonofixSdkEventEnvelope::from_relay_event)
+                .expect("KonoNexus runtime closed while waiting for SDK event");
+            let encoded = event.to_json().expect("SDK event must encode");
+            let decoded = KonofixSdkEventEnvelope::from_json_verified(&encoded)
+                .expect("SDK event must round-trip");
+            match decoded.event {
+                KonofixSdkEvent::Message {
+                    peer_node_id: actual_peer,
+                    data_base64,
+                    ..
+                } if actual_peer == peer_node_id
+                    && STANDARD.decode(data_base64).unwrap() == expected =>
+                {
+                    break;
+                }
+                KonofixSdkEvent::Failed { reason, .. } => {
+                    panic!("unexpected SDK delivery failure: {reason:?}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for KonoNexus SDK message");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_runtime_discovers_and_delivers_across_mesh() {
     let _ = tracing_subscriber::fmt()
@@ -110,12 +150,14 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
     wait_for_message(&mut a, &c_node_id, b"prime-c").await;
     wait_for_receipt(&mut c, &a_node_id, prime_c).await;
 
-    let mesh_message = b
-        .send(c_node_id.clone(), b"mesh-b-to-c".to_vec())
-        .await
-        .unwrap();
+    let mesh_request = KonofixSdkRequest::new_send("mesh-b-to-c", &c_node_id, b"mesh-b-to-c");
+    let mesh_response = mesh_request.execute(&b).await.unwrap();
+    let mesh_message = match mesh_response.result {
+        KonofixSdkResult::Sent { message_id } => message_id,
+        result => panic!("SDK send was not accepted: {result:?}"),
+    };
 
-    wait_for_message(&mut c, &b_node_id, b"mesh-b-to-c").await;
+    wait_for_sdk_message(&mut c, &b_node_id, b"mesh-b-to-c").await;
     wait_for_receipt(&mut b, &c_node_id, mesh_message).await;
 
     assert!(!a.is_finished());
