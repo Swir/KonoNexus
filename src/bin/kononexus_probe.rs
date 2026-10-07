@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use kononexus::{
-    KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport, WanTestPairBundle,
-    WanTestScenario,
+    KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport, WanTestMatrixManifest,
+    WanTestPairBundle, WanTestScenario,
 };
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -58,6 +58,15 @@ struct Args {
 
     #[arg(long, value_name = "PATH")]
     pair_output: Option<PathBuf>,
+
+    #[arg(long, value_name = "PATH")]
+    verify_matrix: Option<PathBuf>,
+
+    #[arg(long, value_name = "PAIR_PATH")]
+    matrix_pair: Vec<PathBuf>,
+
+    #[arg(long, value_name = "PATH")]
+    matrix_output: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -134,6 +143,55 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(path) = args.verify_matrix.as_deref() {
+        let manifest = WanTestMatrixManifest::read_verified(path)?;
+        println!("MATRIX_VALID=1");
+        println!("MATRIX_SCHEMA={}@{}", manifest.domain, manifest.version);
+        println!("BUNDLE_COUNT={}", manifest.bundles.len());
+        println!(
+            "MISSING_SCENARIOS={}",
+            scenario_list(&manifest.missing_scenarios)
+        );
+        println!(
+            "INELIGIBLE_SCENARIOS={}",
+            scenario_list(&manifest.ineligible_scenarios)
+        );
+        println!(
+            "MANUAL_REVIEW_READY={}",
+            u8::from(manifest.ready_for_manual_review)
+        );
+        return Ok(());
+    }
+
+    if !args.matrix_pair.is_empty() {
+        let output = args
+            .matrix_output
+            .as_deref()
+            .context("--matrix-output is required with --matrix-pair")?;
+        let bundles = args
+            .matrix_pair
+            .iter()
+            .map(|path| WanTestPairBundle::read_verified(path))
+            .collect::<Result<Vec<_>>>()?;
+        let manifest = WanTestMatrixManifest::new(bundles)?;
+        manifest.write_atomic(output)?;
+        println!("MATRIX_CREATED={}", output.display());
+        println!("BUNDLE_COUNT={}", manifest.bundles.len());
+        println!(
+            "MISSING_SCENARIOS={}",
+            scenario_list(&manifest.missing_scenarios)
+        );
+        println!(
+            "INELIGIBLE_SCENARIOS={}",
+            scenario_list(&manifest.ineligible_scenarios)
+        );
+        println!(
+            "MANUAL_REVIEW_READY={}",
+            u8::from(manifest.ready_for_manual_review)
+        );
+        return Ok(());
+    }
+
     if !args.pair_report.is_empty() {
         let scenario = args
             .scenario
@@ -160,8 +218,14 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    if args.scenario.is_some() || args.network_label.is_some() || args.pair_output.is_some() {
-        anyhow::bail!("--scenario, --network-label and --pair-output require --pair-report");
+    if args.scenario.is_some()
+        || args.network_label.is_some()
+        || args.pair_output.is_some()
+        || args.matrix_output.is_some()
+    {
+        anyhow::bail!(
+            "pair metadata requires --pair-report, and --matrix-output requires --matrix-pair"
+        );
     }
 
     let identity_path = args.identity.unwrap_or(default_identity_path()?);
@@ -303,6 +367,18 @@ async fn run() -> Result<()> {
 
     transport.shutdown().await;
     Ok(())
+}
+
+fn scenario_list(scenarios: &[WanTestScenario]) -> String {
+    if scenarios.is_empty() {
+        "none".to_owned()
+    } else {
+        scenarios
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 fn flush_stdout() {

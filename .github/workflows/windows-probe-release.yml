@@ -106,6 +106,11 @@ jobs:
           kononexus_probe.exe --verify-pair <pair.json>
           Pair metadata describes one operator-observed run; it does not prove the full matrix.
 
+          Build or verify the incremental seven-scenario manifest:
+          kononexus_probe.exe --matrix-pair <pair-1.json> --matrix-pair <pair-2.json> --matrix-output <matrix.json>
+          kononexus_probe.exe --verify-matrix <matrix.json>
+          MANUAL_REVIEW_READY=1 still requires human review of the physical network setup.
+
           WAN note:
           Two fresh nodes behind NAT still need at least one mutually reachable KonoNexus
           bootstrap/coordinator for universal hole-punch and relay fallback. The GUI reports

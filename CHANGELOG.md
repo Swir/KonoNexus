@@ -4,6 +4,12 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+## 0.1.0-alpha.26
+
+- Added a deterministic WAN matrix manifest that verifies every pair bundle and canonical digest, rejects duplicate scenarios and endpoint-report reuse, and reports missing or ineligible scenarios.
+- Extended `kononexus_probe` with incremental matrix creation and independent verification. `MANUAL_REVIEW_READY=1` requires all seven unique eligible scenarios but deliberately does not close the physical WAN/NAT roadmap gate.
+- Added partial/complete matrix, duplicate/reuse and digest-tamper tests, plus packaged collection instructions.
+
 ## 0.1.0-alpha.25
 
 - Added a deterministic two-endpoint WAN evidence bundle that verifies both signed reports, reciprocal NodeIDs, canonical report SHA-256 digests, timestamp skew, scenario metadata and matrix-row eligibility.
