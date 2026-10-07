@@ -6008,7 +6008,22 @@ impl KonoNode {
     fn peer_endpoint_by_node_id(&self, node_id: &str) -> Option<SocketAddr> {
         self.peers
             .iter()
-            .find(|(_, peer)| peer.node_id == node_id)
+            .filter(|(_, peer)| peer.node_id == node_id)
+            .min_by_key(|(endpoint, _)| {
+                (
+                    if self.confirmed_sessions.contains(*endpoint) {
+                        0_u8
+                    } else {
+                        1_u8
+                    },
+                    if is_native_ipv6_endpoint(**endpoint) {
+                        0_u8
+                    } else {
+                        1_u8
+                    },
+                    **endpoint,
+                )
+            })
             .map(|(endpoint, _)| *endpoint)
     }
 
@@ -6044,7 +6059,9 @@ impl KonoNode {
             .peers
             .iter()
             .find(|(endpoint, peer)| {
-                **endpoint != source && peer.node_id == envelope.sender_node_id
+                **endpoint != source
+                    && peer.node_id == envelope.sender_node_id
+                    && is_native_ipv6_endpoint(**endpoint) == is_native_ipv6_endpoint(source)
             })
             .map(|(endpoint, _)| *endpoint);
 
@@ -6312,6 +6329,10 @@ fn normalized_ip(ip: IpAddr) -> IpAddr {
             .unwrap_or(IpAddr::V6(ip)),
         ip => ip,
     }
+}
+
+fn is_native_ipv6_endpoint(endpoint: SocketAddr) -> bool {
+    matches!(endpoint.ip(), IpAddr::V6(ip) if ip.to_ipv4_mapped().is_none())
 }
 
 fn local_features() -> Vec<String> {
@@ -6900,6 +6921,113 @@ mod tests {
         assert!(!node.connect_candidate_groups.contains_key(&target_node_id));
         assert!(!node.discovery_candidates.contains_key(&first));
         assert!(!node.discovery_candidates.contains_key(&second));
+    }
+
+    #[tokio::test]
+    async fn authenticated_native_ipv6_preempts_ipv4_with_runtime_fallback() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer = NodeIdentity::generate();
+        let peer_node_id = peer.node_id();
+        let ipv4: SocketAddr = "192.0.2.10:47000".parse().unwrap();
+        let ipv6: SocketAddr = "[2001:db8::10]:47000".parse().unwrap();
+        let ipv4_envelope =
+            WireEnvelope::signed(&peer, 1, MessageBody::Ping { token: 1 }).unwrap();
+        let ipv6_envelope =
+            WireEnvelope::signed(&peer, 2, MessageBody::Ping { token: 2 }).unwrap();
+
+        node.record_peer(&ipv4_envelope, ipv4);
+        node.confirmed_sessions.insert(ipv4);
+        assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv4));
+        let first = node
+            .route_controller
+            .select(
+                &peer_node_id,
+                node.direct_app_endpoint_for_peer(&peer_node_id),
+                std::iter::empty(),
+            )
+            .unwrap();
+        assert_eq!(first.route, ControlRoute::Direct(ipv4));
+        assert_eq!(first.generation, 1);
+
+        node.record_peer(&ipv6_envelope, ipv6);
+        node.confirmed_sessions.insert(ipv6);
+        assert!(node.peers.contains_key(&ipv4));
+        assert!(node.peers.contains_key(&ipv6));
+        assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv6));
+        let preferred = node
+            .route_controller
+            .select(
+                &peer_node_id,
+                node.direct_app_endpoint_for_peer(&peer_node_id),
+                std::iter::empty(),
+            )
+            .unwrap();
+        assert_eq!(preferred.route, ControlRoute::Direct(ipv6));
+        assert_eq!(preferred.generation, 2);
+        assert!(preferred.changed);
+
+        node.confirmed_sessions.remove(&ipv6);
+        assert_eq!(node.direct_app_endpoint_for_peer(&peer_node_id), Some(ipv4));
+        let fallback = node
+            .route_controller
+            .select(
+                &peer_node_id,
+                node.direct_app_endpoint_for_peer(&peer_node_id),
+                std::iter::empty(),
+            )
+            .unwrap();
+        assert_eq!(fallback.route, ControlRoute::Direct(ipv4));
+        assert_eq!(fallback.generation, 3);
+        assert!(fallback.changed);
+    }
+
+    #[tokio::test]
+    async fn peer_admission_keeps_one_endpoint_per_address_family() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer = NodeIdentity::generate();
+        let old_ipv4: SocketAddr = "192.0.2.10:47000".parse().unwrap();
+        let new_ipv4: SocketAddr = "192.0.2.11:47000".parse().unwrap();
+        let ipv6: SocketAddr = "[2001:db8::10]:47000".parse().unwrap();
+
+        let old_v4_envelope =
+            WireEnvelope::signed(&peer, 1, MessageBody::Ping { token: 1 }).unwrap();
+        let v6_envelope =
+            WireEnvelope::signed(&peer, 2, MessageBody::Ping { token: 2 }).unwrap();
+        let new_v4_envelope =
+            WireEnvelope::signed(&peer, 3, MessageBody::Ping { token: 3 }).unwrap();
+
+        node.record_peer(&old_v4_envelope, old_ipv4);
+        node.confirmed_sessions.insert(old_ipv4);
+        node.record_peer(&v6_envelope, ipv6);
+        node.confirmed_sessions.insert(ipv6);
+        node.record_peer(&new_v4_envelope, new_ipv4);
+
+        assert!(!node.peers.contains_key(&old_ipv4));
+        assert!(!node.confirmed_sessions.contains(&old_ipv4));
+        assert!(node.peers.contains_key(&new_ipv4));
+        assert!(node.peers.contains_key(&ipv6));
+        assert!(node.confirmed_sessions.contains(&ipv6));
+        assert_eq!(
+            node.peers
+                .values()
+                .filter(|known| known.node_id == peer.node_id())
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
