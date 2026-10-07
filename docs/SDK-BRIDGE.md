@@ -1,6 +1,6 @@
 # KonoNexus SDK JSON bridge v1
 
-Status: integration-ready local host contract for `0.1.0-alpha.27`.
+Status: integration-ready local host contract for `0.1.0-alpha.28`.
 
 The SDK bridge gives Konofix and future platform bindings a small, language-neutral JSON boundary around `KonofixTransport`. It is a local application ABI only: it does **not** change the KNP UDP wire format, relax transport admission, or prove that the Windows or Android application integration is complete.
 
@@ -65,3 +65,20 @@ Failure reasons in v1 are `retries_exhausted` and `expired`.
 3. Read `transport.next_event().await`, convert it using `KonofixSdkEventEnvelope::from_relay_event`, then serialize with `to_json`.
 
 Malformed requests return a Rust error before any transport action. An accepted request whose transport operation fails receives a `rejected` result with code `transport_error`. Hosts should treat the `code` as stable and the human-readable `message` as diagnostic text.
+
+## Process host
+
+`kononexus_sdk_host` keeps the transport and identity alive for a native parent process. Start it with an application-owned state directory:
+
+```powershell
+.\kononexus_sdk_host.exe --identity .\state\node.key --routing-cache .\state\routing.json --bind 0.0.0.0:47000
+```
+
+Add reachable bootstrap peers with repeatable `--peer IP:PORT` options. The host writes a single readiness record containing its NodeID and bound address to stderr. Standard input and standard output are JSON Lines streams:
+
+- write exactly one v1 request JSON object per input line;
+- read exactly one correlated response or asynchronous event JSON object per output line;
+- keep stdout machine-only; human-readable lifecycle diagnostics use stderr;
+- close stdin for a clean shutdown, or send the normal console interrupt signal.
+
+Malformed JSON and invalid envelopes produce a `rejected` response with code `invalid_request`; a safe supplied `request_id` is preserved, otherwise the host uses `invalid-request`. Each input line is capped at the Base64 size of one maximum RelayApp payload plus bounded envelope overhead. Oversized or non-UTF-8 input is drained through its newline, rejected, and cannot desynchronize later requests. The process continues accepting later requests. This recovery behavior is covered by unit and child-process integration tests.

@@ -4,6 +4,13 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+## 0.1.0-alpha.28
+
+- Added `kononexus_sdk_host`, a long-lived JSON Lines process boundary for native application integration. It accepts multiple strict v1 requests without restarting the KonoNexus transport and streams correlated responses plus asynchronous delivery events.
+- Invalid input now receives a bounded `invalid_request` response without terminating the host; request correlation IDs are preserved when safe, and diagnostics cannot inject control characters into the output stream.
+- Added a real child-process integration test that proves malformed input recovery followed by an accepted send in the same host lifecycle.
+- Added the SDK host executable to the Windows testing package so Konofix can integrate against a qualified binary while direct in-process Rust integration remains available.
+
 ## 0.1.0-alpha.27
 
 - Added a strict, versioned JSON SDK bridge for native application hosts. It validates NodeIDs, request correlation IDs, canonical Base64 payloads and bounded exact socket endpoints before invoking the existing `KonofixTransport` API.

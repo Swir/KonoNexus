@@ -71,7 +71,8 @@ pub use routing_cache::{
 pub use sdk_bridge::{
     KonofixSdkCommand, KonofixSdkEvent, KonofixSdkEventEnvelope, KonofixSdkFailureReason,
     KonofixSdkRequest, KonofixSdkResponse, KonofixSdkResult, KONOFIX_SDK_BRIDGE_DOMAIN,
-    KONOFIX_SDK_BRIDGE_VERSION, MAX_SDK_CONNECT_ENDPOINTS, MAX_SDK_REQUEST_ID_BYTES,
+    KONOFIX_SDK_BRIDGE_VERSION, MAX_SDK_CONNECT_ENDPOINTS, MAX_SDK_JSON_LINE_BYTES,
+    MAX_SDK_REQUEST_ID_BYTES,
 };
 pub use security::SequenceWindow;
 pub use session::{

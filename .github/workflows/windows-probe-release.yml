@@ -43,8 +43,8 @@ jobs:
       - name: Check SDK-only library
         run: cargo check --release --no-default-features --lib
 
-      - name: Build self-contained GUI and diagnostic probe
-        run: cargo build --release --bin kononexus_tester --bin kononexus_probe
+      - name: Build self-contained GUI, diagnostic probe and SDK host
+        run: cargo build --release --bin kononexus_tester --bin kononexus_probe --bin kononexus_sdk_host
 
       - name: Verify embedded tester metadata
         shell: pwsh
@@ -83,6 +83,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target\release\kononexus_tester.exe dist\KonoNexus-Network-Tester.exe
           Copy-Item target\release\kononexus_probe.exe dist\kononexus_probe.exe
+          Copy-Item target\release\kononexus_sdk_host.exe dist\kononexus_sdk_host.exe
           @"
           KonoNexus $env:PACKAGE_VERSION Windows x64 Network Tester
 
@@ -94,6 +95,10 @@ jobs:
 
           Diagnostic console and signed-report verifier:
           kononexus_probe.exe
+
+          Long-lived JSON Lines host for native application integration:
+          kononexus_sdk_host.exe
+          Protocol: https://github.com/Swir/KonoNexus/blob/main/docs/SDK-BRIDGE.md
 
           Signed reports:
           The GUI writes Ed25519-signed JSON results to
@@ -119,7 +124,7 @@ jobs:
           Test procedure:
           https://github.com/Swir/KonoNexus/blob/main/docs/TESTING.md
           "@ | Set-Content -Encoding UTF8 dist\README-TEST.txt
-          Compress-Archive -Path dist\KonoNexus-Network-Tester.exe,dist\kononexus_probe.exe,dist\README-TEST.txt -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
+          Compress-Archive -Path dist\KonoNexus-Network-Tester.exe,dist\kononexus_probe.exe,dist\kononexus_sdk_host.exe,dist\README-TEST.txt -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -128,6 +133,7 @@ jobs:
           path: |
             dist/KonoNexus-Network-Tester.exe
             dist/kononexus_probe.exe
+            dist/kononexus_sdk_host.exe
             dist/README-TEST.txt
             KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64.zip
           if-no-files-found: error
@@ -152,4 +158,4 @@ jobs:
               exit 0
             }
           }
-          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" --clobber
+          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" --clobber
