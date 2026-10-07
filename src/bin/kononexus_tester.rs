@@ -27,12 +27,18 @@ enum Command {
 
 #[derive(Debug)]
 enum WorkerEvent {
-    Ready { node_id: String, invite: String },
+    Ready {
+        node_id: String,
+        invite: String,
+    },
     InviteUpdated(String),
     Target(String),
     Snapshot(NetworkDiagnostics),
     TestStarted,
-    TestProgress { delivered: usize, sent: usize },
+    TestProgress {
+        delivered: usize,
+        sent: usize,
+    },
     TestFinished {
         rtt_ms: f32,
         packet_loss: f32,
@@ -175,10 +181,7 @@ impl TesterApp {
                         self.status = UiStatus::Failed;
                         self.error = Some("Brak potwierdzonej dostawy w czasie testu.".into());
                     }
-                    self.push_log(format!(
-                        "Podpisany raport JSON: {}",
-                        report_path.display()
-                    ));
+                    self.push_log(format!("Podpisany raport JSON: {}", report_path.display()));
                     if wan_matrix_eligible {
                         self.push_log(
                             "Raport zawiera dostawę, wybraną ścieżkę i publiczne endpoint evidence; może wejść do macierzy WAN po zebraniu raportu drugiego hosta.",
