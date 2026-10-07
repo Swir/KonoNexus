@@ -821,7 +821,7 @@ async fn worker(
                         event_tx.send(WorkerEvent::InviteUpdated(invite)).ok();
                     }
                 }
-                event_tx.send(WorkerEvent::Snapshot(snapshot)).ok();
+                event_tx.send(WorkerEvent::Snapshot(snapshot.clone())).ok();
 
                 if let Some(active) = test.as_mut() {
                     if active.sent < TEST_SAMPLE_COUNT && Instant::now() >= active.next_send {
