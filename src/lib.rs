@@ -14,6 +14,7 @@ pub mod relay_e2e;
 pub mod rendezvous;
 pub mod route;
 pub mod routing_cache;
+pub mod sdk_bridge;
 pub mod security;
 pub mod session;
 pub mod test_evidence;
@@ -66,6 +67,11 @@ pub use routing_cache::{
     load_routing_bucket_snapshot, load_routing_hints, new_bucket_cache_entry, new_cache_entry,
     save_routing_bucket_snapshot, save_routing_hints, RoutingBucketCacheEntry, RoutingCacheEntry,
     MAX_ROUTING_BOOTSTRAP_HINTS, MAX_ROUTING_BUCKET_CACHE_ENTRIES, MAX_ROUTING_CACHE_ENTRIES,
+};
+pub use sdk_bridge::{
+    KonofixSdkCommand, KonofixSdkEvent, KonofixSdkEventEnvelope, KonofixSdkFailureReason,
+    KonofixSdkRequest, KonofixSdkResponse, KonofixSdkResult, KONOFIX_SDK_BRIDGE_DOMAIN,
+    KONOFIX_SDK_BRIDGE_VERSION, MAX_SDK_CONNECT_ENDPOINTS, MAX_SDK_REQUEST_ID_BYTES,
 };
 pub use security::SequenceWindow;
 pub use session::{
