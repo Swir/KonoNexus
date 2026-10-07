@@ -5,6 +5,7 @@ use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use kononexus::{
     FilterCellStatus, InviteCode, KonofixSdkConfig, KonofixTransport, NatFilteringEvidence,
     NatMappingBehavior, NetworkDiagnostics, NodeIdentity, PathMethod, RelayAppEvent,
+    SignedWanTestReport,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -26,13 +27,24 @@ enum Command {
 
 #[derive(Debug)]
 enum WorkerEvent {
-    Ready { node_id: String, invite: String },
+    Ready {
+        node_id: String,
+        invite: String,
+    },
     InviteUpdated(String),
     Target(String),
     Snapshot(NetworkDiagnostics),
     TestStarted,
-    TestProgress { delivered: usize, sent: usize },
-    TestFinished { rtt_ms: f32, packet_loss: f32 },
+    TestProgress {
+        delivered: usize,
+        sent: usize,
+    },
+    TestFinished {
+        rtt_ms: f32,
+        packet_loss: f32,
+        report_path: PathBuf,
+        wan_matrix_eligible: bool,
+    },
     Log(String),
     Error(String),
 }
@@ -154,6 +166,8 @@ impl TesterApp {
                 WorkerEvent::TestFinished {
                     rtt_ms,
                     packet_loss,
+                    report_path,
+                    wan_matrix_eligible,
                 } => {
                     self.rtt_ms = Some(rtt_ms);
                     self.packet_loss = Some(packet_loss);
@@ -166,6 +180,16 @@ impl TesterApp {
                     } else {
                         self.status = UiStatus::Failed;
                         self.error = Some("Brak potwierdzonej dostawy w czasie testu.".into());
+                    }
+                    self.push_log(format!("Podpisany raport JSON: {}", report_path.display()));
+                    if wan_matrix_eligible {
+                        self.push_log(
+                            "Raport zawiera dostawę, wybraną ścieżkę i publiczne endpoint evidence; może wejść do macierzy WAN po zebraniu raportu drugiego hosta.",
+                        );
+                    } else {
+                        self.push_log(
+                            "Raport nie spełnia jeszcze kryteriów macierzy WAN; zapisano go jako uczciwy wynik diagnostyczny.",
+                        );
                     }
                 }
                 WorkerEvent::Log(message) => self.push_log(message),
@@ -706,7 +730,12 @@ async fn worker(
         .with_routing_cache(state_dir.join("routing-cache.json"))
         .with_event_capacity(256);
     let mut transport = KonofixTransport::spawn(config).await?;
-    event_tx.send(WorkerEvent::Ready { node_id, invite }).ok();
+    event_tx
+        .send(WorkerEvent::Ready {
+            node_id: node_id.clone(),
+            invite,
+        })
+        .ok();
 
     let mut target: Option<String> = None;
     let mut test: Option<ActiveTest> = None;
@@ -792,7 +821,7 @@ async fn worker(
                         event_tx.send(WorkerEvent::InviteUpdated(invite)).ok();
                     }
                 }
-                event_tx.send(WorkerEvent::Snapshot(snapshot)).ok();
+                event_tx.send(WorkerEvent::Snapshot(snapshot.clone())).ok();
 
                 if let Some(active) = test.as_mut() {
                     if active.sent < TEST_SAMPLE_COUNT && Instant::now() >= active.next_send {
@@ -823,13 +852,32 @@ async fn worker(
                 if finished {
                     let active = test.take().expect("test checked above");
                     let delivered = active.delivered;
-                    let packet_loss = 100.0 * (TEST_SAMPLE_COUNT.saturating_sub(delivered)) as f32 / TEST_SAMPLE_COUNT as f32;
                     let rtt_ms = if active.rtts.is_empty() {
                         0.0
                     } else {
                         active.rtts.iter().sum::<f32>() / active.rtts.len() as f32
                     };
-                    event_tx.send(WorkerEvent::TestFinished { rtt_ms, packet_loss }).ok();
+                    let report = SignedWanTestReport::from_runtime(
+                        &identity,
+                        &active.target,
+                        &snapshot,
+                        active.sent,
+                        delivered,
+                        active.failed,
+                        rtt_ms,
+                        APP_VERSION,
+                    )?;
+                    let packet_loss = report.evidence.metrics.packet_loss_percent;
+                    let wan_matrix_eligible = report.evidence.eligible_for_wan_matrix;
+                    let report_path = report.write_atomic(&state_dir.join("reports"))?;
+                    event_tx
+                        .send(WorkerEvent::TestFinished {
+                            rtt_ms,
+                            packet_loss,
+                            report_path,
+                            wan_matrix_eligible,
+                        })
+                        .ok();
                 }
             }
         }

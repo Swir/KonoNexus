@@ -1,4 +1,4 @@
-# KonoNexus Alpha.23 External Test Procedure
+# KonoNexus Alpha.24 External Test Procedure
 
 Status: controlled testing candidate.
 
@@ -104,7 +104,28 @@ The invite is signed with the node's Ed25519 identity and contains no private ke
 
 The result is honest by design: two fresh nodes behind unrelated NATs cannot universally discover each other without a mutually reachable peer/coordinator. If the invite contains only a private endpoint and no reachable mesh bootstrap exists, the GUI reports failure or inconclusive NAT evidence rather than a false `CONNECTED` status.
 
-## 5. Different-network diagnostic probe test
+## 5. Signed result evidence
+
+After every completed GUI test, the tester atomically writes a signed JSON report under:
+
+```text
+%LOCALAPPDATA%\KonoNexus\NetworkTester\reports
+```
+
+The report contains the exact local and target NodeIDs, selected path, endpoint and NAT evidence, sample counters, RTT, packet loss and two separate verdicts:
+
+- `delivery_passed` means at least one authenticated end-to-end delivery was acknowledged;
+- `eligible_for_wan_matrix` additionally requires a selected target path and observed external endpoint evidence.
+
+Verify a copied report without trusting the machine or text editor that supplied it:
+
+```powershell
+.\kononexus_probe.exe --verify-report .\KonoNexus-WAN-....json
+```
+
+A valid file prints `REPORT_VALID=1`. Any changed signed field, public key, NodeID or signature causes a non-zero exit. Matrix eligibility is evidence for one endpoint only; closing a matrix row still requires reports from both physical hosts plus the tested network description. A valid local-only report remains ineligible and cannot close the WAN/NAT roadmap gate.
+
+## 6. Different-network diagnostic probe test
 
 For the first WAN test, at least one initial seed endpoint must actually be reachable from the other machine.
 
@@ -131,7 +152,7 @@ Record whether the logs show:
 - relay fallback,
 - delivery receipt or failure.
 
-## 6. NAT/CGNAT matrix
+## 7. NAT/CGNAT matrix
 
 Run separate tests for:
 
@@ -145,13 +166,13 @@ Run separate tests for:
 
 For each test save logs from both endpoints.
 
-## 7. Firewall
+## 8. Firewall
 
 Allow inbound and outbound UDP for the probe's selected port (default 47000).
 
 Windows Defender Firewall may prompt on first launch. Allow the app on the network profile being tested.
 
-## 8. What counts as a pass
+## 9. What counts as a pass
 
 A message test passes only when:
 
@@ -163,7 +184,7 @@ A message test passes only when:
 
 A timeout or `FAILED` event is evidence to diagnose, not something to hide by increasing timeouts.
 
-## 9. Current testing limitation
+## 10. Current testing limitation
 
 The alpha.23 route tests deterministically cover cooldown-based path changes and recovery, KonoMind-scored relay choice with hysteresis, route/peer health isolation and bounds, and RelayApp ACK route matching. The runtime samples RTT only from an authenticated delivery ACK arriving on the same direct endpoint or established relay circuit as the latest tracked fragment attempt. These tests do not provide WAN or NAT evidence.
 

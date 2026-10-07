@@ -92,8 +92,14 @@ jobs:
           Main file:
           KonoNexus-Network-Tester.exe
 
-          Diagnostic console (optional):
+          Diagnostic console and signed-report verifier:
           kononexus_probe.exe
+
+          Signed reports:
+          The GUI writes Ed25519-signed JSON results to
+          %LOCALAPPDATA%\KonoNexus\NetworkTester\reports.
+          Verify a copied report with:
+          kononexus_probe.exe --verify-report <report.json>
 
           WAN note:
           Two fresh nodes behind NAT still need at least one mutually reachable KonoNexus

@@ -4,8 +4,14 @@ Development log for KonoNexus.
 
 ## Unreleased
 
-- Split the Network Tester GUI dependencies behind the default `tester-gui` feature, preserving normal tester builds while allowing downstream SDK consumers to disable `eframe`, `arboard` and `image` with `default-features = false`. CI now checks the SDK-only library configuration.
-- Added IPv6-first ordering for exact direct candidates from explicit connect hints and independently attested DHT results, before deduplication and the three-candidate cap. When mixed-family input exceeds the initial three-candidate cap, one slot is reserved for an IPv4 fallback. Unscoped IPv6 link-local connect hints are rejected so they cannot displace usable fallback candidates. This does not add IPv6 socket support, multi-endpoint publication, or WAN evidence, so the roadmap item remains open.
+## 0.1.0-alpha.24
+
+- Added versioned Ed25519-signed WAN test JSON reports with signer/NodeID binding, balanced delivery counters, selected-path and NAT evidence, and a separate eligibility verdict that cannot turn local-only success into WAN matrix evidence.
+- The Windows tester now atomically saves a signed report after each completed run. The bundled `kononexus_probe --verify-report <path>` command independently rejects modified fields, signatures, public keys, NodeIDs and inconsistent metrics.
+- Added deterministic report round-trip, tamper-rejection and local-only ineligibility tests, plus updated operator and packaged Windows instructions.
+- Split the Network Tester GUI dependencies behind the default `tester-gui` feature, preserving normal tester builds while allowing downstream SDK consumers to disable `eframe`, `arboard` and `image` with `default-features = false`. CI checks the SDK-only library configuration.
+- Added IPv6-first exact-candidate ordering, retained one authenticated endpoint per address family, preferred confirmed native IPv6 with deterministic IPv4 fallback, and covered admission/migration/fallback diagnostics without claiming WAN availability.
+- Completed bounded relay-to-relay application control-plane migration: an authenticated sibling circuit is reused without redundant relay setup, while stale path state without an E2E session cannot suppress recovery.
 
 ## 0.1.0-alpha.23
 
