@@ -128,9 +128,8 @@ impl SignedWanTestReport {
                 endpoint: path.endpoint.to_string(),
             });
         let delivery_passed = delivered > 0;
-        let eligible_for_wan_matrix = delivery_passed
-            && snapshot.observed_external_endpoint.is_some()
-            && path.is_some();
+        let eligible_for_wan_matrix =
+            delivery_passed && snapshot.observed_external_endpoint.is_some() && path.is_some();
 
         let evidence = WanTestEvidence {
             domain: WAN_TEST_REPORT_DOMAIN.to_owned(),
@@ -147,10 +146,8 @@ impl SignedWanTestReport {
                     .map(|endpoint| endpoint.to_string()),
                 mapping: nat_mapping_code(snapshot.nat_behavior).to_owned(),
                 filtering: nat_filtering_code(snapshot.filtering_evidence).to_owned(),
-                contacted_endpoint: filter_cell_code(
-                    snapshot.filtering_matrix.contacted_endpoint,
-                )
-                .to_owned(),
+                contacted_endpoint: filter_cell_code(snapshot.filtering_matrix.contacted_endpoint)
+                    .to_owned(),
                 same_address_different_port: filter_cell_code(
                     snapshot.filtering_matrix.same_address_different_port,
                 )
@@ -245,8 +242,7 @@ impl SignedWanTestReport {
 
     fn validate_evidence(&self) -> Result<()> {
         let evidence = &self.evidence;
-        if evidence.domain != WAN_TEST_REPORT_DOMAIN
-            || evidence.version != WAN_TEST_REPORT_VERSION
+        if evidence.domain != WAN_TEST_REPORT_DOMAIN || evidence.version != WAN_TEST_REPORT_VERSION
         {
             bail!("unsupported WAN test report schema");
         }
