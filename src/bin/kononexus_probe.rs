@@ -74,10 +74,16 @@ async fn run() -> Result<()> {
     if let Some(path) = args.verify_report.as_deref() {
         let report = SignedWanTestReport::read_verified(path)?;
         println!("REPORT_VALID=1");
-        println!("REPORT_SCHEMA={}@{}", report.evidence.domain, report.evidence.version);
+        println!(
+            "REPORT_SCHEMA={}@{}",
+            report.evidence.domain, report.evidence.version
+        );
         println!("LOCAL_NODE_ID={}", report.evidence.local_node_id);
         println!("TARGET_NODE_ID={}", report.evidence.target_node_id);
-        println!("DELIVERY_PASSED={}", u8::from(report.evidence.delivery_passed));
+        println!(
+            "DELIVERY_PASSED={}",
+            u8::from(report.evidence.delivery_passed)
+        );
         println!(
             "WAN_MATRIX_ELIGIBLE={}",
             u8::from(report.evidence.eligible_for_wan_matrix)
