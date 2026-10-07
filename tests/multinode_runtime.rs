@@ -84,7 +84,7 @@ async fn wait_for_sdk_message(
                     data_base64,
                     ..
                 } if actual_peer == peer_node_id
-                    && STANDARD.decode(data_base64).unwrap() == expected =>
+                    && STANDARD.decode(&data_base64).unwrap() == expected =>
                 {
                     break;
                 }
