@@ -25,7 +25,7 @@
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
 | Source version | `0.1.0-alpha.23` |
-| Roadmap | **44 / 49 = 89.8%** |
+| Roadmap | **45 / 49 = 91.8%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -153,7 +153,7 @@ cargo run -- --peer KNOWN_PEER:47000 --connect-node TARGET_KNP_NODE_ID
 
 KNP then tries at most three currently encrypted peers per round as coordinators, avoids repeating them in the same round, and backs off before another round.
 
-Explicit `connect()` hints and independently attested exact DHT results now enter one NodeID-bound candidate plan. The plan preserves source priority, deduplicates endpoints, tries at most three exact addresses with a four-second stagger, expires after 30 seconds, and never derives adjacent addresses or ports. Only the attempted address is admitted as an expected source; a different signed NodeID is rejected before peer admission. A confirmed encrypted direct session cancels the remaining direct, punch, rendezvous and pending relay work for that target. If exact candidates fail, KNP exhausts one bounded round of at most three authenticated rendezvous coordinators before relay fallback becomes eligible.
+Explicit `connect()` hints and independently attested exact DHT results now enter one NodeID-bound candidate plan. The plan preserves source priority, deduplicates endpoints, tries native IPv6 first while reserving an exact IPv4 fallback within the three-address bound, uses a four-second stagger, expires after 30 seconds, and never derives adjacent addresses or ports. Only the attempted address is admitted as an expected source; a different signed NodeID is rejected before peer admission. When both families establish authenticated sessions, runtime retains one endpoint per family, migrates application traffic to native IPv6, and falls back to the authenticated IPv4 session if IPv6 disappears. A confirmed encrypted direct session cancels the remaining candidate, punch, rendezvous and pending relay work for that target. If exact candidates fail, KNP exhausts one bounded round of at most three authenticated rendezvous coordinators before relay fallback becomes eligible.
 
 Both A and B must already have an encrypted KNP session with that coordinator. The coordinator sends each side the UDP source endpoint it currently observes for the other side. Each side waits briefly, then emits a locally bounded seven-probe backoff burst over roughly 2.7 seconds while the signed punch authorization remains valid for five seconds. A successful `PUNCH_PROBE/PUNCH_ACK` stops the schedule, establishes the authenticated direct endpoint, and starts a fresh encrypted KNP session over it.
 
@@ -161,7 +161,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 44 / 49 items complete (**89.8%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 45 / 49 items complete (**91.8%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -180,7 +180,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] Broader filtering-behavior matrix and negative-result interpretation
 - [x] Multi-candidate/path prioritization without unsafe port spraying
 - [x] Bounded automatic selection of encrypted rendezvous peers
-- [ ] IPv6 direct-path preference
+- [x] IPv6 direct-path preference
 - [x] Signed bounded DHT peer records and encrypted exact lookup
 - [x] Bounded recursive multi-hop DHT over encrypted peers
 - [x] In-memory k-bucket-style routing table
