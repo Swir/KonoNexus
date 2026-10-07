@@ -5405,9 +5405,9 @@ impl KonoNode {
 
     fn has_usable_relay_path_for_peer(&self, peer_node_id: &str, now: Instant) -> bool {
         self.relay_e2e_sessions.keys().any(|key| {
-            self.relay_paths.get(key).is_some_and(|path| {
-                path.peer_node_id == peer_node_id && path.expires_at > now
-            })
+            self.relay_paths
+                .get(key)
+                .is_some_and(|path| path.peer_node_id == peer_node_id && path.expires_at > now)
         })
     }
 
@@ -7094,10 +7094,8 @@ mod tests {
                     receive_window: SequenceWindow::default(),
                 },
             );
-            node.relay_e2e_sessions.insert(
-                (relay_endpoint, circuit_id),
-                SessionSlot::new(session),
-            );
+            node.relay_e2e_sessions
+                .insert((relay_endpoint, circuit_id), SessionSlot::new(session));
         }
 
         let first_candidates = node.relay_e2e_candidates_for_peer(&peer_node_id);
@@ -7117,11 +7115,7 @@ mod tests {
             node.remove_client_relay_path((relay_one, 1)).as_deref(),
             Some(peer_node_id.as_str())
         );
-        assert!(!node.schedule_auto_relay_failover_if_needed(
-            peer_node_id.clone(),
-            relay_one,
-            now,
-        ));
+        assert!(!node.schedule_auto_relay_failover_if_needed(peer_node_id.clone(), relay_one, now,));
         assert!(!node.auto_relay_fallbacks.contains_key(&peer_node_id));
 
         let second_candidates = node.relay_e2e_candidates_for_peer(&peer_node_id);
@@ -7140,11 +7134,7 @@ mod tests {
         assert!(second.generation > first.generation);
 
         node.remove_client_relay_path((relay_two, 2));
-        assert!(node.schedule_auto_relay_failover_if_needed(
-            peer_node_id.clone(),
-            relay_two,
-            now,
-        ));
+        assert!(node.schedule_auto_relay_failover_if_needed(peer_node_id.clone(), relay_two, now,));
         assert_eq!(
             node.auto_relay_fallbacks[&peer_node_id].tried,
             HashSet::from([relay_two])
