@@ -1,4 +1,4 @@
-# KonoNexus Alpha.23 External Test Procedure
+# KonoNexus Alpha.24 External Test Procedure
 
 Status: controlled testing candidate.
 
