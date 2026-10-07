@@ -24,7 +24,7 @@
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.23` |
+| Source version | `0.1.0-alpha.24` |
 | Roadmap | **46 / 49 = 93.9%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
@@ -100,7 +100,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.23`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.24`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
 
 ## Principles
 
@@ -362,7 +362,9 @@ Fragment reassembly, message IDs, retries, deduplication, and ACKs are path-inde
 
 ## Testing candidate
 
-Alpha.23 is the current build state intended for controlled testing on separate computers.
+Alpha.24 is the current build state intended for controlled testing on separate computers.
+
+The Windows GUI now writes an Ed25519-signed JSON result after every completed test. The bundled console probe independently verifies the report signature, signer/NodeID binding, counters and WAN-evidence eligibility. This makes physical test results durable and tamper-evident, but it does not replace the required runs on independent networks.
 
 Automated CI now includes a live three-node runtime harness:
 
