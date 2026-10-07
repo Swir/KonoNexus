@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use kononexus::{KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport};
+use kononexus::{
+    KonofixSdkConfig, KonofixTransport, RelayAppEvent, SignedWanTestReport, WanTestPairBundle,
+    WanTestScenario,
+};
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -40,6 +43,21 @@ struct Args {
 
     #[arg(long, value_name = "PATH")]
     verify_report: Option<PathBuf>,
+
+    #[arg(long, value_name = "PATH")]
+    verify_pair: Option<PathBuf>,
+
+    #[arg(long, value_names = ["REPORT_A", "REPORT_B"], num_args = 2)]
+    pair_report: Vec<PathBuf>,
+
+    #[arg(long, value_name = "SCENARIO")]
+    scenario: Option<WanTestScenario>,
+
+    #[arg(long, value_name = "DESCRIPTION")]
+    network_label: Option<String>,
+
+    #[arg(long, value_name = "PATH")]
+    pair_output: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -96,6 +114,54 @@ async fn run() -> Result<()> {
             report.evidence.metrics.average_rtt_ms
         );
         return Ok(());
+    }
+
+    if let Some(path) = args.verify_pair.as_deref() {
+        let bundle = WanTestPairBundle::read_verified(path)?;
+        println!("PAIR_VALID=1");
+        println!("PAIR_SCHEMA={}@{}", bundle.domain, bundle.version);
+        println!("SCENARIO={}", bundle.scenario);
+        println!("NETWORK_LABEL={}", bundle.network_label);
+        println!("NODE_A={}", bundle.report_a.evidence.local_node_id);
+        println!("NODE_B={}", bundle.report_b.evidence.local_node_id);
+        println!("TIMESTAMP_SKEW_MS={}", bundle.timestamp_skew_ms);
+        println!(
+            "MATRIX_ROW_ELIGIBLE={}",
+            u8::from(bundle.matrix_row_eligible)
+        );
+        println!("REPORT_A_SHA256={}", bundle.report_a_sha256);
+        println!("REPORT_B_SHA256={}", bundle.report_b_sha256);
+        return Ok(());
+    }
+
+    if !args.pair_report.is_empty() {
+        let scenario = args
+            .scenario
+            .context("--scenario is required with --pair-report")?;
+        let network_label = args
+            .network_label
+            .as_deref()
+            .context("--network-label is required with --pair-report")?;
+        let output = args
+            .pair_output
+            .as_deref()
+            .context("--pair-output is required with --pair-report")?;
+        let report_a = SignedWanTestReport::read_verified(&args.pair_report[0])?;
+        let report_b = SignedWanTestReport::read_verified(&args.pair_report[1])?;
+        let bundle = WanTestPairBundle::new(report_a, report_b, scenario, network_label)?;
+        bundle.write_atomic(output)?;
+        println!("PAIR_CREATED={}", output.display());
+        println!(
+            "MATRIX_ROW_ELIGIBLE={}",
+            u8::from(bundle.matrix_row_eligible)
+        );
+        println!("REPORT_A_SHA256={}", bundle.report_a_sha256);
+        println!("REPORT_B_SHA256={}", bundle.report_b_sha256);
+        return Ok(());
+    }
+
+    if args.scenario.is_some() || args.network_label.is_some() || args.pair_output.is_some() {
+        anyhow::bail!("--scenario, --network-label and --pair-output require --pair-report");
     }
 
     let identity_path = args.identity.unwrap_or(default_identity_path()?);
