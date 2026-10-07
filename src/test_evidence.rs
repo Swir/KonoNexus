@@ -5,13 +5,19 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const WAN_TEST_REPORT_DOMAIN: &str = "kononexus/wan-test-evidence";
 pub const WAN_TEST_REPORT_VERSION: u8 = 1;
+pub const WAN_TEST_PAIR_DOMAIN: &str = "kononexus/wan-test-pair";
+pub const WAN_TEST_PAIR_VERSION: u8 = 1;
+pub const WAN_TEST_PAIR_MAX_SKEW_MS: u64 = 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WanPathEvidence {
@@ -60,6 +66,199 @@ pub struct SignedWanTestReport {
     pub evidence: WanTestEvidence,
     pub signer_public_key: String,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WanTestScenario {
+    SameLan,
+    HomeNatPair,
+    HomeToMobile,
+    DualMobileCgnat,
+    PublicIpv6,
+    DirectInterruption,
+    RestartReconnect,
+}
+
+impl fmt::Display for WanTestScenario {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SameLan => "same_lan",
+            Self::HomeNatPair => "home_nat_pair",
+            Self::HomeToMobile => "home_to_mobile",
+            Self::DualMobileCgnat => "dual_mobile_cgnat",
+            Self::PublicIpv6 => "public_ipv6",
+            Self::DirectInterruption => "direct_interruption",
+            Self::RestartReconnect => "restart_reconnect",
+        })
+    }
+}
+
+impl FromStr for WanTestScenario {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.replace('-', "_").to_ascii_lowercase().as_str() {
+            "same_lan" => Ok(Self::SameLan),
+            "home_nat_pair" => Ok(Self::HomeNatPair),
+            "home_to_mobile" => Ok(Self::HomeToMobile),
+            "dual_mobile_cgnat" => Ok(Self::DualMobileCgnat),
+            "public_ipv6" => Ok(Self::PublicIpv6),
+            "direct_interruption" => Ok(Self::DirectInterruption),
+            "restart_reconnect" => Ok(Self::RestartReconnect),
+            _ => Err(format!(
+                "unknown WAN scenario {value:?}; expected same_lan, home_nat_pair, home_to_mobile, dual_mobile_cgnat, public_ipv6, direct_interruption, or restart_reconnect"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WanTestPairBundle {
+    pub domain: String,
+    pub version: u8,
+    pub generated_unix_ms: u64,
+    pub scenario: WanTestScenario,
+    pub network_label: String,
+    pub report_a_sha256: String,
+    pub report_b_sha256: String,
+    pub report_a: SignedWanTestReport,
+    pub report_b: SignedWanTestReport,
+    pub timestamp_skew_ms: u64,
+    pub reciprocal_node_ids: bool,
+    pub matrix_row_eligible: bool,
+}
+
+impl WanTestPairBundle {
+    pub fn new(
+        report_a: SignedWanTestReport,
+        report_b: SignedWanTestReport,
+        scenario: WanTestScenario,
+        network_label: impl Into<String>,
+    ) -> Result<Self> {
+        let generated_unix_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before Unix epoch")?
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        Self::at(
+            report_a,
+            report_b,
+            scenario,
+            network_label,
+            generated_unix_ms,
+        )
+    }
+
+    pub fn at(
+        report_a: SignedWanTestReport,
+        report_b: SignedWanTestReport,
+        scenario: WanTestScenario,
+        network_label: impl Into<String>,
+        generated_unix_ms: u64,
+    ) -> Result<Self> {
+        report_a.verify()?;
+        report_b.verify()?;
+        let reciprocal_node_ids = reports_are_reciprocal(&report_a, &report_b);
+        if !reciprocal_node_ids {
+            bail!("WAN pair reports must name each other's local NodeID");
+        }
+        let timestamp_skew_ms = report_a
+            .evidence
+            .generated_unix_ms
+            .abs_diff(report_b.evidence.generated_unix_ms);
+        let matrix_row_eligible = report_a.evidence.eligible_for_wan_matrix
+            && report_b.evidence.eligible_for_wan_matrix
+            && timestamp_skew_ms <= WAN_TEST_PAIR_MAX_SKEW_MS;
+        let bundle = Self {
+            domain: WAN_TEST_PAIR_DOMAIN.to_owned(),
+            version: WAN_TEST_PAIR_VERSION,
+            generated_unix_ms,
+            scenario,
+            network_label: network_label.into(),
+            report_a_sha256: report_sha256(&report_a)?,
+            report_b_sha256: report_sha256(&report_b)?,
+            report_a,
+            report_b,
+            timestamp_skew_ms,
+            reciprocal_node_ids,
+            matrix_row_eligible,
+        };
+        bundle.verify()?;
+        Ok(bundle)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        if self.domain != WAN_TEST_PAIR_DOMAIN || self.version != WAN_TEST_PAIR_VERSION {
+            bail!("unsupported WAN test pair schema");
+        }
+        validate_network_label(&self.network_label)?;
+        self.report_a.verify().context("invalid pair report A")?;
+        self.report_b.verify().context("invalid pair report B")?;
+        if !reports_are_reciprocal(&self.report_a, &self.report_b) || !self.reciprocal_node_ids {
+            bail!("WAN pair reports do not contain reciprocal NodeIDs");
+        }
+        if self.report_a_sha256 != report_sha256(&self.report_a)?
+            || self.report_b_sha256 != report_sha256(&self.report_b)?
+        {
+            bail!("WAN pair report digest mismatch");
+        }
+        let expected_skew = self
+            .report_a
+            .evidence
+            .generated_unix_ms
+            .abs_diff(self.report_b.evidence.generated_unix_ms);
+        if self.timestamp_skew_ms != expected_skew {
+            bail!("WAN pair timestamp skew mismatch");
+        }
+        let expected_eligibility = self.report_a.evidence.eligible_for_wan_matrix
+            && self.report_b.evidence.eligible_for_wan_matrix
+            && expected_skew <= WAN_TEST_PAIR_MAX_SKEW_MS;
+        if self.matrix_row_eligible != expected_eligibility {
+            bail!("WAN pair matrix eligibility mismatch");
+        }
+        Ok(())
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        self.verify()?;
+        serde_json::to_string_pretty(self).context("failed to encode WAN test pair")
+    }
+
+    pub fn from_json_verified(encoded: &str) -> Result<Self> {
+        let bundle: Self =
+            serde_json::from_str(encoded).context("failed to decode WAN test pair")?;
+        bundle.verify()?;
+        Ok(bundle)
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<()> {
+        self.verify()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file_name = path
+            .file_name()
+            .context("WAN pair output must include a file name")?
+            .to_string_lossy();
+        let temporary_path = path.with_file_name(format!(".{file_name}.tmp"));
+        fs::write(&temporary_path, self.to_pretty_json()?)
+            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
+        fs::rename(&temporary_path, path)
+            .with_context(|| format!("failed to publish {}", path.display()))
+    }
+
+    pub fn read_verified(path: &Path) -> Result<Self> {
+        let encoded = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Self::from_json_verified(&encoded)
+    }
 }
 
 impl SignedWanTestReport {
@@ -304,6 +503,23 @@ impl SignedWanTestReport {
     }
 }
 
+fn reports_are_reciprocal(a: &SignedWanTestReport, b: &SignedWanTestReport) -> bool {
+    a.evidence.local_node_id != b.evidence.local_node_id
+        && a.evidence.local_node_id == b.evidence.target_node_id
+        && a.evidence.target_node_id == b.evidence.local_node_id
+}
+
+fn report_sha256(report: &SignedWanTestReport) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(report)?)))
+}
+
+fn validate_network_label(label: &str) -> Result<()> {
+    if label.trim().is_empty() || label.len() > 128 || label.chars().any(char::is_control) {
+        bail!("network label must contain 1-128 printable bytes");
+    }
+    Ok(())
+}
+
 fn validate_node_id(node_id: &str) -> Result<()> {
     let Some(encoded) = node_id.strip_prefix("knp1") else {
         bail!("invalid KNP NodeID prefix");
@@ -387,6 +603,41 @@ mod tests {
         }
     }
 
+    fn reciprocal_reports(
+        generated_a: u64,
+        generated_b: u64,
+    ) -> (SignedWanTestReport, SignedWanTestReport) {
+        let identity_a = NodeIdentity::generate();
+        let identity_b = NodeIdentity::generate();
+        let node_a = identity_a.node_id();
+        let node_b = identity_b.node_id();
+        let report_a = SignedWanTestReport::signed_at(
+            &identity_a,
+            &node_b,
+            &snapshot(node_b.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+            10,
+            9,
+            1,
+            42.5,
+            "test",
+            generated_a,
+        )
+        .unwrap();
+        let report_b = SignedWanTestReport::signed_at(
+            &identity_b,
+            &node_a,
+            &snapshot(node_a.clone(), Some("198.51.100.20:47000".parse().unwrap())),
+            10,
+            10,
+            0,
+            38.0,
+            "test",
+            generated_b,
+        )
+        .unwrap();
+        (report_a, report_b)
+    }
+
     #[test]
     fn signed_wan_report_round_trips_and_is_matrix_eligible() {
         let identity = NodeIdentity::generate();
@@ -454,5 +705,103 @@ mod tests {
 
         assert!(report.evidence.delivery_passed);
         assert!(!report.evidence.eligible_for_wan_matrix);
+    }
+
+    #[test]
+    fn reciprocal_wan_pair_round_trips_and_is_matrix_row_eligible() {
+        let (report_a, report_b) = reciprocal_reports(1_000, 2_000);
+        let bundle = WanTestPairBundle::at(
+            report_a,
+            report_b,
+            WanTestScenario::HomeNatPair,
+            "ISP A / ISP B",
+            3_000,
+        )
+        .unwrap();
+
+        assert!(bundle.reciprocal_node_ids);
+        assert!(bundle.matrix_row_eligible);
+        assert_eq!(bundle.timestamp_skew_ms, 1_000);
+        assert_eq!(bundle.report_a_sha256.len(), 64);
+        let encoded = bundle.to_pretty_json().unwrap();
+        assert_eq!(
+            WanTestPairBundle::from_json_verified(&encoded).unwrap(),
+            bundle
+        );
+    }
+
+    #[test]
+    fn wan_pair_rejects_nonreciprocal_reports() {
+        let (report_a, _) = reciprocal_reports(1_000, 2_000);
+        let unrelated_identity = NodeIdentity::generate();
+        let unrelated_target = NodeIdentity::generate().node_id();
+        let unrelated = SignedWanTestReport::signed_at(
+            &unrelated_identity,
+            &unrelated_target,
+            &snapshot(
+                unrelated_target.clone(),
+                Some("192.0.2.40:47000".parse().unwrap()),
+            ),
+            10,
+            10,
+            0,
+            20.0,
+            "test",
+            2_000,
+        )
+        .unwrap();
+
+        assert!(WanTestPairBundle::at(
+            report_a,
+            unrelated,
+            WanTestScenario::HomeToMobile,
+            "home/mobile",
+            3_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wan_pair_rejects_tampered_embedded_report_or_digest() {
+        let (report_a, report_b) = reciprocal_reports(1_000, 2_000);
+        let mut bundle = WanTestPairBundle::at(
+            report_a,
+            report_b,
+            WanTestScenario::PublicIpv6,
+            "native IPv6",
+            3_000,
+        )
+        .unwrap();
+
+        bundle.report_a.evidence.metrics.average_rtt_ms = 0.5;
+        assert!(bundle.verify().is_err());
+
+        let (report_a, report_b) = reciprocal_reports(1_000, 2_000);
+        let mut bundle = WanTestPairBundle::at(
+            report_a,
+            report_b,
+            WanTestScenario::PublicIpv6,
+            "native IPv6",
+            3_000,
+        )
+        .unwrap();
+        bundle.report_b_sha256 = "00".to_owned();
+        assert!(bundle.verify().is_err());
+    }
+
+    #[test]
+    fn excessive_pair_skew_is_valid_but_not_matrix_row_eligible() {
+        let (report_a, report_b) = reciprocal_reports(1_000, 1_000 + WAN_TEST_PAIR_MAX_SKEW_MS + 1);
+        let bundle = WanTestPairBundle::at(
+            report_a,
+            report_b,
+            WanTestScenario::DualMobileCgnat,
+            "two carriers",
+            5_000,
+        )
+        .unwrap();
+
+        bundle.verify().unwrap();
+        assert!(!bundle.matrix_row_eligible);
     }
 }

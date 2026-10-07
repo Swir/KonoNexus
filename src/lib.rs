@@ -73,5 +73,6 @@ pub use session::{
 };
 pub use test_evidence::{
     SignedWanTestReport, WanNatEvidence, WanPathEvidence, WanTestEvidence, WanTestMetrics,
-    WAN_TEST_REPORT_DOMAIN, WAN_TEST_REPORT_VERSION,
+    WanTestPairBundle, WanTestScenario, WAN_TEST_PAIR_DOMAIN, WAN_TEST_PAIR_MAX_SKEW_MS,
+    WAN_TEST_PAIR_VERSION, WAN_TEST_REPORT_DOMAIN, WAN_TEST_REPORT_VERSION,
 };
