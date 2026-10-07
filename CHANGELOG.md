@@ -4,6 +4,13 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+## 0.1.0-alpha.27
+
+- Added a strict, versioned JSON SDK bridge for native application hosts. It validates NodeIDs, request correlation IDs, canonical Base64 payloads and bounded exact socket endpoints before invoking the existing `KonofixTransport` API.
+- Added stable send/connect responses plus message, delivery and failure event envelopes, including a binary-safe round trip and explicit failure-reason mapping without changing the KNP network wire format.
+- Exercised the bridge through the live three-node mesh runtime and documented exact host-facing JSON shapes for Konofix and future Android bindings. These are integration-ready contracts, not claims that either application integration is complete.
+- Corrected the roadmap summary to match the existing 46 checked items out of 49; no new roadmap gate is claimed by this release.
+
 ## 0.1.0-alpha.26
 
 - Added a deterministic WAN matrix manifest that verifies every pair bundle and canonical digest, rejects duplicate scenarios and endpoint-report reuse, and reports missing or ineligible scenarios.
