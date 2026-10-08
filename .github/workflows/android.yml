@@ -58,3 +58,70 @@ jobs:
       - run: cargo clippy --locked --no-default-features --features android-jni --lib -- -D warnings
       - run: cargo test --locked --no-default-features --features android-jni --lib
       - run: cargo check --locked --target aarch64-linux-android --no-default-features --features android-jni --lib
+
+  emulator:
+    name: AAR and emulator transport
+    needs: android
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install pinned Android SDK and NDK
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path "*/bin/sdkmanager" | sort -V | tail -1)"
+          test -x "$SDKMANAGER"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "platform-tools" "ndk;27.2.12479018"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-emulator
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --version 3.5.4 --locked
+      - name: Build emulator native library
+        run: cargo ndk -t x86_64 -o android/bridge/src/main/jniLibs build --release --locked --no-default-features --features android-jni --lib
+      - name: Assemble distributable AAR
+        working-directory: android
+        run: gradle --no-daemon :bridge:assembleRelease
+      - name: Verify AAR payload
+        run: |
+          unzip -l android/bridge/build/outputs/aar/bridge-release.aar > aar-contents.txt
+          grep -Fq "classes.jar" aar-contents.txt
+          grep -Fq "jni/x86_64/libkononexus.so" aar-contents.txt
+      - name: Run native transport on API 35 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          script: cd android && gradle --no-daemon :bridge:connectedDebugAndroidTest
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: KonoNexus-Android-AAR
+          path: android/bridge/build/outputs/aar/bridge-release.aar
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload emulator reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: KonoNexus-Android-emulator-reports
+          path: |
+            android/bridge/build/reports/androidTests/connected/**
+            android/bridge/build/outputs/androidTest-results/connected/**
+          if-no-files-found: warn
+          retention-days: 30
