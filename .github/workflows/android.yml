@@ -76,6 +76,8 @@ jobs:
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path "*/bin/sdkmanager" | sort -V | tail -1)"
           test -x "$SDKMANAGER"
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/emulator" >> "$GITHUB_PATH"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" "platforms;android-35" "platform-tools" "emulator" "system-images;android-35;default;x86_64" "ndk;27.2.12479018"
       - uses: gradle/actions/setup-gradle@v4
@@ -116,10 +118,13 @@ jobs:
           SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
           AVDMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path "*/bin/avdmanager" | sort -V | tail -1)"
           test -x "$AVDMANAGER"
-          test -r /dev/kvm
-          test -w /dev/kvm
+          command -v adb
           echo no | "$AVDMANAGER" create avd --force --name kononexus-ci --package "system-images;android-35;default;x86_64" --device pixel_6
-          nohup "$SDK_ROOT/emulator/emulator" -avd kononexus-ci -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -memory 2048 -cores 2 > emulator.log 2>&1 &
+          accel=()
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            accel=(-accel off)
+          fi
+          nohup "$SDK_ROOT/emulator/emulator" -avd kononexus-ci -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -memory 2048 -cores 2 "${accel[@]}" > emulator.log 2>&1 &
           echo "$!" > emulator.pid
           adb wait-for-device
           ready=0
