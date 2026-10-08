@@ -106,7 +106,7 @@ jobs:
           api-level: 35
           arch: x86_64
           profile: pixel_6
-          disable-animations: true
+          disable-animations: false
           script: |
             adb wait-for-device
             for service in package activity; do
