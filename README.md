@@ -25,7 +25,7 @@
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
 | Source version | `0.1.0-alpha.28` |
-| Roadmap | **46 / 49 = 93.9%** |
+| Roadmap | **47 / 49 = 95.9%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -163,7 +163,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 46 / 49 items complete (**93.9%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 47 / 49 items complete (**95.9%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -212,7 +212,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [ ] Real multi-network/NAT test matrix
 - [x] KonoNexus Network Tester GUI
 - [x] Konofix SDK transport wrapper
-- [ ] Konofix Windows application integration
+- [x] Konofix Windows application integration ([evidence](docs/KONOFIX-WINDOWS-INTEGRATION.md))
 - [ ] Android transport integration
 
 See [docs/KNP-SPEC.md](docs/KNP-SPEC.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
