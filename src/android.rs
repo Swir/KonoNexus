@@ -612,6 +612,7 @@ mod tests {
     use super::*;
     use crate::{KonofixSdkEvent, KonofixSdkResult};
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn config(root: &PathBuf, name: &str) -> AndroidTransportConfig {
         AndroidTransportConfig {
@@ -635,7 +636,10 @@ mod tests {
         let unique = format!(
             "kononexus-android-{}-{}",
             std::process::id(),
-            Instant::now().elapsed().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the Unix epoch")
+                .as_nanos()
         );
         let root = std::env::temp_dir().join(unique);
         fs::create_dir_all(&root).unwrap();
