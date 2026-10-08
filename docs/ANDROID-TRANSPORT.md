@@ -15,11 +15,12 @@ cargo ndk \
   -t arm64-v8a \
   -t armeabi-v7a \
   -t x86_64 \
-  -o android/src/main/jniLibs \
+  -o android/bridge/src/main/jniLibs \
   build --release --locked --no-default-features --features android-jni --lib
+(cd android && gradle --no-daemon :bridge:assembleRelease)
 ```
 
-Copy `android/src/main/java/com/swir/kononexus/KonoNexusNative.kt` into the consuming Android module (or package both the Kotlin source and `jniLibs` in an AAR). The JNI ABI is intentionally bound to the class name `com.swir.kononexus.KonoNexusNative`.
+The distributable AAR is written to `android/bridge/build/outputs/aar/bridge-release.aar`. It contains the Kotlin lifecycle API and native libraries; the JNI ABI is intentionally bound to the class name `com.swir.kononexus.KonoNexusNative`.
 
 The application manifest needs network access:
 
@@ -78,3 +79,9 @@ The Rust worker reserves event-queue capacity before consuming the next transpor
 - Unknown config fields are rejected.
 - Seed endpoints, event capacity, path lengths, and poll timeouts are bounded.
 - This bridge adds no public KNP frame, packet type, or peer-visible behavior.
+
+## Emulator qualification
+
+The Android workflow builds an x86_64 native library, packages the AAR, boots an API 35 emulator, and runs `connectedCheck`. The instrumented test starts two independent native sessions with app-private identities, connects them over real emulator loopback UDP, sends a binary SDK message, observes it at the receiver, verifies the authenticated delivery receipt at the sender, and exercises idempotent shutdown.
+
+This is device-class integration evidence for the Android bridge. It does not replace the separate physical WAN/NAT matrix, and `local_test_mode` remains test-only.
