@@ -612,9 +612,10 @@ mod tests {
     use super::*;
     use crate::{KonofixSdkEvent, KonofixSdkResult};
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn config(root: &PathBuf, name: &str) -> AndroidTransportConfig {
+    fn config(root: &Path, name: &str) -> AndroidTransportConfig {
         AndroidTransportConfig {
             domain: ANDROID_BRIDGE_DOMAIN.to_owned(),
             version: ANDROID_BRIDGE_VERSION,
