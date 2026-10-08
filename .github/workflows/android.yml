@@ -1,0 +1,59 @@
+name: Android Bridge
+
+on:
+  push:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/android.rs"
+      - "src/lib.rs"
+      - "android/**"
+      - "docs/ANDROID-TRANSPORT.md"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/android.rs"
+      - "src/lib.rs"
+      - "android/**"
+      - "docs/ANDROID-TRANSPORT.md"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: Lockfile is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo generate-lockfile
+      - name: Preserve generated lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-generated-lockfile
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 3
+      - name: Reject an outdated lockfile
+        run: git diff --exit-code -- Cargo.lock
+
+  android:
+    name: JNI and Android cross-check
+    needs: lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked --no-default-features --features android-jni --lib
+      - run: cargo clippy --locked --no-default-features --features android-jni --lib -- -D warnings
+      - run: cargo test --locked --no-default-features --features android-jni --lib
+      - run: cargo check --locked --target aarch64-linux-android --no-default-features --features android-jni --lib
