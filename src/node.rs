@@ -105,6 +105,7 @@ const DHT_OWNER_REPLICATION_RESERVE: usize = DHT_BUCKET_SIZE;
 const DHT_REPLICATION_BURST_PER_TICK: usize = 4;
 const RELAY_APP_BURST_PER_TICK: usize = 4;
 const MAX_RELAY_APP_HANDLE_CAPACITY: usize = 1_024;
+const MAX_PENDING_RELAY_APP_RECEIPTS: usize = 1_024;
 const SESSION_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SESSION_HANDSHAKE_MAX_ATTEMPTS: u8 = 4;
 const SESSION_RESPONDER_ACK_TTL: Duration = Duration::from_secs(10);
@@ -635,6 +636,7 @@ pub struct KonoNode {
     relay_app_command_rx: Option<mpsc::Receiver<RelayAppCommand>>,
     relay_app_event_tx: Option<mpsc::Sender<RelayAppMessage>>,
     relay_app_receipt_tx: Option<mpsc::Sender<RelayAppDeliveryReceipt>>,
+    pending_relay_app_receipts: VecDeque<RelayAppDeliveryReceipt>,
     relay_app_failure_tx: Option<mpsc::Sender<RelayAppDeliveryFailure>>,
     route_controller: RouteController,
     relay_app_route_attempts: RelayAppRouteAttempts,
@@ -728,6 +730,7 @@ impl KonoNode {
             relay_app_command_rx: None,
             relay_app_event_tx: None,
             relay_app_receipt_tx: None,
+            pending_relay_app_receipts: VecDeque::new(),
             relay_app_failure_tx: None,
             route_controller: RouteController::default(),
             relay_app_route_attempts: RelayAppRouteAttempts::default(),
@@ -925,6 +928,7 @@ impl KonoNode {
                     self.drive_punch_attempts().await;
                     self.drive_relay_app().await;
                     self.flush_relay_app_events();
+                    self.flush_relay_app_receipts();
                     self.flush_relay_app_failures();
                     self.publish_diagnostics();
                 }
@@ -942,6 +946,7 @@ impl KonoNode {
                     }
                     self.drive_dht_replications().await;
                     self.flush_relay_app_events();
+                    self.flush_relay_app_receipts();
                     self.flush_relay_app_failures();
                 }
                 command = async {
@@ -3048,6 +3053,7 @@ impl KonoNode {
 
         if status == RelayAppReceiveStatus::Completed {
             self.flush_relay_app_events();
+            self.flush_relay_app_receipts();
             self.flush_relay_app_failures();
         }
 
@@ -3071,20 +3077,12 @@ impl KonoNode {
                 self.route_controller
                     .report_ack_success(peer_node_id, route, path, rtt, sent_at);
             }
-            if let Some(sender) = self.relay_app_receipt_tx.as_ref() {
-                let receipt = RelayAppDeliveryReceipt {
+            self.pending_relay_app_receipts
+                .push_back(RelayAppDeliveryReceipt {
                     peer_node_id: peer_node_id.to_owned(),
                     message_id,
-                };
-                if let Err(error) = sender.try_send(receipt) {
-                    debug!(
-                        peer = %peer_node_id,
-                        message_id,
-                        %error,
-                        "delivery receipt channel unavailable"
-                    );
-                }
-            }
+                });
+            self.flush_relay_app_receipts();
 
             debug!(
                 peer = %peer_node_id,
@@ -3231,9 +3229,13 @@ impl KonoNode {
             } => {
                 let needs_path = self.direct_app_endpoint_for_peer(&peer_node_id).is_none()
                     && self.relay_e2e_path_for_peer(&peer_node_id).is_none();
-                let result = self
-                    .queue_relay_app_message(peer_node_id.clone(), data)
-                    .map_err(|error| error.to_string());
+                let result =
+                    if self.pending_relay_app_receipts.len() >= MAX_PENDING_RELAY_APP_RECEIPTS {
+                        Err("delivery receipt backlog is full".to_owned())
+                    } else {
+                        self.queue_relay_app_message(peer_node_id.clone(), data)
+                            .map_err(|error| error.to_string())
+                    };
 
                 if result.is_ok() && needs_path {
                     self.queue_auto_rendezvous(peer_node_id);
@@ -3447,6 +3449,27 @@ impl KonoNode {
                 Err(mpsc::error::TrySendError::Full(_)) => break,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.relay_app_failure_tx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn flush_relay_app_receipts(&mut self) {
+        while let Some(receipt) = self.pending_relay_app_receipts.front().cloned() {
+            let result = match self.relay_app_receipt_tx.as_ref() {
+                Some(sender) => sender.try_send(receipt),
+                None => break,
+            };
+
+            match result {
+                Ok(()) => {
+                    self.pending_relay_app_receipts.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_relay_app_receipts.clear();
+                    self.relay_app_receipt_tx = None;
                     break;
                 }
             }
@@ -6617,6 +6640,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_receipts_survive_a_full_consumer_channel() {
+        let mut node = KonoNode::bind(
+            NodeIdentity::generate(),
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let peer = "knp1peer";
+        let now = Instant::now();
+        let first = node
+            .relay_app
+            .queue(peer.to_owned(), vec![1_u8], now)
+            .unwrap();
+        let second = node
+            .relay_app
+            .queue(peer.to_owned(), vec![2_u8], now)
+            .unwrap();
+        let (receipt_tx, mut receipt_rx) = mpsc::channel(1);
+        node.relay_app_receipt_tx = Some(receipt_tx);
+        let route = ControlRoute::Direct("127.0.0.1:47000".parse().unwrap());
+
+        node.handle_app_ack(peer, first, route, now);
+        node.handle_app_ack(peer, second, route, now);
+
+        assert_eq!(node.pending_relay_app_receipts.len(), 1);
+        assert_eq!(receipt_rx.recv().await.unwrap().message_id, first);
+        node.flush_relay_app_receipts();
+        assert_eq!(receipt_rx.recv().await.unwrap().message_id, second);
+        assert!(node.pending_relay_app_receipts.is_empty());
+    }
+
+    #[tokio::test]
     async fn exhausted_delivery_learns_the_actual_relay_path() {
         let mut node = KonoNode::bind(
             NodeIdentity::generate(),
@@ -6979,8 +7036,6 @@ mod tests {
         node.sessions
             .insert(endpoint, SessionSlot::new(local_session));
         node.confirmed_sessions.insert(endpoint);
-        // Advance the recorded age, not the runtime clock or timeout. No sleep,
-        // extra HELLO, weaker peer TTL or external network is needed.
         let old = Instant::now() - Duration::from_secs(2);
         node.peers.get_mut(&endpoint).unwrap().last_seen = old;
         let frame = remote_session
