@@ -3229,14 +3229,13 @@ impl KonoNode {
             } => {
                 let needs_path = self.direct_app_endpoint_for_peer(&peer_node_id).is_none()
                     && self.relay_e2e_path_for_peer(&peer_node_id).is_none();
-                let result = if self.pending_relay_app_receipts.len()
-                    >= MAX_PENDING_RELAY_APP_RECEIPTS
-                {
-                    Err("delivery receipt backlog is full".to_owned())
-                } else {
-                    self.queue_relay_app_message(peer_node_id.clone(), data)
-                        .map_err(|error| error.to_string())
-                };
+                let result =
+                    if self.pending_relay_app_receipts.len() >= MAX_PENDING_RELAY_APP_RECEIPTS {
+                        Err("delivery receipt backlog is full".to_owned())
+                    } else {
+                        self.queue_relay_app_message(peer_node_id.clone(), data)
+                            .map_err(|error| error.to_string())
+                    };
 
                 if result.is_ok() && needs_path {
                     self.queue_auto_rendezvous(peer_node_id);
