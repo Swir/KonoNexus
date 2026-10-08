@@ -107,21 +107,7 @@ jobs:
           arch: x86_64
           profile: pixel_6
           disable-animations: false
-          script: |
-            adb wait-for-device
-            for service in package activity; do
-              ready=0
-              for attempt in $(seq 1 60); do
-                if adb shell service check "$service" 2>/dev/null | grep -Fq "found"; then
-                  ready=1
-                  break
-                fi
-                sleep 3
-              done
-              test "$ready" = 1
-            done
-            cd android
-            gradle --no-daemon :bridge:connectedDebugAndroidTest
+          script: adb wait-for-device; ready=0; for attempt in $(seq 1 120); do if adb shell service check package 2>/dev/null | grep -Fq "found" && adb shell service check activity 2>/dev/null | grep -Fq "found"; then ready=1; break; fi; sleep 3; done; test "$ready" = 1 && cd android && gradle --no-daemon :bridge:connectedDebugAndroidTest
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
