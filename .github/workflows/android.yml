@@ -100,14 +100,17 @@ jobs:
           unzip -l android/bridge/build/outputs/aar/bridge-release.aar > aar-contents.txt
           grep -Fq "classes.jar" aar-contents.txt
           grep -Fq "jni/x86_64/libkononexus.so" aar-contents.txt
+      - name: Assemble instrumentation APK before emulator boot
+        working-directory: android
+        run: gradle --no-daemon :bridge:assembleDebugAndroidTest
       - name: Run native transport on API 35 emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           arch: x86_64
           profile: pixel_6
-          disable-animations: true
-          script: cd android && gradle --no-daemon :bridge:connectedDebugAndroidTest
+          disable-animations: false
+          script: adb wait-for-device; ready=0; for attempt in $(seq 1 120); do if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then sleep 5; if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then ready=1; break; fi; fi; sleep 3; done; test "$ready" = 1 && cd android && gradle --no-daemon :bridge:connectedDebugAndroidTest
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
