@@ -25,7 +25,7 @@
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
 | Source version | `0.1.0-alpha.28` |
-| Roadmap | **47 / 49 = 95.9%** |
+| Roadmap | **48 / 49 = 98.0%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
 | License | MIT |
@@ -83,7 +83,7 @@ kononexus = { git = "https://github.com/Swir/KonoNexus.git", default-features = 
 The default `tester-gui` feature keeps the tester enabled for normal builds. Disable default features for SDK integration; for example, `cargo check --no-default-features --lib` checks only the core library without `eframe`, `arboard` or `image`.
 Production consumers should also pin `rev` to an exact reviewed commit instead of following a moving branch.
 
-Native hosts that need a language-neutral boundary can use the strict, versioned JSON SDK bridge documented in [`docs/SDK-BRIDGE.md`](docs/SDK-BRIDGE.md). The packaged `kononexus_sdk_host` process keeps one transport alive and exchanges one request, response or event per JSON line. It does not alter the public KNP network wire format or by itself complete the Windows/Android application integrations.
+Native hosts that need a language-neutral boundary can use the strict, versioned JSON SDK bridge documented in [`docs/SDK-BRIDGE.md`](docs/SDK-BRIDGE.md). The packaged `kononexus_sdk_host` process keeps one transport alive and exchanges one request, response or event per JSON line. Android consumers can use the packaged Kotlin/JNI AAR documented in [`docs/ANDROID-TRANSPORT.md`](docs/ANDROID-TRANSPORT.md). Neither boundary alters the public KNP network wire format.
 
 ## Requirements / compatibility
 
@@ -91,7 +91,7 @@ Native hosts that need a language-neutral boundary can use the strict, versioned
 - **Primary development targets:** Windows and Linux.
 - **Windows tester:** intended for controlled two-PC validation.
 - **Networking:** UDP reachability and NAT behavior vary by network; no universal NAT/CGNAT success is claimed.
-- **Android transport:** planned, not yet complete.
+- **Android transport:** Kotlin/JNI AAR qualified on an API 35 emulator with real native UDP message and authenticated-receipt lifecycle coverage.
 - **Security:** pre-release protocol/security work has automated coverage but no claim of independent security review.
 
 ## Usage
@@ -163,7 +163,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 
 ## Roadmap
 
-**Verified roadmap progress:** 47 / 49 items complete (**95.9%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
+**Verified roadmap progress:** 48 / 49 items complete (**98.0%**). This number is derived from the checklist below and reflects implemented protocol/state-machine behavior; local tests do not close the separate real-network validation gate.
 
 - [x] KNP wire envelope and protocol versioning
 - [x] Persistent Ed25519 node identity
@@ -213,7 +213,7 @@ This is an experimental primitive. NATs that create destination-specific mapping
 - [x] KonoNexus Network Tester GUI
 - [x] Konofix SDK transport wrapper
 - [x] Konofix Windows application integration ([evidence](docs/KONOFIX-WINDOWS-INTEGRATION.md))
-- [ ] Android transport integration
+- [x] Android transport integration ([guide](docs/ANDROID-TRANSPORT.md), [API 35 evidence](https://github.com/Swir/KonoNexus/actions/runs/37806721178))
 
 See [docs/KNP-SPEC.md](docs/KNP-SPEC.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
 
