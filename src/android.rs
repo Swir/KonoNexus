@@ -381,11 +381,14 @@ async fn run_android_transport(
                         printable_error(&error),
                     ),
                 };
-                let json = response.to_json().unwrap_or_else(|error| {
-                    format!(
-                        "{{\"domain\":\"{ANDROID_BRIDGE_DOMAIN}\",\"version\":{ANDROID_BRIDGE_VERSION},\"request_id\":\"bridge-error\",\"result\":{{\"status\":\"rejected\",\"code\":\"serialization_error\",\"message\":\"{}\"}}}}",
-                        printable_error(&error)
+                let json = response.to_json().unwrap_or_else(|_| {
+                    KonofixSdkResponse::rejected(
+                        "bridge-error",
+                        "serialization_error",
+                        "unable to encode SDK response",
                     )
+                    .to_json()
+                    .expect("static SDK rejection response is valid")
                 });
                 let _ = reply.send(json);
             }
