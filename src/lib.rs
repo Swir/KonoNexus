@@ -1,3 +1,4 @@
+pub mod android;
 mod candidate_group;
 pub mod dht;
 pub mod identity;
@@ -19,6 +20,10 @@ pub mod security;
 pub mod session;
 pub mod test_evidence;
 
+pub use android::{
+    AndroidTransportBridge, AndroidTransportConfig, AndroidTransportInfo, ANDROID_BRIDGE_DOMAIN,
+    ANDROID_BRIDGE_VERSION, MAX_ANDROID_EVENT_CAPACITY, MAX_ANDROID_POLL_TIMEOUT_MS,
+};
 pub use dht::{
     endpoint_publishable, node_id_closer_to_target, routing_bucket_index, DhtTable,
     EndpointAttestation, EndpointAttestationTable, PeerRecord, RoutingPeer, RoutingTable,
