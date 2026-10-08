@@ -4,8 +4,8 @@
 //! tested on CI. The optional `android-jni` feature only adds the thin JNI ABI.
 
 use crate::{
-    KonofixSdkEventEnvelope, KonofixSdkRequest, KonofixSdkResponse, KonofixTransport,
-    KonofixSdkConfig, MAX_SDK_REQUEST_ID_BYTES,
+    KonofixSdkConfig, KonofixSdkEventEnvelope, KonofixSdkRequest, KonofixSdkResponse,
+    KonofixTransport, MAX_SDK_REQUEST_ID_BYTES,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -180,10 +180,7 @@ impl AndroidTransportBridge {
                     }
                 };
                 runtime.block_on(run_android_transport(
-                    sdk_config,
-                    command_rx,
-                    event_tx,
-                    ready_tx,
+                    sdk_config, command_rx, event_tx, ready_tx,
                 ));
             })
             .context("unable to spawn Android transport thread")?;
@@ -654,7 +651,10 @@ mod tests {
         let root = test_root();
         let valid = config(&root, "valid");
         let json = valid.to_json().unwrap();
-        assert_eq!(AndroidTransportConfig::from_json_verified(&json).unwrap(), valid);
+        assert_eq!(
+            AndroidTransportConfig::from_json_verified(&json).unwrap(),
+            valid
+        );
 
         let mut invalid = valid.clone();
         invalid.domain = "other/domain".to_owned();
@@ -713,7 +713,8 @@ mod tests {
                     ..
                 } = event.event
                 {
-                    received = incoming_id == message_id && data_base64 == "YW5kcm9pZC10cmFuc3BvcnQ=";
+                    received =
+                        incoming_id == message_id && data_base64 == "YW5kcm9pZC10cmFuc3BvcnQ=";
                 }
             }
             if let Some(json) = sender.poll_event_json(50).unwrap() {
@@ -728,7 +729,10 @@ mod tests {
             }
         }
         assert!(received, "Android receiver must observe the binary message");
-        assert!(delivered, "Android sender must observe the authenticated receipt");
+        assert!(
+            delivered,
+            "Android sender must observe the authenticated receipt"
+        );
 
         sender.stop().unwrap();
         receiver.stop().unwrap();
