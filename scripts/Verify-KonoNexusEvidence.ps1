@@ -74,7 +74,7 @@ if ($probeExitCode -ne 0) {
 if ($RequireReady -and -not ($verificationOutput | Where-Object {
             $_.ToString().Trim() -eq "MANUAL_REVIEW_READY=1"
         })) {
-    Write-Error "The matrix is valid but not complete and eligible for manual review."
+    [Console]::Error.WriteLine("The matrix is valid but not complete and eligible for manual review.")
     exit 2
 }
 
