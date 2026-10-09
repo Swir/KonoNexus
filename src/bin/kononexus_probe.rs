@@ -62,6 +62,9 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     verify_matrix: Option<PathBuf>,
 
+    #[arg(long, value_name = "BUILD")]
+    expected_tester_build: Option<String>,
+
     #[arg(long, value_name = "PAIR_PATH")]
     matrix_pair: Vec<PathBuf>,
 
@@ -100,6 +103,10 @@ async fn run() -> Result<()> {
 
     if let Some(path) = args.verify_report.as_deref() {
         let report = SignedWanTestReport::read_verified(path)?;
+        ensure_expected_tester_build(
+            args.expected_tester_build.as_deref(),
+            &report.evidence.tester_version,
+        )?;
         println!("REPORT_VALID=1");
         println!(
             "REPORT_SCHEMA={}@{}",
@@ -128,6 +135,10 @@ async fn run() -> Result<()> {
 
     if let Some(path) = args.verify_pair.as_deref() {
         let bundle = WanTestPairBundle::read_verified(path)?;
+        ensure_expected_tester_build(
+            args.expected_tester_build.as_deref(),
+            &bundle.report_a.evidence.tester_version,
+        )?;
         println!("PAIR_VALID=1");
         println!("PAIR_SCHEMA={}@{}", bundle.domain, bundle.version);
         println!("TESTER_BUILD={}", bundle.report_a.evidence.tester_version);
@@ -147,16 +158,15 @@ async fn run() -> Result<()> {
 
     if let Some(path) = args.verify_matrix.as_deref() {
         let manifest = WanTestMatrixManifest::read_verified(path)?;
+        let tester_build = manifest
+            .bundles
+            .first()
+            .map(|bundle| bundle.report_a.evidence.tester_version.as_str())
+            .unwrap_or("none");
+        ensure_expected_tester_build(args.expected_tester_build.as_deref(), tester_build)?;
         println!("MATRIX_VALID=1");
         println!("MATRIX_SCHEMA={}@{}", manifest.domain, manifest.version);
-        println!(
-            "TESTER_BUILD={}",
-            manifest
-                .bundles
-                .first()
-                .map(|bundle| bundle.report_a.evidence.tester_version.as_str())
-                .unwrap_or("none")
-        );
+        println!("TESTER_BUILD={tester_build}");
         println!("BUNDLE_COUNT={}", manifest.bundles.len());
         println!(
             "MISSING_SCENARIOS={}",
@@ -235,6 +245,11 @@ async fn run() -> Result<()> {
     {
         anyhow::bail!(
             "pair metadata requires --pair-report, and --matrix-output requires --matrix-pair"
+        );
+    }
+    if args.expected_tester_build.is_some() {
+        anyhow::bail!(
+            "--expected-tester-build requires --verify-report, --verify-pair, or --verify-matrix"
         );
     }
 
@@ -379,6 +394,19 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+fn ensure_expected_tester_build(expected: Option<&str>, actual: &str) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        anyhow::bail!("expected tester build cannot be empty");
+    }
+    if actual != expected {
+        anyhow::bail!("tester build mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
 fn scenario_list(scenarios: &[WanTestScenario]) -> String {
     if scenarios.is_empty() {
         "none".to_owned()
@@ -414,4 +442,37 @@ fn default_identity_path() -> Result<PathBuf> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("kononexus-probe.key"))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_expected_tester_build;
+
+    #[test]
+    fn expected_tester_build_accepts_exact_match_or_no_guard() {
+        assert!(ensure_expected_tester_build(None, "0.1.0-alpha.28+git.abc").is_ok());
+        assert!(
+            ensure_expected_tester_build(
+                Some("0.1.0-alpha.28+git.abc"),
+                "0.1.0-alpha.28+git.abc"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn expected_tester_build_rejects_mismatch() {
+        let error =
+            ensure_expected_tester_build(Some("0.1.0-alpha.28+git.expected"), "0.1.0-alpha.28+git.actual")
+                .unwrap_err();
+        assert!(error.to_string().contains("tester build mismatch"));
+    }
+
+    #[test]
+    fn expected_tester_build_rejects_empty_guard() {
+        let error = ensure_expected_tester_build(Some(""), "0.1.0-alpha.28+git.actual")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "expected tester build cannot be empty");
+    }
 }
