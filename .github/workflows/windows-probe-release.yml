@@ -93,6 +93,8 @@ jobs:
           Copy-Item target\release\kononexus_tester.exe dist\KonoNexus-Network-Tester.exe
           Copy-Item target\release\kononexus_probe.exe dist\kononexus_probe.exe
           Copy-Item target\release\kononexus_sdk_host.exe dist\kononexus_sdk_host.exe
+          $expectedBuild = "$env:PACKAGE_VERSION+git.$env:GITHUB_SHA"
+          $expectedBuild | Set-Content -Encoding ASCII dist\QUALIFIED-BUILD.txt
           @"
           KonoNexus $env:PACKAGE_VERSION Windows x64 Network Tester
 
@@ -109,20 +111,25 @@ jobs:
           kononexus_sdk_host.exe
           Protocol: https://github.com/Swir/KonoNexus/blob/main/docs/SDK-BRIDGE.md
 
+          Qualified signed evidence build:
+          $expectedBuild
+          Load it before final qualification:
+          `$EXPECTED_BUILD = Get-Content .\QUALIFIED-BUILD.txt
+
           Signed reports:
           The GUI writes Ed25519-signed JSON results to
           %LOCALAPPDATA%\KonoNexus\NetworkTester\reports.
           Verify a copied report with:
-          kononexus_probe.exe --verify-report <report.json>
+          kononexus_probe.exe --verify-report <report.json> --expected-tester-build `$EXPECTED_BUILD
 
           Pair two reciprocal endpoint reports for one matrix row:
           kononexus_probe.exe --pair-report <pc-a.json> <pc-b.json> --scenario home_nat_pair --network-label "ISP A / ISP B" --pair-output <pair.json>
-          kononexus_probe.exe --verify-pair <pair.json>
+          kononexus_probe.exe --verify-pair <pair.json> --expected-tester-build `$EXPECTED_BUILD
           Pair metadata describes one operator-observed run; it does not prove the full matrix.
 
           Build or verify the incremental seven-scenario manifest:
           kononexus_probe.exe --matrix-pair <pair-1.json> --matrix-pair <pair-2.json> --matrix-output <matrix.json>
-          kononexus_probe.exe --verify-matrix <matrix.json>
+          kononexus_probe.exe --verify-matrix <matrix.json> --expected-tester-build `$EXPECTED_BUILD
           MANUAL_REVIEW_READY=1 still requires human review of the physical network setup.
 
           WAN note:
@@ -138,12 +145,16 @@ jobs:
             "dist\kononexus_probe.exe",
             "dist\kononexus_sdk_host.exe"
           )
-          $checksumLines = foreach ($payload in $payloads) {
+          $checksumTargets = $payloads + @(
+            "dist\README-TEST.txt",
+            "dist\QUALIFIED-BUILD.txt"
+          )
+          $checksumLines = foreach ($payload in $checksumTargets) {
             $hash = (Get-FileHash -Algorithm SHA256 $payload).Hash.ToLowerInvariant()
             "$hash *$([IO.Path]::GetFileName($payload))"
           }
           $checksumLines | Set-Content -Encoding ASCII dist\SHA256SUMS.txt
-          $archiveInputs = $payloads + @("dist\README-TEST.txt", "dist\SHA256SUMS.txt")
+          $archiveInputs = $checksumTargets + @("dist\SHA256SUMS.txt")
           Compress-Archive -Path $archiveInputs -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
           $zip = "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip"
           $zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
@@ -158,6 +169,7 @@ jobs:
             dist/kononexus_probe.exe
             dist/kononexus_sdk_host.exe
             dist/README-TEST.txt
+            dist/QUALIFIED-BUILD.txt
             dist/SHA256SUMS.txt
             KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64.zip
             KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64.zip.sha256
@@ -184,4 +196,4 @@ jobs:
               exit 0
             }
           }
-          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe dist\SHA256SUMS.txt "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip.sha256" --clobber
+          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe dist\QUALIFIED-BUILD.txt dist\SHA256SUMS.txt "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip.sha256" --clobber
