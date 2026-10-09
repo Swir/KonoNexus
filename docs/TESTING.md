@@ -117,32 +117,29 @@ The report contains the exact local and target NodeIDs, selected path, endpoint 
 - `delivery_passed` means at least one authenticated end-to-end delivery was acknowledged;
 - `eligible_for_wan_matrix` additionally requires a selected target path and observed external endpoint evidence.
 
-Verify a copied report without trusting the machine or text editor that supplied it. For release qualification, require the complete build identity printed by the verified package:
+Verify a copied report without trusting the machine or text editor that supplied it. The qualified Windows package includes `QUALIFIED-BUILD.txt` and a helper that reads that complete build identity automatically:
 
 ```powershell
-$EXPECTED_BUILD = "0.1.0-alpha.28+git.<40-character-qualified-commit>"
-.\kononexus_probe.exe --verify-report .\KonoNexus-WAN-....json --expected-tester-build $EXPECTED_BUILD
+powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -Report .\KonoNexus-WAN-....json
 ```
 
-A valid file prints `REPORT_VALID=1`. Any changed signed field, public key, NodeID or signature causes a non-zero exit. Matrix eligibility is evidence for one endpoint only; closing a matrix row still requires reports from both physical hosts plus the tested network description. A valid local-only report remains ineligible and cannot close the WAN/NAT roadmap gate.
+A valid file prints `REPORT_VALID=1` and `QUALIFIED_BUILD_MATCH=1`. Any changed signed field, public key, NodeID, signature or tester-build mismatch causes a non-zero exit. Matrix eligibility is evidence for one endpoint only; closing a matrix row still requires reports from both physical hosts plus the tested network description. A valid local-only report remains ineligible and cannot close the WAN/NAT roadmap gate.
 
-After copying both endpoint reports to one machine, create a reciprocal matrix-row bundle:
+After copying both endpoint reports to one machine, create and immediately qualify a reciprocal matrix-row bundle:
 
 ```powershell
-.\kononexus_probe.exe --pair-report .\pc-a.json .\pc-b.json --scenario home_nat_pair --network-label "ISP A / ISP B" --pair-output .\home-nat-pair.json
-.\kononexus_probe.exe --verify-pair .\home-nat-pair.json --expected-tester-build $EXPECTED_BUILD
+powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -ReportA .\pc-a.json -ReportB .\pc-b.json -Scenario home_nat_pair -NetworkLabel "ISP A / ISP B" -PairOutput .\home-nat-pair.json -RequireEligible
 ```
 
-The supported scenarios are `same_lan`, `home_nat_pair`, `home_to_mobile`, `dual_mobile_cgnat`, `public_ipv6`, `direct_interruption`, and `restart_reconnect`. Pair creation rejects reports unless their signed local/target NodeIDs are reciprocal. `MATRIX_ROW_ELIGIBLE=1` additionally requires both endpoint reports to be WAN-eligible and no more than one hour apart. The bundle records canonical SHA-256 digests for both signed reports; its scenario and network label are operator-supplied metadata, not endpoint-signed claims. One eligible bundle documents one physical run only and never closes the full matrix by itself.
+The supported scenarios are `same_lan`, `home_nat_pair`, `home_to_mobile`, `dual_mobile_cgnat`, `public_ipv6`, `direct_interruption`, and `restart_reconnect`. Pair creation rejects reports unless their signed local/target NodeIDs are reciprocal. `-RequireEligible` returns exit code 2 unless both endpoint reports are WAN-eligible and no more than one hour apart. The bundle records canonical SHA-256 digests for both signed reports; its scenario and network label are operator-supplied metadata, not endpoint-signed claims. One eligible bundle documents one physical run only and never closes the full matrix by itself.
 
-Collect available row bundles into a deterministic manifest. Repeat `--matrix-pair` for each file; partial manifests are valid and print what is still missing:
+Collect available row bundles into a deterministic manifest. Pass their paths as one semicolon-separated string; partial manifests remain valid, while `-RequireReady` returns exit code 2 until every required row is present and eligible:
 
 ```powershell
-.\kononexus_probe.exe --matrix-pair .\same-lan.json --matrix-pair .\home-nat-pair.json --matrix-output .\wan-matrix.json
-.\kononexus_probe.exe --verify-matrix .\wan-matrix.json --expected-tester-build $EXPECTED_BUILD
+powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -PairFiles ".\same-lan.json;.\home-nat-pair.json" -MatrixOutput .\wan-matrix.json -RequireReady
 ```
 
-The pair verifier rejects reports produced by different tester builds. The manifest rejects mixed tester builds, duplicate scenarios, modified bundles and any endpoint report reused under another scenario. The optional `--expected-tester-build` guard additionally fails verification unless the signed evidence matches the exact qualified artifact build; use it for final-gate and release review. The probe prints `TESTER_BUILD` for every verified report, pair and non-empty matrix so the evidence can be matched to the qualified GitHub commit. It also prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and logs; it is not an automatic claim that the roadmap gate is closed.
+The pair verifier rejects reports produced by different tester builds. The manifest rejects mixed tester builds, duplicate scenarios, modified bundles and any endpoint report reused under another scenario. The helper always supplies the packaged exact-build guard to the probe and immediately verifies every created pair or matrix. The probe prints `TESTER_BUILD` for every verified report, pair and non-empty matrix so the evidence can be matched to the qualified GitHub commit. It also prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and logs; it is not an automatic claim that the roadmap gate is closed.
 
 ## 6. Different-network diagnostic probe test
 
