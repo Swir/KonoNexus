@@ -451,13 +451,11 @@ mod tests {
     #[test]
     fn expected_tester_build_accepts_exact_match_or_no_guard() {
         assert!(ensure_expected_tester_build(None, "0.1.0-alpha.28+git.abc").is_ok());
-        assert!(
-            ensure_expected_tester_build(
-                Some("0.1.0-alpha.28+git.abc"),
-                "0.1.0-alpha.28+git.abc"
-            )
-            .is_ok()
-        );
+        assert!(ensure_expected_tester_build(
+            Some("0.1.0-alpha.28+git.abc"),
+            "0.1.0-alpha.28+git.abc"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -472,8 +470,8 @@ mod tests {
 
     #[test]
     fn expected_tester_build_rejects_empty_guard() {
-        let error = ensure_expected_tester_build(Some(""), "0.1.0-alpha.28+git.actual")
-            .unwrap_err();
+        let error =
+            ensure_expected_tester_build(Some(""), "0.1.0-alpha.28+git.actual").unwrap_err();
         assert_eq!(error.to_string(), "expected tester build cannot be empty");
     }
 }
