@@ -652,7 +652,13 @@ impl SignedWanTestReport {
         }
 
         let metrics = &evidence.metrics;
-        if metrics.delivered + metrics.explicit_failed + metrics.timed_out != metrics.sent {
+        // Imported counters are untrusted, even before signature verification.
+        // Never panic in debug builds or accept wrapped totals in release builds.
+        let total = metrics
+            .delivered
+            .checked_add(metrics.explicit_failed)
+            .and_then(|total| total.checked_add(metrics.timed_out));
+        if total != Some(metrics.sent) {
             bail!("WAN test counters do not balance");
         }
         if !metrics.average_rtt_ms.is_finite() || metrics.average_rtt_ms < 0.0 {
@@ -884,6 +890,81 @@ mod tests {
             SignedWanTestReport::from_json_verified(&encoded).unwrap(),
             report
         );
+    }
+
+    #[test]
+    fn wan_report_rejects_signed_overflowing_counters() {
+        let identity = NodeIdentity::generate();
+        let target = NodeIdentity::generate().node_id();
+        let base = SignedWanTestReport::signed_at(
+            &identity,
+            &target,
+            &snapshot(target.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+            10,
+            10,
+            0,
+            2.0,
+            "test",
+            123,
+        )
+        .unwrap();
+
+        // Each total wraps back to sent with unchecked release arithmetic.
+        // Re-sign so a signature mismatch cannot hide acceptance of bad counters.
+        for (sent, delivered, explicit_failed, timed_out) in [
+            (9, usize::MAX, 1, 9),
+            (0, 1, 0, usize::MAX),
+            (usize::MAX, usize::MAX, usize::MAX, 1),
+        ] {
+            let mut report = base.clone();
+            report.evidence.metrics = WanTestMetrics {
+                sent,
+                delivered,
+                explicit_failed,
+                timed_out,
+                average_rtt_ms: 2.0,
+                packet_loss_percent: if sent == 0 { 100.0 } else { 0.0 },
+            };
+            let payload = serde_json::to_vec(&report.evidence).unwrap();
+            report.signature = hex::encode(identity.sign(&payload));
+
+            let error = report.verify().unwrap_err();
+            assert!(error.to_string().contains("counters do not balance"));
+            let encoded = serde_json::to_string(&report).unwrap();
+            assert!(SignedWanTestReport::from_json_verified(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn wan_report_accepts_balanced_counter_boundaries() {
+        let identity = NodeIdentity::generate();
+        let target = NodeIdentity::generate().node_id();
+        for (sent, delivered, explicit_failed) in [
+            (0, 0, 0),
+            (usize::MAX, usize::MAX, 0),
+            (usize::MAX, 0, usize::MAX),
+            (usize::MAX, 0, 0),
+            (usize::MAX, usize::MAX - 2, 1),
+        ] {
+            let report = SignedWanTestReport::signed_at(
+                &identity,
+                &target,
+                &snapshot(target.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+                sent,
+                delivered,
+                explicit_failed,
+                2.0,
+                "test",
+                123,
+            )
+            .unwrap();
+            report.verify().unwrap();
+            let encoded = report.to_pretty_json().unwrap();
+            assert_eq!(
+                SignedWanTestReport::from_json_verified(&encoded).unwrap(),
+                report
+            );
+        }
     }
 
     #[test]
