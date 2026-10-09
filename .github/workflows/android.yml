@@ -76,10 +76,8 @@ jobs:
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path "*/bin/sdkmanager" | sort -V | tail -1)"
           test -x "$SDKMANAGER"
           echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK_ROOT/emulator" >> "$GITHUB_PATH"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" "platforms;android-35" "platform-tools" "emulator" "system-images;android-35;default;x86_64" "ndk;27.2.12479018"
+          "$SDKMANAGER" "platforms;android-35" "platform-tools" "ndk;27.2.12479018"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
@@ -102,6 +100,23 @@ jobs:
           unzip -l android/bridge/build/outputs/aar/bridge-release.aar > aar-contents.txt
           grep -Fq "classes.jar" aar-contents.txt
           grep -Fq "jni/x86_64/libkononexus.so" aar-contents.txt
+      - name: Assemble instrumentation APK before emulator boot
+        working-directory: android
+        run: gradle --no-daemon :bridge:assembleDebugAndroidTest
+      - name: Ignore the emulator runner's premature unlock only
+        run: |
+          mkdir -p "$RUNNER_TEMP/kononexus-adb"
+          printf '%s\n'             '#!/usr/bin/env bash'             'if [ "$#" -eq 6 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "input" ] && [ "$5" = "keyevent" ] && [ "$6" = "82" ]; then exit 0; fi'             'exec "$ANDROID_SDK_ROOT/platform-tools/adb" "$@"'             > "$RUNNER_TEMP/kononexus-adb/adb"
+          chmod +x "$RUNNER_TEMP/kononexus-adb/adb"
+          echo "$RUNNER_TEMP/kononexus-adb" >> "$GITHUB_PATH"
+      - name: Run native transport on API 35 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: false
+          script: adb wait-for-device; ready=0; for attempt in $(seq 1 120); do if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then sleep 5; if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then ready=1; break; fi; fi; sleep 3; done; test "$ready" = 1 && cd android && gradle --no-daemon :bridge:connectedDebugAndroidTest
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
@@ -109,55 +124,12 @@ jobs:
           path: android/bridge/build/outputs/aar/bridge-release.aar
           if-no-files-found: error
           retention-days: 90
-      - name: Assemble instrumentation APK before emulator boot
-        working-directory: android
-        run: gradle --no-daemon :bridge:assembleDebugAndroidTest
-      - name: Run native transport on API 35 emulator
-        timeout-minutes: 18
-        run: |
-          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          AVDMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path "*/bin/avdmanager" | sort -V | tail -1)"
-          test -x "$AVDMANAGER"
-          command -v adb
-          echo no | "$AVDMANAGER" create avd --force --name kononexus-ci --package "system-images;android-35;default;x86_64" --device pixel_6
-          accel=()
-          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            accel=(-accel off)
-          fi
-          nohup "$SDK_ROOT/emulator/emulator" -avd kononexus-ci -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -memory 2048 -cores 2 "${accel[@]}" > emulator.log 2>&1 &
-          echo "$!" > emulator.pid
-          adb wait-for-device
-          ready=0
-          stable=0
-          for attempt in $(seq 1 180); do
-            if adb shell getprop sys.boot_completed 2>/dev/null | grep -qx "1"                 && adb shell pm path android >/dev/null 2>&1                 && adb shell am get-current-user >/dev/null 2>&1; then
-              stable=$((stable + 1))
-              if [ "$stable" -ge 3 ]; then
-                ready=1
-                break
-              fi
-            else
-              stable=0
-            fi
-            sleep 5
-          done
-          test "$ready" = 1
-          cd android
-          gradle --no-daemon :bridge:connectedDebugAndroidTest
-      - name: Stop emulator
-        if: always()
-        run: |
-          adb emu kill || true
-          if [ -f emulator.pid ]; then
-            wait "$(cat emulator.pid)" || true
-          fi
       - name: Upload emulator reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: KonoNexus-Android-emulator-reports
           path: |
-            emulator.log
             android/bridge/build/reports/androidTests/connected/**
             android/bridge/build/outputs/androidTest-results/connected/**
           if-no-files-found: warn
