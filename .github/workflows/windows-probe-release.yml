@@ -10,6 +10,14 @@ on:
       - "assets/kononexus-tester.ico"
       - "src/**"
       - ".github/workflows/windows-probe-release.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "assets/kononexus-tester.ico"
+      - "src/**"
+      - ".github/workflows/windows-probe-release.yml"
   workflow_dispatch:
 
 permissions:
@@ -135,7 +143,8 @@ jobs:
             "$hash *$([IO.Path]::GetFileName($payload))"
           }
           $checksumLines | Set-Content -Encoding ASCII dist\SHA256SUMS.txt
-          Compress-Archive -Path $payloads,dist\README-TEST.txt,dist\SHA256SUMS.txt -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
+          $archiveInputs = $payloads + @("dist\README-TEST.txt", "dist\SHA256SUMS.txt")
+          Compress-Archive -Path $archiveInputs -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
           $zip = "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip"
           $zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           "$zipHash *$zip" | Set-Content -Encoding ASCII "$zip.sha256"
@@ -155,6 +164,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish prerelease assets
+        if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
