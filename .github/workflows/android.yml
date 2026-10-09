@@ -10,6 +10,7 @@ on:
       - "android/**"
       - "docs/ANDROID-TRANSPORT.md"
       - ".github/workflows/android.yml"
+      - ".github/scripts/run-android-emulator.sh"
   pull_request:
     paths:
       - "Cargo.toml"
@@ -19,6 +20,7 @@ on:
       - "android/**"
       - "docs/ANDROID-TRANSPORT.md"
       - ".github/workflows/android.yml"
+      - ".github/scripts/run-android-emulator.sh"
 
 permissions:
   contents: read
@@ -126,41 +128,7 @@ jobs:
           ram-size: 2048M
           heap-size: 512M
           disable-animations: false
-          script: |
-            adb wait-for-device
-            ready=0
-            for attempt in $(seq 1 120); do
-              if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then
-                sleep 5
-                if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then
-                  ready=1
-                  break
-                fi
-              fi
-              sleep 3
-            done
-            test "$ready" = 1
-            mkdir -p android/bridge/build/outputs/androidTest-results/connected
-            adb logcat -c || true
-            cd android
-            set +e
-            gradle --no-daemon :bridge:connectedDebugAndroidTest > "$RUNNER_TEMP/kononexus-instrumentation-1.log" 2>&1
-            first_status=$?
-            set -e
-            cat "$RUNNER_TEMP/kononexus-instrumentation-1.log"
-            if [ "$first_status" -eq 0 ]; then
-              exit 0
-            fi
-            if ! grep -Fq "Instrumentation run failed due to Process crashed." "$RUNNER_TEMP/kononexus-instrumentation-1.log"; then
-              exit "$first_status"
-            fi
-            cd ..
-            adb logcat -d -v threadtime > android/bridge/build/outputs/androidTest-results/connected/process-crash-logcat.txt || true
-            adb shell pm clear com.swir.kononexus.test || true
-            adb shell pm clear com.swir.kononexus || true
-            sleep 5
-            cd android
-            gradle --no-daemon :bridge:connectedDebugAndroidTest
+          script: bash .github/scripts/run-android-emulator.sh
       - name: Upload emulator reports
         if: always()
         uses: actions/upload-artifact@v4
