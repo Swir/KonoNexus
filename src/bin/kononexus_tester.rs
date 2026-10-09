@@ -16,6 +16,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::time;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_COMMIT: Option<&str> = option_env!("KONONEXUS_BUILD_COMMIT");
 const TEST_SAMPLE_COUNT: usize = 10;
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -865,7 +866,7 @@ async fn worker(
                         delivered,
                         active.failed,
                         rtt_ms,
-                        APP_VERSION,
+                        &evidence_tester_version(),
                     )?;
                     let packet_loss = report.evidence.metrics.packet_loss_percent;
                     let wan_matrix_eligible = report.evidence.eligible_for_wan_matrix;
@@ -881,6 +882,13 @@ async fn worker(
                 }
             }
         }
+    }
+}
+
+fn evidence_tester_version() -> String {
+    match BUILD_COMMIT {
+        Some(commit) if !commit.is_empty() => format!("{APP_VERSION}+git.{commit}"),
+        _ => APP_VERSION.to_owned(),
     }
 }
 

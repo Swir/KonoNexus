@@ -224,6 +224,9 @@ impl WanTestPairBundle {
         validate_network_label(&self.network_label)?;
         self.report_a.verify().context("invalid pair report A")?;
         self.report_b.verify().context("invalid pair report B")?;
+        if self.report_a.evidence.tester_version != self.report_b.evidence.tester_version {
+            bail!("WAN pair reports must come from the same tester build");
+        }
         if !reports_are_reciprocal(&self.report_a, &self.report_b) || !self.reciprocal_node_ids {
             bail!("WAN pair reports do not contain reciprocal NodeIDs");
         }
@@ -346,9 +349,17 @@ impl WanTestMatrixManifest {
 
         let mut seen_scenarios = BTreeSet::new();
         let mut seen_reports = BTreeSet::new();
+        let mut tester_version = None;
         let mut previous_scenario = None;
         for (bundle, digest) in self.bundles.iter().zip(&self.bundle_sha256) {
             bundle.verify()?;
+            for report in [&bundle.report_a, &bundle.report_b] {
+                let version = report.evidence.tester_version.as_str();
+                if tester_version.is_some_and(|expected| expected != version) {
+                    bail!("WAN matrix mixes reports from different tester builds");
+                }
+                tester_version.get_or_insert(version);
+            }
             if previous_scenario.is_some_and(|previous| previous >= bundle.scenario) {
                 bail!("WAN matrix bundles must use canonical scenario order");
             }
@@ -611,6 +622,12 @@ impl SignedWanTestReport {
         {
             bail!("unsupported WAN test report schema");
         }
+        if evidence.tester_version.trim().is_empty()
+            || evidence.tester_version.len() > 128
+            || evidence.tester_version.chars().any(char::is_control)
+        {
+            bail!("tester version must contain 1-128 printable bytes");
+        }
         validate_node_id(&evidence.local_node_id)?;
         validate_node_id(&evidence.target_node_id)?;
         if evidence.local_node_id == evidence.target_node_id {
@@ -777,6 +794,15 @@ mod tests {
         generated_a: u64,
         generated_b: u64,
     ) -> (SignedWanTestReport, SignedWanTestReport) {
+        reciprocal_reports_for_builds(generated_a, generated_b, "test", "test")
+    }
+
+    fn reciprocal_reports_for_builds(
+        generated_a: u64,
+        generated_b: u64,
+        tester_version_a: &str,
+        tester_version_b: &str,
+    ) -> (SignedWanTestReport, SignedWanTestReport) {
         let identity_a = NodeIdentity::generate();
         let identity_b = NodeIdentity::generate();
         let node_a = identity_a.node_id();
@@ -789,7 +815,7 @@ mod tests {
             9,
             1,
             42.5,
-            "test",
+            tester_version_a,
             generated_a,
         )
         .unwrap();
@@ -801,7 +827,7 @@ mod tests {
             10,
             0,
             38.0,
-            "test",
+            tester_version_b,
             generated_b,
         )
         .unwrap();
@@ -809,7 +835,20 @@ mod tests {
     }
 
     fn eligible_bundle(scenario: WanTestScenario, generated: u64) -> WanTestPairBundle {
-        let (report_a, report_b) = reciprocal_reports(generated, generated + 1_000);
+        eligible_bundle_for_build(scenario, generated, "test")
+    }
+
+    fn eligible_bundle_for_build(
+        scenario: WanTestScenario,
+        generated: u64,
+        tester_version: &str,
+    ) -> WanTestPairBundle {
+        let (report_a, report_b) = reciprocal_reports_for_builds(
+            generated,
+            generated + 1_000,
+            tester_version,
+            tester_version,
+        );
         WanTestPairBundle::at(
             report_a,
             report_b,
@@ -910,6 +949,22 @@ mod tests {
             WanTestPairBundle::from_json_verified(&encoded).unwrap(),
             bundle
         );
+    }
+
+    #[test]
+    fn wan_pair_rejects_reports_from_different_tester_builds() {
+        let (report_a, report_b) =
+            reciprocal_reports_for_builds(1_000, 2_000, "alpha.28+git.aaaa", "alpha.28+git.bbbb");
+        let error = WanTestPairBundle::at(
+            report_a,
+            report_b,
+            WanTestScenario::HomeNatPair,
+            "ISP A / ISP B",
+            3_000,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("same tester build"));
     }
 
     #[test]
@@ -1031,6 +1086,16 @@ mod tests {
         relabeled.scenario = WanTestScenario::HomeNatPair;
         relabeled.verify().unwrap();
         assert!(WanTestMatrixManifest::at(vec![first, relabeled], 20_000).is_err());
+    }
+
+    #[test]
+    fn wan_matrix_rejects_reports_from_different_tester_builds() {
+        let first = eligible_bundle_for_build(WanTestScenario::SameLan, 1_000, "alpha.28+git.aaaa");
+        let second =
+            eligible_bundle_for_build(WanTestScenario::HomeNatPair, 10_000, "alpha.28+git.bbbb");
+
+        let error = WanTestMatrixManifest::at(vec![first, second], 20_000).unwrap_err();
+        assert!(error.to_string().contains("different tester builds"));
     }
 
     #[test]

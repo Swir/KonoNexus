@@ -10,6 +10,14 @@ on:
       - "assets/kononexus-tester.ico"
       - "src/**"
       - ".github/workflows/windows-probe-release.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "assets/kononexus-tester.ico"
+      - "src/**"
+      - ".github/workflows/windows-probe-release.yml"
   workflow_dispatch:
 
 permissions:
@@ -21,6 +29,7 @@ jobs:
     runs-on: windows-latest
     env:
       RUSTFLAGS: "-C target-feature=+crt-static"
+      KONONEXUS_BUILD_COMMIT: ${{ github.sha }}
 
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +133,21 @@ jobs:
           Test procedure:
           https://github.com/Swir/KonoNexus/blob/main/docs/TESTING.md
           "@ | Set-Content -Encoding UTF8 dist\README-TEST.txt
-          Compress-Archive -Path dist\KonoNexus-Network-Tester.exe,dist\kononexus_probe.exe,dist\kononexus_sdk_host.exe,dist\README-TEST.txt -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
+          $payloads = @(
+            "dist\KonoNexus-Network-Tester.exe",
+            "dist\kononexus_probe.exe",
+            "dist\kononexus_sdk_host.exe"
+          )
+          $checksumLines = foreach ($payload in $payloads) {
+            $hash = (Get-FileHash -Algorithm SHA256 $payload).Hash.ToLowerInvariant()
+            "$hash *$([IO.Path]::GetFileName($payload))"
+          }
+          $checksumLines | Set-Content -Encoding ASCII dist\SHA256SUMS.txt
+          $archiveInputs = $payloads + @("dist\README-TEST.txt", "dist\SHA256SUMS.txt")
+          Compress-Archive -Path $archiveInputs -DestinationPath "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" -Force
+          $zip = "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip"
+          $zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$zipHash *$zip" | Set-Content -Encoding ASCII "$zip.sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -135,10 +158,13 @@ jobs:
             dist/kononexus_probe.exe
             dist/kononexus_sdk_host.exe
             dist/README-TEST.txt
+            dist/SHA256SUMS.txt
             KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64.zip
+            KonoNexus-${{ steps.package_version.outputs.version }}-Network-Tester-Windows-x64.zip.sha256
           if-no-files-found: error
 
       - name: Publish prerelease assets
+        if: github.event_name != 'pull_request'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -158,4 +184,4 @@ jobs:
               exit 0
             }
           }
-          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" --clobber
+          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe dist\SHA256SUMS.txt "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip.sha256" --clobber
