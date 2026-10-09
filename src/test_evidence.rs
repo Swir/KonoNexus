@@ -843,8 +843,12 @@ mod tests {
         generated: u64,
         tester_version: &str,
     ) -> WanTestPairBundle {
-        let (report_a, report_b) =
-            reciprocal_reports_for_builds(generated, generated + 1_000, tester_version, tester_version);
+        let (report_a, report_b) = reciprocal_reports_for_builds(
+            generated,
+            generated + 1_000,
+            tester_version,
+            tester_version,
+        );
         WanTestPairBundle::at(
             report_a,
             report_b,
@@ -1086,13 +1090,9 @@ mod tests {
 
     #[test]
     fn wan_matrix_rejects_reports_from_different_tester_builds() {
-        let first =
-            eligible_bundle_for_build(WanTestScenario::SameLan, 1_000, "alpha.28+git.aaaa");
-        let second = eligible_bundle_for_build(
-            WanTestScenario::HomeNatPair,
-            10_000,
-            "alpha.28+git.bbbb",
-        );
+        let first = eligible_bundle_for_build(WanTestScenario::SameLan, 1_000, "alpha.28+git.aaaa");
+        let second =
+            eligible_bundle_for_build(WanTestScenario::HomeNatPair, 10_000, "alpha.28+git.bbbb");
 
         let error = WanTestMatrixManifest::at(vec![first, second], 20_000).unwrap_err();
         assert!(error.to_string().contains("different tester builds"));
