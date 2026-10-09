@@ -9,6 +9,7 @@ on:
       - "build.rs"
       - "assets/kononexus-tester.ico"
       - "src/**"
+      - "scripts/Verify-KonoNexusEvidence.ps1"
       - ".github/workflows/windows-probe-release.yml"
   pull_request:
     paths:
@@ -17,6 +18,7 @@ on:
       - "build.rs"
       - "assets/kononexus-tester.ico"
       - "src/**"
+      - "scripts/Verify-KonoNexusEvidence.ps1"
       - ".github/workflows/windows-probe-release.yml"
   workflow_dispatch:
 
