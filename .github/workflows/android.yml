@@ -10,6 +10,7 @@ on:
       - "android/**"
       - "docs/ANDROID-TRANSPORT.md"
       - ".github/workflows/android.yml"
+      - ".github/scripts/run-android-emulator.sh"
   pull_request:
     paths:
       - "Cargo.toml"
@@ -19,6 +20,7 @@ on:
       - "android/**"
       - "docs/ANDROID-TRANSPORT.md"
       - ".github/workflows/android.yml"
+      - ".github/scripts/run-android-emulator.sh"
 
 permissions:
   contents: read
@@ -103,14 +105,6 @@ jobs:
       - name: Assemble instrumentation APK before emulator boot
         working-directory: android
         run: gradle --no-daemon :bridge:assembleDebugAndroidTest
-      - name: Run native transport on API 35 emulator
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 35
-          arch: x86_64
-          profile: pixel_6
-          disable-animations: false
-          script: adb wait-for-device; ready=0; for attempt in $(seq 1 120); do if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then sleep 5; if adb shell pm path android >/dev/null 2>&1 && adb shell am get-current-user >/dev/null 2>&1; then ready=1; break; fi; fi; sleep 3; done; test "$ready" = 1 && cd android && gradle --no-daemon :bridge:connectedDebugAndroidTest
       - name: Upload AAR
         uses: actions/upload-artifact@v4
         with:
@@ -118,6 +112,23 @@ jobs:
           path: android/bridge/build/outputs/aar/bridge-release.aar
           if-no-files-found: error
           retention-days: 90
+      - name: Ignore the emulator runner's premature unlock only
+        run: |
+          mkdir -p "$RUNNER_TEMP/kononexus-adb"
+          printf '%s\n'             '#!/usr/bin/env bash'             'if [ "$#" -eq 6 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "input" ] && [ "$5" = "keyevent" ] && [ "$6" = "82" ]; then exit 0; fi'             'exec "$ANDROID_SDK_ROOT/platform-tools/adb" "$@"'             > "$RUNNER_TEMP/kononexus-adb/adb"
+          chmod +x "$RUNNER_TEMP/kononexus-adb/adb"
+          echo "$RUNNER_TEMP/kononexus-adb" >> "$GITHUB_PATH"
+      - name: Run native transport on API 35 emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_2
+          cores: 2
+          ram-size: 2048M
+          heap-size: 512M
+          disable-animations: false
+          script: bash .github/scripts/run-android-emulator.sh
       - name: Upload emulator reports
         if: always()
         uses: actions/upload-artifact@v4
