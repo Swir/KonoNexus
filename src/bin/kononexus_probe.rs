@@ -105,6 +105,7 @@ async fn run() -> Result<()> {
             "REPORT_SCHEMA={}@{}",
             report.evidence.domain, report.evidence.version
         );
+        println!("TESTER_BUILD={}", report.evidence.tester_version);
         println!("LOCAL_NODE_ID={}", report.evidence.local_node_id);
         println!("TARGET_NODE_ID={}", report.evidence.target_node_id);
         println!(
@@ -129,6 +130,7 @@ async fn run() -> Result<()> {
         let bundle = WanTestPairBundle::read_verified(path)?;
         println!("PAIR_VALID=1");
         println!("PAIR_SCHEMA={}@{}", bundle.domain, bundle.version);
+        println!("TESTER_BUILD={}", bundle.report_a.evidence.tester_version);
         println!("SCENARIO={}", bundle.scenario);
         println!("NETWORK_LABEL={}", bundle.network_label);
         println!("NODE_A={}", bundle.report_a.evidence.local_node_id);
@@ -147,6 +149,14 @@ async fn run() -> Result<()> {
         let manifest = WanTestMatrixManifest::read_verified(path)?;
         println!("MATRIX_VALID=1");
         println!("MATRIX_SCHEMA={}@{}", manifest.domain, manifest.version);
+        println!(
+            "TESTER_BUILD={}",
+            manifest
+                .bundles
+                .first()
+                .map(|bundle| bundle.report_a.evidence.tester_version.as_str())
+                .unwrap_or("none")
+        );
         println!("BUNDLE_COUNT={}", manifest.bundles.len());
         println!(
             "MISSING_SCENARIOS={}",
