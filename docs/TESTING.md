@@ -112,7 +112,7 @@ After every completed GUI test, the tester atomically writes a signed JSON repor
 %LOCALAPPDATA%\KonoNexus\NetworkTester\reports
 ```
 
-The report contains the exact local and target NodeIDs, selected path, endpoint and NAT evidence, sample counters, RTT, packet loss and two separate verdicts:
+The report contains the exact local and target NodeIDs, selected path, endpoint and NAT evidence, sample counters, RTT, packet loss and two separate verdicts. Official GitHub-built testers also bind the signed `tester_version` to the complete source commit as `<version>+git.<40-character SHA>`:
 
 - `delivery_passed` means at least one authenticated end-to-end delivery was acknowledged;
 - `eligible_for_wan_matrix` additionally requires a selected target path and observed external endpoint evidence.
@@ -141,7 +141,7 @@ Collect available row bundles into a deterministic manifest. Repeat `--matrix-pa
 .\kononexus_probe.exe --verify-matrix .\wan-matrix.json
 ```
 
-The manifest rejects duplicate scenarios, modified bundles and any endpoint report reused under another scenario. It prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and logs; it is not an automatic claim that the roadmap gate is closed.
+The pair verifier rejects reports produced by different tester builds. The manifest rejects mixed tester builds, duplicate scenarios, modified bundles and any endpoint report reused under another scenario. The probe prints `TESTER_BUILD` for every verified report, pair and non-empty matrix so the evidence can be matched to the qualified GitHub commit. It also prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and logs; it is not an automatic claim that the roadmap gate is closed.
 
 ## 6. Different-network diagnostic probe test
 
