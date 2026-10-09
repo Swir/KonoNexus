@@ -444,7 +444,6 @@ fn default_identity_path() -> Result<PathBuf> {
         .join("kononexus-probe.key"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::ensure_expected_tester_build;
@@ -463,9 +462,11 @@ mod tests {
 
     #[test]
     fn expected_tester_build_rejects_mismatch() {
-        let error =
-            ensure_expected_tester_build(Some("0.1.0-alpha.28+git.expected"), "0.1.0-alpha.28+git.actual")
-                .unwrap_err();
+        let error = ensure_expected_tester_build(
+            Some("0.1.0-alpha.28+git.expected"),
+            "0.1.0-alpha.28+git.actual",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("tester build mismatch"));
     }
 
