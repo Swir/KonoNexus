@@ -97,8 +97,19 @@ Use `KonoNexus-Network-Tester.exe` for the normal two-PC test:
 
 1. Start the tester on PC A and click **Kopiuj invite**.
 2. Transfer the single `KNX1...` code to PC B.
-3. On PC B click **Wklej invite**, then **Połącz** and **START TESTU WAN**.
-4. The GUI reports `DIRECT`, `UDP HOLE PUNCH`, or `RELAY`, authenticated delivery RTT, delivery loss, NAT/endpoint evidence, NodeIDs, and a technical log.
+3. On PC B click **Wklej invite**, then **Połącz**.
+4. After both GUIs show the peer, click **START TESTU WAN** on both PCs. Each endpoint writes its own signed report; a one-sided run is not a reciprocal matrix row.
+5. The GUI reports `DIRECT`, `UDP HOLE PUNCH`, or `RELAY`, authenticated delivery RTT, delivery loss, NAT/endpoint evidence, NodeIDs, and a technical log.
+
+For the `public_ipv6` row, start the same qualified executable on **both** physical endpoints with an IPv6 bind:
+
+```powershell
+.\KonoNexus-Network-Tester.exe --bind "[::]:47000"
+```
+
+Both hosts must have independently verified public IPv6 connectivity and must allow inbound and outbound UDP 47000 in the host and network firewalls. The default launch remains IPv4-only. One process owns one UDP address family; this option does not claim simultaneous dual-stack operation.
+
+The pair verifier checks signatures and reciprocal eligibility, but the `public_ipv6` scenario name is operator metadata. Before accepting this row, manually confirm in **both** signed reports that `evidence.path.method` is `direct`, `evidence.path.endpoint` is a native IPv6 socket address, and `evidence.nat.observed_external_endpoint` is a public native IPv6 socket address. IPv4, IPv4-mapped IPv6, relay, private/ULA, or missing endpoint evidence does not close this row.
 
 The invite is signed with the node's Ed25519 identity and contains no private key. It expires after 24 hours. A modified or malformed invite is rejected before dialing.
 
@@ -139,7 +150,9 @@ Collect available row bundles into a deterministic manifest. Pass their paths as
 powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -PairFiles ".\same-lan.json;.\home-nat-pair.json" -MatrixOutput .\wan-matrix.json -RequireReady
 ```
 
-The pair verifier rejects reports produced by different tester builds. The manifest rejects mixed tester builds, duplicate scenarios, modified bundles and any endpoint report reused under another scenario. The helper always supplies the packaged exact-build guard to the probe and immediately verifies every created pair or matrix. The probe prints `TESTER_BUILD` for every verified report, pair and non-empty matrix so the evidence can be matched to the qualified GitHub commit. It also prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and logs; it is not an automatic claim that the roadmap gate is closed.
+The pair verifier rejects reports produced by different tester builds. The manifest rejects mixed tester builds, duplicate scenarios, modified bundles and any endpoint report reused under another scenario. The helper always supplies the packaged exact-build guard to the probe and immediately verifies every created pair or matrix. The probe prints `TESTER_BUILD` for every verified report, pair and non-empty matrix so the evidence can be matched to the qualified GitHub commit. It also prints `MISSING_SCENARIOS`, `INELIGIBLE_SCENARIOS` and `MANUAL_REVIEW_READY`. Readiness becomes `1` only when all seven scenarios contain separate eligible report pairs. This means the set is ready for human inspection of the physical hosts, carriers, router/NAT setup and captures; it is not an automatic claim that the roadmap gate is closed.
+
+Version-1 reports do not contain a shared signed run/session identifier. `PAIR_VALID=1` therefore proves signature, build, reciprocal NodeID, eligibility and timestamp-skew consistency, but not by itself that the two files came from one jointly observed physical run. For every accepted row, record one operator run ID, synchronized UTC start/end times, the exact network setup and hashes of both GUI captures; visually confirm both endpoints participated in that same run. Never pair reports only because the verifier accepts them.
 
 ## 6. Different-network diagnostic probe test
 
@@ -176,11 +189,11 @@ Run separate tests for:
 2. two normal home NATs,
 3. home network ↔ mobile hotspot,
 4. two mobile/CGNAT-style networks,
-5. public IPv6 where available,
+5. public IPv6 where available (run both testers with `--bind "[::]:47000"`),
 6. direct path interrupted after connection to observe relay fallback,
 7. restart/reconnect using persisted routing hints.
 
-For each test save logs from both endpoints.
+For each test save the signed JSON report from both endpoints and capture the visible technical log from both GUIs with screenshots or a screen recording. For `direct_interruption`, the capture must show the path before and after the deliberate interruption because the signed report records the final evidence, not the complete on-screen migration history.
 
 ## 8. Firewall
 
@@ -212,6 +225,6 @@ The harness registers only its exact ephemeral loopback socket addresses under a
 
 CI also exercises the bounded exact-candidate planner: deduplication and the three-endpoint cap, exact supplied-port preservation, stagger/TTL exhaustion, cross-NodeID rejection, global target-state bounds, cancellation after encrypted-session confirmation, and rendezvous-round exhaustion before relay eligibility. These checks prove deterministic logic and admission invariants; they do not prove that any candidate traverses a real NAT or CGNAT.
 
-The exact-candidate planner now places supplied native IPv6 endpoints before IPv4 candidates before deduplication and the three-endpoint cap. Explicit connect hints and independently attested DHT endpoints use the same ordering, with IPv4-mapped IPv6 ranked as IPv4. When mixed-family input exceeds the initial three-candidate cap, one slot is reserved for an exact IPv4 fallback. Explicit hints preserve supplied endpoints and ports; unusable addresses are rejected, including IPv6 link-local hints without an interface scope. DHT candidates must pass record validation and exact endpoint attestation before ordering. This is ordering groundwork only: the runtime still has one bound UDP socket and publishes one observed endpoint, so these checks do not establish dual-stack availability or close the public IPv6 direct-path validation item.
+The exact-candidate planner now places supplied native IPv6 endpoints before IPv4 candidates before deduplication and the three-endpoint cap. Explicit connect hints and independently attested DHT endpoints use the same ordering, with IPv4-mapped IPv6 ranked as IPv4. When mixed-family input exceeds the initial three-candidate cap, one slot is reserved for an exact IPv4 fallback. Explicit hints preserve supplied endpoints and ports; unusable addresses are rejected, including IPv6 link-local hints without an interface scope. DHT candidates must pass record validation and exact endpoint attestation before ordering. The runtime still owns one bound UDP socket and publishes one observed endpoint. The tester can deliberately select IPv4 or IPv6 for a process, but local checks do not establish simultaneous dual-stack availability or close the real public IPv6 validation row.
 
 It does **not** prove success through every real NAT, CGNAT, carrier firewall, or router. The external tests above are the next required validation stage before calling the networking foundation stable.

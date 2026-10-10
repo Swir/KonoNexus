@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use kononexus::{
     FilterCellStatus, InviteCode, KonofixSdkConfig, KonofixTransport, NatFilteringEvidence,
@@ -8,7 +9,7 @@ use kononexus::{
     SignedWanTestReport,
 };
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -19,6 +20,14 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_COMMIT: Option<&str> = option_env!("KONONEXUS_BUILD_COMMIT");
 const TEST_SAMPLE_COUNT: usize = 10;
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Parser)]
+#[command(version, about = "KonoNexus two-endpoint WAN network tester")]
+struct TesterArgs {
+    /// UDP address used by the KonoNexus runtime (use [::]:47000 for native IPv6).
+    #[arg(long, default_value = "0.0.0.0:47000")]
+    bind: SocketAddr,
+}
 
 #[derive(Debug)]
 enum Command {
@@ -31,6 +40,7 @@ enum WorkerEvent {
     Ready {
         node_id: String,
         invite: String,
+        bind_addr: SocketAddr,
     },
     InviteUpdated(String),
     Target(String),
@@ -93,6 +103,7 @@ struct TesterApp {
     clipboard: Option<arboard::Clipboard>,
     status: UiStatus,
     node_id: String,
+    bind_addr: Option<SocketAddr>,
     target_node_id: Option<String>,
     invite: String,
     invite_input: String,
@@ -117,6 +128,7 @@ impl TesterApp {
             clipboard: arboard::Clipboard::new().ok(),
             status: UiStatus::Starting,
             node_id: String::new(),
+            bind_addr: None,
             target_node_id: None,
             invite: String::new(),
             invite_input: String::new(),
@@ -132,11 +144,18 @@ impl TesterApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                WorkerEvent::Ready { node_id, invite } => {
+                WorkerEvent::Ready {
+                    node_id,
+                    invite,
+                    bind_addr,
+                } => {
                     self.node_id = node_id;
                     self.invite = invite;
+                    self.bind_addr = Some(bind_addr);
                     self.status = UiStatus::Waiting;
-                    self.push_log("Runtime KNP uruchomiony; oczekiwanie na drugi komputer.");
+                    self.push_log(format!(
+                        "Runtime KNP uruchomiony na {bind_addr}; oczekiwanie na drugi komputer."
+                    ));
                 }
                 WorkerEvent::InviteUpdated(invite) => {
                     self.invite = invite;
@@ -283,6 +302,10 @@ impl eframe::App for TesterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
         ctx.request_repaint_after(Duration::from_millis(100));
+        let bind_label = self
+            .bind_addr
+            .map(|addr| format!("UDP {addr}"))
+            .unwrap_or_else(|| "UDP —".to_owned());
 
         egui::CentralPanel::default()
             .frame(
@@ -308,9 +331,11 @@ impl eframe::App for TesterApp {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new(format!("{APP_VERSION}  •  Windows x64  •  UDP 47000"))
-                                .size(11.0)
-                                .color(Color32::from_rgb(122, 139, 171)),
+                            RichText::new(format!(
+                                "{APP_VERSION}  •  Windows x64  •  {bind_label}"
+                            ))
+                            .size(11.0)
+                            .color(Color32::from_rgb(122, 139, 171)),
                         );
                     });
                 });
@@ -686,7 +711,10 @@ fn filter_cell_label(status: FilterCellStatus) -> &'static str {
     }
 }
 
-fn spawn_worker(event_tx: Sender<WorkerEvent>) -> tokio_mpsc::UnboundedSender<Command> {
+fn spawn_worker(
+    event_tx: Sender<WorkerEvent>,
+    bind_addr: SocketAddr,
+) -> tokio_mpsc::UnboundedSender<Command> {
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("kononexus-network-runtime".into())
@@ -696,7 +724,9 @@ fn spawn_worker(event_tx: Sender<WorkerEvent>) -> tokio_mpsc::UnboundedSender<Co
                 .build();
             match runtime {
                 Ok(runtime) => {
-                    if let Err(error) = runtime.block_on(worker(command_rx, event_tx.clone())) {
+                    if let Err(error) =
+                        runtime.block_on(worker(command_rx, event_tx.clone(), bind_addr))
+                    {
                         let _ = event_tx.send(WorkerEvent::Error(format!("{error:#}")));
                     }
                 }
@@ -714,6 +744,7 @@ fn spawn_worker(event_tx: Sender<WorkerEvent>) -> tokio_mpsc::UnboundedSender<Co
 async fn worker(
     mut command_rx: tokio_mpsc::UnboundedReceiver<Command>,
     event_tx: Sender<WorkerEvent>,
+    bind_addr: SocketAddr,
 ) -> Result<()> {
     let state_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -723,18 +754,20 @@ async fn worker(
     let identity_path = state_dir.join("identity.key");
     let identity = NodeIdentity::load_or_create(&identity_path)?;
     let node_id = identity.node_id();
-    let endpoints = local_invite_endpoints(47000);
-    let invite = InviteCode::signed(&identity, endpoints)?.encode()?;
 
     let config = KonofixSdkConfig::new(identity_path.clone())
-        .with_bind("0.0.0.0:47000".parse().unwrap())
+        .with_bind(bind_addr)
         .with_routing_cache(state_dir.join("routing-cache.json"))
         .with_event_capacity(256);
     let mut transport = KonofixTransport::spawn(config).await?;
+    let bound_addr = transport.local_addr();
+    let endpoints = local_invite_endpoints(bound_addr);
+    let invite = InviteCode::signed(&identity, endpoints)?.encode()?;
     event_tx
         .send(WorkerEvent::Ready {
             node_id: node_id.clone(),
             invite,
+            bind_addr: bound_addr,
         })
         .ok();
 
@@ -816,7 +849,7 @@ async fn worker(
                     last_external = snapshot.observed_external_endpoint;
                     if let Some(external) = last_external {
                         let identity = NodeIdentity::load_or_create(&identity_path)?;
-                        let mut endpoints = local_invite_endpoints(snapshot.local_addr.port());
+                        let mut endpoints = local_invite_endpoints(snapshot.local_addr);
                         endpoints.push(external);
                         let invite = InviteCode::signed(&identity, endpoints)?.encode()?;
                         event_tx.send(WorkerEvent::InviteUpdated(invite)).ok();
@@ -892,15 +925,47 @@ fn evidence_tester_version() -> String {
     }
 }
 
-fn local_invite_endpoints(port: u16) -> Vec<SocketAddr> {
-    local_ip_hint()
-        .map(|ip| vec![SocketAddr::new(ip, port)])
-        .unwrap_or_else(|| vec!["127.0.0.1:47000".parse().expect("static endpoint is valid")])
+fn local_invite_endpoints(bound_addr: SocketAddr) -> Vec<SocketAddr> {
+    local_invite_endpoints_with_hint(bound_addr, local_ip_hint(bound_addr))
 }
 
-fn local_ip_hint() -> Option<IpAddr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
+fn local_invite_endpoints_with_hint(
+    bound_addr: SocketAddr,
+    hinted_ip: Option<IpAddr>,
+) -> Vec<SocketAddr> {
+    if !bound_addr.ip().is_unspecified() {
+        return vec![bound_addr];
+    }
+
+    let ip = hinted_ip
+        .filter(|hint| address_families_match(bound_addr.ip(), *hint))
+        .unwrap_or(match bound_addr {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        });
+    vec![SocketAddr::new(ip, bound_addr.port())]
+}
+
+fn address_families_match(left: IpAddr, right: IpAddr) -> bool {
+    matches!(
+        (left, right),
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+    )
+}
+
+fn local_ip_hint(bound_addr: SocketAddr) -> Option<IpAddr> {
+    let (probe_bind, route_target) = match bound_addr {
+        SocketAddr::V4(_) => (
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            "8.8.8.8:80".parse::<SocketAddr>().ok()?,
+        ),
+        SocketAddr::V6(_) => (
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+            "[2001:4860:4860::8888]:80".parse::<SocketAddr>().ok()?,
+        ),
+    };
+    let socket = UdpSocket::bind(probe_bind).ok()?;
+    socket.connect(route_target).ok()?;
     Some(socket.local_addr().ok()?.ip())
 }
 
@@ -917,8 +982,9 @@ fn app_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    let args = TesterArgs::parse();
     let (event_tx, event_rx) = mpsc::channel();
-    let command_tx = spawn_worker(event_tx);
+    let command_tx = spawn_worker(event_tx, args.bind);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("KonoNexus Network Tester")
         .with_inner_size([980.0, 760.0])
@@ -939,4 +1005,48 @@ fn main() -> eframe::Result<()> {
 #[allow(dead_code)]
 fn _state_path(base: &Path) -> PathBuf {
     base.join("KonoNexus").join("NetworkTester")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tester_bind_defaults_to_ipv4_and_accepts_bracketed_ipv6() {
+        let defaults = TesterArgs::try_parse_from(["tester"]).unwrap();
+        assert_eq!(defaults.bind, "0.0.0.0:47000".parse().unwrap());
+
+        let ipv6 = TesterArgs::try_parse_from(["tester", "--bind", "[::]:47000"]).unwrap();
+        assert_eq!(ipv6.bind, "[::]:47000".parse().unwrap());
+    }
+
+    #[test]
+    fn invite_hint_preserves_bound_family_and_actual_port() {
+        let ipv4 = local_invite_endpoints_with_hint(
+            "0.0.0.0:43123".parse().unwrap(),
+            Some("192.0.2.10".parse().unwrap()),
+        );
+        assert_eq!(ipv4, vec!["192.0.2.10:43123".parse().unwrap()]);
+
+        let ipv6 = local_invite_endpoints_with_hint(
+            "[::]:43124".parse().unwrap(),
+            Some("2001:db8::10".parse().unwrap()),
+        );
+        assert_eq!(ipv6, vec!["[2001:db8::10]:43124".parse().unwrap()]);
+    }
+
+    #[test]
+    fn invite_hint_rejects_other_family_and_keeps_explicit_bind() {
+        let fallback = local_invite_endpoints_with_hint(
+            "[::]:43125".parse().unwrap(),
+            Some("192.0.2.11".parse().unwrap()),
+        );
+        assert_eq!(fallback, vec!["[::1]:43125".parse().unwrap()]);
+
+        let explicit = local_invite_endpoints_with_hint(
+            "[2001:db8::12]:43126".parse().unwrap(),
+            Some("192.0.2.12".parse().unwrap()),
+        );
+        assert_eq!(explicit, vec!["[2001:db8::12]:43126".parse().unwrap()]);
+    }
 }
