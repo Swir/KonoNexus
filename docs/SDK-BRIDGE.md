@@ -1,6 +1,6 @@
 # KonoNexus SDK JSON bridge v1
 
-Status: integration-ready local host contract for `0.1.0-alpha.28`.
+Status: integration-ready local host contract for `0.1.0-alpha.29`.
 
 The SDK bridge gives Konofix and future platform bindings a small, language-neutral JSON boundary around `KonofixTransport`. It is a local application ABI only: it does **not** change the KNP UDP wire format, relax transport admission, or prove that the Windows or Android application integration is complete.
 

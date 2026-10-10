@@ -8,6 +8,7 @@ on:
       - "Cargo.lock"
       - "build.rs"
       - "assets/kononexus-tester.ico"
+      - "docs/TESTING.md"
       - "src/**"
       - "scripts/Verify-KonoNexusEvidence.ps1"
       - ".github/workflows/windows-probe-release.yml"
@@ -17,6 +18,7 @@ on:
       - "Cargo.lock"
       - "build.rs"
       - "assets/kononexus-tester.ico"
+      - "docs/TESTING.md"
       - "src/**"
       - "scripts/Verify-KonoNexusEvidence.ps1"
       - ".github/workflows/windows-probe-release.yml"
@@ -96,6 +98,7 @@ jobs:
           Copy-Item target\release\kononexus_probe.exe dist\kononexus_probe.exe
           Copy-Item target\release\kononexus_sdk_host.exe dist\kononexus_sdk_host.exe
           Copy-Item scripts\Verify-KonoNexusEvidence.ps1 dist\Verify-KonoNexusEvidence.ps1
+          Copy-Item docs\TESTING.md dist\TESTING.md
           $tokens = $null
           $parseErrors = $null
           [System.Management.Automation.Language.Parser]::ParseFile(
@@ -123,12 +126,20 @@ jobs:
           Main file:
           KonoNexus-Network-Tester.exe
 
+          Native public IPv6 matrix row (run on both physical endpoints):
+          .\KonoNexus-Network-Tester.exe --bind "[::]:47000"
+          The default launch is IPv4-only. One process uses one address family; this
+          option does not claim simultaneous dual-stack operation.
+          Manually require both signed reports to show evidence.path.method=direct,
+          a native IPv6 evidence.path.endpoint, and a public native IPv6
+          evidence.nat.observed_external_endpoint. Scenario metadata alone is not proof.
+
           Diagnostic console and signed-report verifier:
           kononexus_probe.exe
 
           Long-lived JSON Lines host for native application integration:
           kononexus_sdk_host.exe
-          Protocol: https://github.com/Swir/KonoNexus/blob/main/docs/SDK-BRIDGE.md
+          Protocol: https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_SHA/docs/SDK-BRIDGE.md
 
           Qualified signed evidence build:
           $expectedBuild
@@ -137,12 +148,15 @@ jobs:
           Signed reports:
           The GUI writes Ed25519-signed JSON results to
           %LOCALAPPDATA%\KonoNexus\NetworkTester\reports.
+          Click START TESTU WAN on both endpoints to produce the reciprocal pair.
           Verify a copied report with:
           powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -Report <report.json>
 
           Create and immediately qualify one reciprocal matrix row:
           powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -ReportA <pc-a.json> -ReportB <pc-b.json> -Scenario home_nat_pair -NetworkLabel "ISP A / ISP B" -PairOutput <pair.json> -RequireEligible
-          Pair metadata describes one operator-observed run; it does not prove the full matrix.
+          PAIR_VALID proves cryptographic/structural consistency, not a shared physical run.
+          Record one operator run ID, synchronized UTC interval and hashes of both GUI
+          captures, then confirm both endpoints participated in that same run.
 
           Create and immediately qualify the incremental seven-scenario manifest:
           powershell.exe -ExecutionPolicy Bypass -File .\Verify-KonoNexusEvidence.ps1 -PairFiles "<pair-1.json>;<pair-2.json>" -MatrixOutput <matrix.json> -RequireReady
@@ -154,7 +168,8 @@ jobs:
           real path/evidence and never converts an inconclusive result into a pass.
 
           Test procedure:
-          https://github.com/Swir/KonoNexus/blob/main/docs/TESTING.md
+          TESTING.md (included and checksummed in this package)
+          https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_SHA/docs/TESTING.md
           "@ | Set-Content -Encoding UTF8 dist\README-TEST.txt
           $payloads = @(
             "dist\KonoNexus-Network-Tester.exe",
@@ -163,6 +178,7 @@ jobs:
           )
           $checksumTargets = $payloads + @(
             "dist\README-TEST.txt",
+            "dist\TESTING.md",
             "dist\QUALIFIED-BUILD.txt",
             "dist\Verify-KonoNexusEvidence.ps1"
           )
@@ -186,6 +202,7 @@ jobs:
             dist/kononexus_probe.exe
             dist/kononexus_sdk_host.exe
             dist/README-TEST.txt
+            dist/TESTING.md
             dist/QUALIFIED-BUILD.txt
             dist/Verify-KonoNexusEvidence.ps1
             dist/SHA256SUMS.txt
@@ -214,4 +231,4 @@ jobs:
               exit 0
             }
           }
-          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe dist\QUALIFIED-BUILD.txt dist\Verify-KonoNexusEvidence.ps1 dist\SHA256SUMS.txt "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip.sha256" --clobber
+          gh release upload $tag dist\KonoNexus-Network-Tester.exe dist\kononexus_probe.exe dist\kononexus_sdk_host.exe dist\README-TEST.txt dist\TESTING.md dist\QUALIFIED-BUILD.txt dist\Verify-KonoNexusEvidence.ps1 dist\SHA256SUMS.txt "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip" "KonoNexus-$env:PACKAGE_VERSION-Network-Tester-Windows-x64.zip.sha256" --clobber

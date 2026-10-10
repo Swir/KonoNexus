@@ -170,3 +170,43 @@ async fn three_node_runtime_discovers_and_delivers_across_mesh() {
 
     let _ = std::fs::remove_dir_all(state_dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_node_ipv6_runtime_delivers_and_receipts() {
+    let state_dir = unique_state_dir();
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let config_a = KonofixSdkConfig::new(state_dir.join("ipv6-a.key"))
+        .with_bind("[::1]:0".parse().unwrap())
+        .with_routing_cache(state_dir.join("ipv6-a-routing.json"))
+        .with_hello_interval(Duration::from_millis(250))
+        .with_local_test_mode(true);
+    let mut a = KonofixTransport::spawn(config_a).await.unwrap();
+    let a_node_id = a.node_id().to_owned();
+    let a_addr = a.local_addr();
+    assert!(a_addr.is_ipv6());
+
+    let config_b = KonofixSdkConfig::new(state_dir.join("ipv6-b.key"))
+        .with_bind("[::1]:0".parse().unwrap())
+        .with_routing_cache(state_dir.join("ipv6-b-routing.json"))
+        .with_hello_interval(Duration::from_millis(250))
+        .with_local_test_mode(true);
+    let mut b = KonofixTransport::spawn(config_b).await.unwrap();
+    let b_node_id = b.node_id().to_owned();
+    assert!(b.local_addr().is_ipv6());
+    b.connect(a_node_id.clone(), vec![a_addr]).await.unwrap();
+
+    let message_id = b
+        .send(a_node_id.clone(), b"ipv6-runtime".to_vec())
+        .await
+        .unwrap();
+    wait_for_message(&mut a, &b_node_id, b"ipv6-runtime").await;
+    wait_for_receipt(&mut b, &a_node_id, message_id).await;
+
+    assert!(!a.is_finished());
+    assert!(!b.is_finished());
+
+    a.shutdown().await;
+    b.shutdown().await;
+    let _ = std::fs::remove_dir_all(state_dir);
+}

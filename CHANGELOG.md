@@ -4,6 +4,12 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+## 0.1.0-alpha.29
+
+- Added an explicit Network Tester `--bind` option so the same qualified Windows executable can run either the default IPv4 socket or a deliberate native IPv6 socket (`--bind "[::]:47000"`) on both physical endpoints.
+- Kept invite hints in the selected address family and actual bound port, with focused parser/hint tests and a real two-node IPv6 loopback delivery/receipt regression test.
+- Clarified that one tester process owns one UDP address family and that these local checks do not replace the signed, manually reviewed `public_ipv6` WAN evidence row.
+
 ## 0.1.0-alpha.28
 
 - Added `kononexus_sdk_host`, a long-lived JSON Lines process boundary for native application integration. It accepts multiple strict v1 requests without restarting the KonoNexus transport and streams correlated responses plus asynchronous delivery events.
