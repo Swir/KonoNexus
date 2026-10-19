@@ -19,6 +19,12 @@
 
 </div>
 
+## 📸 Screenshot
+
+![KonoNexus application screenshot](docs/screenshots/application.jpg)
+
+Windows Network Tester 0.1.0-alpha.29 from the published release, bound to localhost with a temporary identity. No WAN test has been run.
+
 ## Project status
 
 | Item | Status |
