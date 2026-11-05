@@ -6,6 +6,10 @@ Development log for KonoNexus.
 
 ## 0.1.0-alpha.30 — stability hardening
 
+- Reject local/private/reserved observations and loopback paths as WAN evidence,
+  including IPv4-mapped IPv6. Apply the same checks when signing and verifying
+  reports; the GUI no longer calls private endpoint observations public evidence.
+
 - Keep the tester runtime alive after rejected commands; close it and release UDP
   when the UI command channel closes. Reject self invites and overlapping tests.
 - Make Connect use the edited invite field instead of overwriting it from the

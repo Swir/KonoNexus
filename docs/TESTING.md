@@ -154,6 +154,17 @@ The report contains the exact local and target NodeIDs, selected path, endpoint 
 - `delivery_passed` means at least one authenticated end-to-end delivery was acknowledged;
 - `eligible_for_wan_matrix` additionally requires a selected target path and observed external endpoint evidence.
 
+Alpha.30 requires the observed address to be a public WAN candidate and rejects
+loopback bindings or paths, including IPv4-mapped loopback. Private, link-local,
+CGNAT/shared, documentation and reserved observations remain diagnostic data and
+do not qualify a report. The verifier rejects older reports that incorrectly
+claimed WAN eligibility for those addresses; repeat those runs with this build.
+Address-class filtering follows the
+[IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/)
+and [IANA IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/)
+special-purpose registries, with conservative native global-unicast IPv6
+eligibility. It does not establish physical connectivity by itself.
+
 Verify a copied report without trusting the machine or text editor that supplied it. The qualified Windows package includes `QUALIFIED-BUILD.txt` and a helper that reads that complete build identity automatically:
 
 ```powershell

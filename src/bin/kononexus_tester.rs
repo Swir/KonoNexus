@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
+use kononexus::test_evidence::wan_endpoint_eligible;
 use kononexus::{
     FilterCellStatus, InviteCode, KonofixSdkConfig, KonofixTransport, NatFilteringEvidence,
     NatMappingBehavior, NetworkDiagnostics, NodeIdentity, PathMethod, RelayAppEvent,
@@ -338,7 +339,7 @@ impl TesterApp {
         self.snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.observed_external_endpoint)
-            .is_some()
+            .is_some_and(wan_endpoint_eligible)
     }
 }
 

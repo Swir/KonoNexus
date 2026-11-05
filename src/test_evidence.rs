@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -504,8 +504,12 @@ impl SignedWanTestReport {
                 endpoint: path.endpoint.to_string(),
             });
         let delivery_passed = delivered > 0;
-        let eligible_for_wan_matrix =
-            delivery_passed && snapshot.observed_external_endpoint.is_some() && path.is_some();
+        let eligible_for_wan_matrix = delivery_passed
+            && snapshot
+                .observed_external_endpoint
+                .is_some_and(wan_endpoint_eligible)
+            && !snapshot.local_addr.ip().to_canonical().is_loopback()
+            && path.as_ref().is_some_and(physical_path_evidence);
 
         let evidence = WanTestEvidence {
             domain: WAN_TEST_REPORT_DOMAIN.to_owned(),
@@ -683,13 +687,68 @@ impl SignedWanTestReport {
             bail!("WAN test delivery verdict does not match counters");
         }
         let expected_eligibility = expected_pass
-            && evidence.nat.observed_external_endpoint.is_some()
-            && evidence.path.is_some();
+            && evidence
+                .nat
+                .observed_external_endpoint
+                .as_ref()
+                .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+                .is_some_and(wan_endpoint_eligible)
+            && !evidence
+                .local_endpoint
+                .parse::<SocketAddr>()?
+                .ip()
+                .to_canonical()
+                .is_loopback()
+            && evidence.path.as_ref().is_some_and(physical_path_evidence);
         if evidence.eligible_for_wan_matrix != expected_eligibility {
             bail!("WAN matrix eligibility does not match evidence");
         }
         Ok(())
     }
+}
+
+/// Address evidence must be routable beyond the local/private network. This
+/// filters address classes; it does not prove reachability or a physical WAN run.
+pub fn wan_endpoint_eligible(endpoint: SocketAddr) -> bool {
+    let ip = endpoint.ip().to_canonical();
+    if !crate::endpoint_publishable(SocketAddr::new(ip, endpoint.port())) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            octets[0] != 0
+                && octets[0] < 240
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
+                && !(octets[..3] == [192, 0, 0] && !matches!(octets[3], 9 | 10))
+                && octets[..3] != [192, 88, 99]
+                && !ip.is_documentation()
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            // Global-unicast candidates, excluding documentation allocations.
+            segments[0] & 0xe000 == 0x2000
+                && !(segments[0] == 0x2001
+                    && segments[1] < 0x0200
+                    && !(segments[1] == 1
+                        && segments[2..7] == [0; 5]
+                        && (1..=3).contains(&segments[7])
+                        || segments[1] == 3
+                        || segments[1] == 4 && segments[2] == 0x0112
+                        || (0x0020..=0x003f).contains(&segments[1])))
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
+        }
+    }
+}
+
+fn physical_path_evidence(path: &WanPathEvidence) -> bool {
+    path.endpoint.parse::<SocketAddr>().is_ok_and(|endpoint| {
+        let ip = endpoint.ip().to_canonical();
+        endpoint.port() != 0 && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+    })
 }
 
 fn reports_are_reciprocal(a: &SignedWanTestReport, b: &SignedWanTestReport) -> bool {
@@ -773,6 +832,84 @@ mod tests {
     use super::*;
     use crate::{FilterMatrixSnapshot, PathDiagnostic};
 
+    #[test]
+    fn wan_evidence_rejects_nonpublic_observations_even_when_delivery_passes() {
+        let identity = NodeIdentity::generate();
+        let target = NodeIdentity::generate().node_id();
+        for endpoint in [
+            "127.0.0.1:47000",
+            "10.0.0.1:47000",
+            "192.168.1.2:47000",
+            "100.64.0.1:47000",
+            "169.254.1.1:47000",
+            "0.1.2.3:47000",
+            "192.0.0.8:47000",
+            "198.18.1.1:47000",
+            "203.0.113.1:47000",
+            "240.0.0.1:47000",
+            "8.8.8.8:0",
+            "[::1]:47000",
+            "[::ffff:127.0.0.1]:47000",
+            "[::ffff:192.168.1.2]:47000",
+            "[fc00::1]:47000",
+            "[fe80::1]:47000",
+            "[2001:db8::1]:47000",
+            "[2001:2::1]:47000",
+            "[3fff::1]:47000",
+        ] {
+            let report = SignedWanTestReport::signed_at(
+                &identity,
+                &target,
+                &snapshot(target.clone(), Some(endpoint.parse().unwrap())),
+                10,
+                10,
+                0,
+                2.0,
+                "test",
+                123,
+            )
+            .unwrap();
+            assert!(report.evidence.delivery_passed);
+            assert!(!report.evidence.eligible_for_wan_matrix, "{endpoint}");
+            // A valid signature must not allow the old, false WAN claim.
+            let mut forged = report;
+            forged.evidence.eligible_for_wan_matrix = true;
+            forged.signature =
+                hex::encode(identity.sign(&serde_json::to_vec(&forged.evidence).unwrap()));
+            assert!(forged.verify().is_err(), "{endpoint}");
+        }
+        for endpoint in ["8.8.8.8:47000", "[2606:4700:4700::1111]:47000"] {
+            assert!(wan_endpoint_eligible(endpoint.parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn public_observation_cannot_qualify_a_loopback_binding_or_path() {
+        let identity = NodeIdentity::generate();
+        let target = NodeIdentity::generate().node_id();
+        for local_binding in [true, false] {
+            let mut diagnostics = snapshot(target.clone(), Some("8.8.8.8:47000".parse().unwrap()));
+            if local_binding {
+                diagnostics.local_addr = "127.0.0.1:47000".parse().unwrap();
+            } else {
+                diagnostics.active_paths[0].endpoint = "[::ffff:127.0.0.1]:47000".parse().unwrap();
+            }
+            let report = SignedWanTestReport::signed_at(
+                &identity,
+                &target,
+                &diagnostics,
+                10,
+                10,
+                0,
+                2.0,
+                "test",
+                123,
+            )
+            .unwrap();
+            assert!(!report.evidence.eligible_for_wan_matrix);
+        }
+    }
+
     fn snapshot(peer_node_id: String, external: Option<SocketAddr>) -> NetworkDiagnostics {
         NetworkDiagnostics {
             local_addr: "0.0.0.0:47000".parse().unwrap(),
@@ -790,7 +927,7 @@ mod tests {
             active_paths: vec![PathDiagnostic {
                 peer_node_id,
                 method: PathMethod::HolePunch,
-                endpoint: "198.51.100.20:47000".parse().unwrap(),
+                endpoint: "1.1.1.1:47000".parse().unwrap(),
             }],
             pending_punches: 0,
         }
@@ -816,7 +953,7 @@ mod tests {
         let report_a = SignedWanTestReport::signed_at(
             &identity_a,
             &node_b,
-            &snapshot(node_b.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+            &snapshot(node_b.clone(), Some("8.8.8.8:47000".parse().unwrap())),
             10,
             9,
             1,
@@ -828,7 +965,7 @@ mod tests {
         let report_b = SignedWanTestReport::signed_at(
             &identity_b,
             &node_a,
-            &snapshot(node_a.clone(), Some("198.51.100.20:47000".parse().unwrap())),
+            &snapshot(node_a.clone(), Some("1.1.1.1:47000".parse().unwrap())),
             10,
             10,
             0,
@@ -872,7 +1009,7 @@ mod tests {
         let report = SignedWanTestReport::signed_at(
             &identity,
             &target,
-            &snapshot(target.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+            &snapshot(target.clone(), Some("8.8.8.8:47000".parse().unwrap())),
             10,
             9,
             1,
@@ -899,7 +1036,7 @@ mod tests {
         let base = SignedWanTestReport::signed_at(
             &identity,
             &target,
-            &snapshot(target.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+            &snapshot(target.clone(), Some("8.8.8.8:47000".parse().unwrap())),
             10,
             10,
             0,
@@ -949,7 +1086,7 @@ mod tests {
             let report = SignedWanTestReport::signed_at(
                 &identity,
                 &target,
-                &snapshot(target.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+                &snapshot(target.clone(), Some("8.8.8.8:47000".parse().unwrap())),
                 sent,
                 delivered,
                 explicit_failed,
@@ -974,7 +1111,7 @@ mod tests {
         let mut report = SignedWanTestReport::signed_at(
             &identity,
             &target,
-            &snapshot(target.clone(), Some("203.0.113.10:47000".parse().unwrap())),
+            &snapshot(target.clone(), Some("8.8.8.8:47000".parse().unwrap())),
             10,
             8,
             1,
