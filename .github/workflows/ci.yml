@@ -9,8 +9,13 @@ permissions:
 
 jobs:
   rust:
-    name: Rust checks
-    runs-on: ubuntu-latest
+    name: Rust checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -26,13 +31,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --all --all-targets
+        run: cargo test --locked --all --all-targets
 
       - name: Check SDK-only library
-        run: cargo check --no-default-features --lib
+        run: cargo check --locked --no-default-features --lib
 
       - name: Clippy SDK-only library
-        run: cargo clippy --no-default-features --lib -- -D warnings
+        run: cargo clippy --locked --no-default-features --lib -- -D warnings
