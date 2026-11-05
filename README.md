@@ -21,9 +21,9 @@
 
 ## 📸 Screenshot
 
-![KonoNexus application screenshot](docs/screenshots/application.jpg)
+![KonoNexus Network Tester 0.1.0-alpha.30](docs/screenshots/application.png)
 
-Windows Network Tester 0.1.0-alpha.29 from the published release, bound to localhost with a temporary identity. No WAN test has been run.
+Windows Network Tester 0.1.0-alpha.30, captured from the running Windows application without a cursor. This local development run uses a temporary identity and a localhost UDP bind; it is not evidence of WAN connectivity.
 
 ## Project status
 
