@@ -5,8 +5,7 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
-      - "src/android.rs"
-      - "src/lib.rs"
+      - "src/**"
       - "android/**"
       - "docs/ANDROID-TRANSPORT.md"
       - ".github/workflows/android.yml"
@@ -15,8 +14,7 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
-      - "src/android.rs"
-      - "src/lib.rs"
+      - "src/**"
       - "android/**"
       - "docs/ANDROID-TRANSPORT.md"
       - ".github/workflows/android.yml"

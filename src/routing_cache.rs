@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -322,21 +323,43 @@ fn normalize_bucket_entries(
 }
 
 fn write_atomic(path: &Path, encoded: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut pending = tempfile::NamedTempFile::new_in(parent)
+        .context("failed to create temporary routing cache")?;
+    pending
+        .write_all(encoded)
+        .context("failed to write routing cache")?;
+    pending
+        .as_file()
+        .sync_all()
+        .context("failed to sync routing cache")?;
+    let mut pending = pending.into_temp_path();
+    let mut retries = 0;
+    loop {
+        match pending.persist(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if retries < 20 && cache_replace_is_busy(&error.error) => {
+                // Windows can briefly deny replacement while another reader or
+                // rename still holds the old destination. Keep the complete
+                // temporary file and retry, never remove the old snapshot.
+                pending = error.path;
+                retries += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                return Err(error.error)
+                    .with_context(|| format!("failed to commit routing cache {}", path.display()))
+            }
+        }
     }
+}
 
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, encoded)
-        .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("failed to replace {}", path.display()))?;
-    }
-    fs::rename(&temp_path, path)
-        .with_context(|| format!("failed to commit routing cache {}", path.display()))?;
-
-    Ok(())
+fn cache_replace_is_busy(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 fn cache_endpoint_allowed(endpoint: SocketAddr) -> bool {
@@ -367,6 +390,59 @@ fn unix_time_ms() -> Result<u64> {
 mod tests {
     use super::*;
     use std::env;
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_cache_replacement_keeps_the_previous_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("routing.json");
+        let original = new_cache_entry(
+            format!("knp1{:040x}", 1),
+            "192.0.2.1:47000".parse().unwrap(),
+        )
+        .unwrap();
+        save_routing_hints(&path, std::slice::from_ref(&original)).unwrap();
+        let permissions = fs::metadata(&path).unwrap().permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&path, readonly).unwrap();
+        let replacement = save_routing_hints(&path, &[]);
+        fs::set_permissions(&path, permissions).unwrap();
+        assert!(replacement.is_err());
+        assert_eq!(load_routing_hints(&path).unwrap(), vec![original]);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_cache_updates_preserve_complete_snapshots_and_neighbor_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("routing.json");
+        let neighbor = path.with_extension("tmp");
+        fs::write(&neighbor, "unrelated file").unwrap();
+        let entry = new_cache_entry(
+            format!("knp1{:040x}", 1),
+            "192.0.2.1:47000".parse().unwrap(),
+        )
+        .unwrap();
+        save_routing_hints(&path, std::slice::from_ref(&entry)).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let path = &path;
+                let entry = &entry;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        save_routing_hints(path, std::slice::from_ref(entry)).unwrap();
+                        assert_eq!(load_routing_hints(path).unwrap(), vec![entry.clone()]);
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_to_string(neighbor).unwrap(), "unrelated file");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
 
     fn node_ids_in_bucket(local_node_id: &str, bucket: usize, count: usize) -> Vec<String> {
         let mut matching = Vec::new();

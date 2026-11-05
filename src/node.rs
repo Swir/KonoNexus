@@ -655,6 +655,9 @@ impl KonoNode {
         bootstrap_peers: Vec<SocketAddr>,
         hello_interval: Duration,
     ) -> Result<Self> {
+        if hello_interval.is_zero() {
+            bail!("hello interval must be greater than zero");
+        }
         let local_node_id = identity.node_id();
         let socket = UdpSocket::bind(bind_addr)
             .await

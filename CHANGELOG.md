@@ -4,6 +4,29 @@ Development log for KonoNexus.
 
 ## Unreleased
 
+## 0.1.0-alpha.30 — stability hardening
+
+- Reject local/private/reserved observations and loopback paths as WAN evidence,
+  including IPv4-mapped IPv6. Apply the same checks when signing and verifying
+  reports; the GUI no longer calls private endpoint observations public evidence.
+
+- Keep the tester runtime alive after rejected commands; close it and release UDP
+  when the UI command channel closes. Reject self invites and overlapping tests.
+- Make Connect use the edited invite field instead of overwriting it from the
+  clipboard. Report a disconnected worker instead of leaving the UI testing.
+- Add tester `--peer` bootstrap hints and `--state-dir` for isolated identities.
+- Publish identity keys atomically without overwriting a concurrently created key;
+  create new Unix key files with owner-only permissions. Preserve invalid existing
+  identity files and return an error rather than silently generating a new NodeID.
+- Replace routing snapshots atomically using unique temporary files, preserving
+  the previous snapshot until replacement and avoiding concurrent-writer collisions.
+- Reject a zero hello interval before starting the network runtime.
+- Run locked Rust checks on Windows and Linux and require Windows tests before
+  packaging. Restrict release publication to main. Set the default Cargo executable
+  so documented `cargo run -- ...` commands work with multiple binaries.
+- Add regression coverage for command recovery, socket release, concurrent key
+  creation and cache writes. Real-network acceptance is still required for stable.
+
 ## 0.1.0-alpha.29
 
 - Added an explicit Network Tester `--bind` option so the same qualified Windows executable can run either the default IPv4 socket or a deliberate native IPv6 socket (`--bind "[::]:47000"`) on both physical endpoints.

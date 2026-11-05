@@ -21,16 +21,16 @@
 
 ## 📸 Screenshot
 
-![KonoNexus application screenshot](docs/screenshots/application.jpg)
+![KonoNexus Network Tester 0.1.0-alpha.30](docs/screenshots/application.jpg)
 
-Windows Network Tester 0.1.0-alpha.29 from the published release, bound to localhost with a temporary identity. No WAN test has been run.
+Windows Network Tester 0.1.0-alpha.30, captured from the running Windows application without a cursor. This local development run uses a temporary identity and a localhost UDP bind; it is not evidence of WAN connectivity.
 
 ## Project status
 
 | Item | Status |
 |---|---|
 | Current stage | Alpha / controlled network-testing candidate |
-| Source version | `0.1.0-alpha.29` |
+| Source version | `0.1.0-alpha.30` |
 | Roadmap | **48 / 49 = 98.0%** |
 | Core | Rust 2021 |
 | Current tester focus | Windows two-PC Internet testing |
@@ -108,7 +108,7 @@ The examples below document protocol flows that are already present in this bran
 
 ## Releases
 
-There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.29`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI.
+There is **no stable KonoNexus 1.0 release yet**. The active source/testing candidate is `0.1.0-alpha.30`. Release readiness depends on the remaining roadmap, integration and real multi-network evidence rather than source-only CI. See [stable release readiness](docs/STABLE-READINESS.md) for the remaining acceptance work.
 
 ## Principles
 

@@ -1,4 +1,4 @@
-# KonoNexus Alpha.28 External Test Procedure
+# KonoNexus Alpha.30 External Test Procedure
 
 Status: controlled testing candidate.
 
@@ -101,6 +101,32 @@ Use `KonoNexus-Network-Tester.exe` for the normal two-PC test:
 4. After both GUIs show the peer, click **START TESTU WAN** on both PCs. Each endpoint writes its own signed report; a one-sided run is not a reciprocal matrix row.
 5. The GUI reports `DIRECT`, `UDP HOLE PUNCH`, or `RELAY`, authenticated delivery RTT, delivery loss, NAT/endpoint evidence, NodeIDs, and a technical log.
 
+**Wklej invite** copies the clipboard into the editable field. **Połącz** uses
+the code currently in that field, including manually pasted or edited text.
+The tester rejects its own invite and keeps running after a rejected command.
+
+When both endpoints need an existing reachable mesh peer, start each tester with
+the same reachable coordinator (replace the example address):
+
+```powershell
+.\KonoNexus-Network-Tester.exe --peer <REACHABLE_PEER_IP>:47000
+```
+
+`--peer` may be repeated. Both testers must establish authenticated sessions with
+the coordinator before it can help them rendezvous or relay. This option does not
+create a public coordinator or make an unreachable peer reachable.
+
+For separate identities on one machine, use a distinct state directory and UDP
+port for each instance:
+
+```powershell
+.\KonoNexus-Network-Tester.exe --bind 127.0.0.1:47001 --state-dir .\state-a
+.\KonoNexus-Network-Tester.exe --bind 127.0.0.1:47002 --state-dir .\state-b
+```
+
+Such a run checks local operation only. Reports are written to `reports` inside
+the selected state directory; the default data directory below is unchanged.
+
 For the `public_ipv6` row, start the same qualified executable on **both** physical endpoints with an IPv6 bind:
 
 ```powershell
@@ -127,6 +153,17 @@ The report contains the exact local and target NodeIDs, selected path, endpoint 
 
 - `delivery_passed` means at least one authenticated end-to-end delivery was acknowledged;
 - `eligible_for_wan_matrix` additionally requires a selected target path and observed external endpoint evidence.
+
+Alpha.30 requires the observed address to be a public WAN candidate and rejects
+loopback bindings or paths, including IPv4-mapped loopback. Private, link-local,
+CGNAT/shared, documentation and reserved observations remain diagnostic data and
+do not qualify a report. The verifier rejects older reports that incorrectly
+claimed WAN eligibility for those addresses; repeat those runs with this build.
+Address-class filtering follows the
+[IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry/)
+and [IANA IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry/)
+special-purpose registries, with conservative native global-unicast IPv6
+eligibility. It does not establish physical connectivity by itself.
 
 Verify a copied report without trusting the machine or text editor that supplied it. The qualified Windows package includes `QUALIFIED-BUILD.txt` and a helper that reads that complete build identity automatically:
 

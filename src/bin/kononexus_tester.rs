@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
+use kononexus::test_evidence::wan_endpoint_eligible;
 use kononexus::{
     FilterCellStatus, InviteCode, KonofixSdkConfig, KonofixTransport, NatFilteringEvidence,
     NatMappingBehavior, NetworkDiagnostics, NodeIdentity, PathMethod, RelayAppEvent,
@@ -10,7 +11,7 @@ use kononexus::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -27,6 +28,14 @@ struct TesterArgs {
     /// UDP address used by the KonoNexus runtime (use [::]:47000 for native IPv6).
     #[arg(long, default_value = "0.0.0.0:47000")]
     bind: SocketAddr,
+
+    /// Reachable mesh peers used for discovery, rendezvous and relay fallback.
+    #[arg(long = "peer")]
+    seed_peers: Vec<SocketAddr>,
+
+    /// Store identity, routing cache and reports in this directory.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -122,10 +131,19 @@ impl TesterApp {
         event_rx: Receiver<WorkerEvent>,
     ) -> Self {
         configure_style(&cc.egui_ctx);
+        let mut app = Self::from_channels(command_tx, event_rx);
+        app.clipboard = arboard::Clipboard::new().ok();
+        app
+    }
+
+    fn from_channels(
+        command_tx: tokio_mpsc::UnboundedSender<Command>,
+        event_rx: Receiver<WorkerEvent>,
+    ) -> Self {
         Self {
             command_tx,
             event_rx,
-            clipboard: arboard::Clipboard::new().ok(),
+            clipboard: None,
             status: UiStatus::Starting,
             node_id: String::new(),
             bind_addr: None,
@@ -230,22 +248,41 @@ impl TesterApp {
         }
     }
 
-    fn paste_and_connect(&mut self) {
+    fn paste_invite(&mut self) {
         if let Some(clipboard) = self.clipboard.as_mut() {
             match clipboard.get_text() {
                 Ok(text) => self.invite_input = text,
                 Err(error) => {
                     self.error = Some(format!("Nie można odczytać schowka: {error}"));
-                    return;
                 }
             }
+        } else {
+            self.error = Some("Schowek niedostępny. Wklej kod bezpośrednio do pola invite.".into());
+        }
+    }
+
+    fn connect_invite(&mut self) {
+        if self.status == UiStatus::Testing {
+            return;
         }
         match InviteCode::decode(&self.invite_input) {
             Ok(invite) => {
-                self.target_node_id = Some(invite.node_id.clone());
+                if invite.node_id == self.node_id {
+                    self.error = Some("To jest Twój invite. Użyj kodu drugiego komputera.".into());
+                    return;
+                }
+                let peer = invite.node_id.clone();
+                if self.command_tx.send(Command::Connect(invite)).is_err() {
+                    self.status = UiStatus::Failed;
+                    self.error =
+                        Some("Runtime sieciowy jest niedostępny. Uruchom tester ponownie.".into());
+                    return;
+                }
+                self.target_node_id = Some(peer);
                 self.status = UiStatus::Connecting;
                 self.error = None;
-                let _ = self.command_tx.send(Command::Connect(invite));
+                self.rtt_ms = None;
+                self.packet_loss = None;
             }
             Err(error) => {
                 self.status = UiStatus::Failed;
@@ -263,9 +300,17 @@ impl TesterApp {
     }
 
     fn start_test(&mut self) {
+        if self.status == UiStatus::Testing {
+            return;
+        }
         if self.target_node_id.is_some() {
-            self.status = UiStatus::Testing;
-            let _ = self.command_tx.send(Command::StartTest);
+            if self.command_tx.send(Command::StartTest).is_ok() {
+                self.status = UiStatus::Testing;
+            } else {
+                self.status = UiStatus::Failed;
+                self.error =
+                    Some("Runtime sieciowy jest niedostępny. Uruchom tester ponownie.".into());
+            }
         } else {
             self.error = Some(
                 "Najpierw wklej invite z drugiego komputera albo poczekaj na połączenie.".into(),
@@ -294,7 +339,7 @@ impl TesterApp {
         self.snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.observed_external_endpoint)
-            .is_some()
+            .is_some_and(wan_endpoint_eligible)
     }
 }
 
@@ -515,13 +560,15 @@ fn invite_joiner(ui: &mut egui::Ui, app: &mut TesterApp) {
                 .font(egui::TextStyle::Monospace),
         );
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Wklej invite").clicked() {
-                app.paste_and_connect();
-            }
-            if ui.button("Połącz").clicked() {
-                app.paste_and_connect();
-            }
+        ui.add_enabled_ui(app.status != UiStatus::Testing, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Wklej invite").clicked() {
+                    app.paste_invite();
+                }
+                if ui.button("Połącz").clicked() {
+                    app.connect_invite();
+                }
+            })
         });
         ui.add_space(6.0);
         ui.label(
@@ -635,7 +682,11 @@ fn technical_details(ui: &mut egui::Ui, app: &TesterApp) {
                 );
                 detail(ui, "DHT records", &snapshot.dht_records.to_string());
                 detail(ui, "Pending punches", &snapshot.pending_punches.to_string());
-                if let Some(path) = snapshot.active_paths.first() {
+                if let Some(path) = snapshot
+                    .active_paths
+                    .iter()
+                    .find(|path| Some(path.peer_node_id.as_str()) == app.target_node_id.as_deref())
+                {
                     detail(ui, "Path endpoint", &path.endpoint.to_string());
                 }
             }
@@ -713,7 +764,7 @@ fn filter_cell_label(status: FilterCellStatus) -> &'static str {
 
 fn spawn_worker(
     event_tx: Sender<WorkerEvent>,
-    bind_addr: SocketAddr,
+    args: TesterArgs,
 ) -> tokio_mpsc::UnboundedSender<Command> {
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
     std::thread::Builder::new()
@@ -724,8 +775,7 @@ fn spawn_worker(
                 .build();
             match runtime {
                 Ok(runtime) => {
-                    if let Err(error) =
-                        runtime.block_on(worker(command_rx, event_tx.clone(), bind_addr))
+                    if let Err(error) = runtime.block_on(worker(command_rx, event_tx.clone(), args))
                     {
                         let _ = event_tx.send(WorkerEvent::Error(format!("{error:#}")));
                     }
@@ -744,19 +794,22 @@ fn spawn_worker(
 async fn worker(
     mut command_rx: tokio_mpsc::UnboundedReceiver<Command>,
     event_tx: Sender<WorkerEvent>,
-    bind_addr: SocketAddr,
+    args: TesterArgs,
 ) -> Result<()> {
-    let state_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("KonoNexus")
-        .join("NetworkTester");
+    let state_dir = args.state_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("KonoNexus")
+            .join("NetworkTester")
+    });
     std::fs::create_dir_all(&state_dir).context("nie można utworzyć katalogu danych testera")?;
     let identity_path = state_dir.join("identity.key");
     let identity = NodeIdentity::load_or_create(&identity_path)?;
     let node_id = identity.node_id();
 
     let config = KonofixSdkConfig::new(identity_path.clone())
-        .with_bind(bind_addr)
+        .with_bind(args.bind)
+        .with_seed_peers(args.seed_peers)
         .with_routing_cache(state_dir.join("routing-cache.json"))
         .with_event_capacity(256);
     let mut transport = KonofixTransport::spawn(config).await?;
@@ -779,25 +832,14 @@ async fn worker(
 
     loop {
         tokio::select! {
-            Some(command) = command_rx.recv() => {
-                match command {
-                    Command::Connect(invite) => {
-                        invite.verify()?;
-                        let peer = invite.node_id.clone();
-                        let endpoints = invite.socket_endpoints();
-                        transport.connect(peer.clone(), endpoints.clone()).await?;
-                        target = Some(peer.clone());
-                        event_tx.send(WorkerEvent::Target(peer.clone())).ok();
-                        event_tx.send(WorkerEvent::Log(format!(
-                            "Invite zweryfikowany. Próba DIRECT → HOLE PUNCH → RELAY do {peer} przez {} endpoint(y).",
-                            endpoints.len()
-                        ))).ok();
-                    }
-                    Command::StartTest => {
-                        let peer = target.clone().context("brak docelowego NodeID")?;
-                        test = Some(ActiveTest::new(peer));
-                        event_tx.send(WorkerEvent::TestStarted).ok();
-                    }
+            command = command_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                if let Err(error) = handle_worker_command(
+                    command, &transport, &mut target, &mut test, &event_tx
+                ).await {
+                    event_tx.send(WorkerEvent::Error(format!("{error:#}"))).ok();
                 }
             }
             event = transport.next_event() => {
@@ -916,6 +958,43 @@ async fn worker(
             }
         }
     }
+    transport.shutdown().await;
+    Ok(())
+}
+
+async fn handle_worker_command(
+    command: Command,
+    transport: &KonofixTransport,
+    target: &mut Option<String>,
+    test: &mut Option<ActiveTest>,
+    event_tx: &Sender<WorkerEvent>,
+) -> Result<()> {
+    if test.is_some() {
+        anyhow::bail!("Poczekaj na zakończenie bieżącego testu.");
+    }
+    match command {
+        Command::Connect(invite) => {
+            invite.verify()?;
+            if invite.node_id == transport.node_id() {
+                anyhow::bail!("To jest Twój invite. Użyj kodu drugiego komputera.");
+            }
+            let peer = invite.node_id.clone();
+            let endpoints = invite.socket_endpoints();
+            transport.connect(peer.clone(), endpoints.clone()).await?;
+            *target = Some(peer.clone());
+            event_tx.send(WorkerEvent::Target(peer.clone())).ok();
+            event_tx.send(WorkerEvent::Log(format!(
+                "Invite zweryfikowany. Próba DIRECT → HOLE PUNCH → RELAY do {peer} przez {} endpoint(y).",
+                endpoints.len()
+            ))).ok();
+        }
+        Command::StartTest => {
+            let peer = target.clone().context("brak docelowego NodeID")?;
+            *test = Some(ActiveTest::new(peer));
+            event_tx.send(WorkerEvent::TestStarted).ok();
+        }
+    }
+    Ok(())
 }
 
 fn evidence_tester_version() -> String {
@@ -984,7 +1063,7 @@ fn app_icon() -> Option<egui::IconData> {
 fn main() -> eframe::Result<()> {
     let args = TesterArgs::parse();
     let (event_tx, event_rx) = mpsc::channel();
-    let command_tx = spawn_worker(event_tx, args.bind);
+    let command_tx = spawn_worker(event_tx, args);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("KonoNexus Network Tester")
         .with_inner_size([980.0, 760.0])
@@ -1002,14 +1081,235 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[allow(dead_code)]
-fn _state_path(base: &Path) -> PathBuf {
-    base.join("KonoNexus").join("NetworkTester")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app() -> (TesterApp, tokio_mpsc::UnboundedReceiver<Command>) {
+        let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::channel();
+        (TesterApp::from_channels(command_tx, event_rx), command_rx)
+    }
+
+    #[test]
+    fn connect_uses_edited_invite_and_rejects_self_without_replacing_target() {
+        let (mut app, mut commands) = test_app();
+        let local = NodeIdentity::generate();
+        let remote = NodeIdentity::generate();
+        app.node_id = local.node_id();
+        app.invite_input = InviteCode::signed(&remote, vec!["192.0.2.1:47000".parse().unwrap()])
+            .unwrap()
+            .encode()
+            .unwrap();
+        app.connect_invite();
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::Connect(invite) if invite.node_id == remote.node_id())
+        );
+        assert_eq!(
+            app.target_node_id.as_deref(),
+            Some(remote.node_id().as_str())
+        );
+
+        app.invite_input = InviteCode::signed(&local, vec!["192.0.2.2:47000".parse().unwrap()])
+            .unwrap()
+            .encode()
+            .unwrap();
+        app.connect_invite();
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            app.target_node_id.as_deref(),
+            Some(remote.node_id().as_str())
+        );
+        assert!(app.error.as_deref().unwrap().contains("Twój invite"));
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_leave_ui_testing_or_connecting() {
+        let (mut app, commands) = test_app();
+        drop(commands);
+        let remote = NodeIdentity::generate();
+        app.invite_input = InviteCode::signed(&remote, vec!["192.0.2.1:47000".parse().unwrap()])
+            .unwrap()
+            .encode()
+            .unwrap();
+        app.connect_invite();
+        assert!(app.status == UiStatus::Failed);
+        assert!(app.target_node_id.is_none());
+        app.target_node_id = Some(remote.node_id());
+        app.start_test();
+        assert!(app.status == UiStatus::Failed);
+    }
+
+    async fn wait_worker_event(
+        events: &Receiver<WorkerEvent>,
+        predicate: impl Fn(&WorkerEvent) -> bool,
+    ) -> WorkerEvent {
+        time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.try_recv() {
+                    Ok(event) if predicate(&event) => return event,
+                    Ok(_) => {}
+                    Err(mpsc::TryRecvError::Empty) => time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("worker disconnected: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("worker event timeout")
+    }
+
+    #[tokio::test]
+    async fn worker_recovers_after_rejected_commands_and_releases_socket_on_close() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "knp-worker-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (commands, command_rx) = tokio_mpsc::unbounded_channel();
+        let (events_tx, events) = mpsc::channel();
+        let task = tokio::spawn(worker(
+            command_rx,
+            events_tx,
+            TesterArgs {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                seed_peers: Vec::new(),
+                state_dir: Some(state_dir.clone()),
+            },
+        ));
+        let ready =
+            wait_worker_event(&events, |event| matches!(event, WorkerEvent::Ready { .. })).await;
+        let WorkerEvent::Ready {
+            invite, bind_addr, ..
+        } = ready
+        else {
+            unreachable!()
+        };
+        commands.send(Command::StartTest).unwrap();
+        wait_worker_event(&events, |event| matches!(event, WorkerEvent::Error(_))).await;
+        commands
+            .send(Command::Connect(InviteCode::decode(&invite).unwrap()))
+            .unwrap();
+        wait_worker_event(&events, |event| matches!(event, WorkerEvent::Error(_))).await;
+
+        let remote = NodeIdentity::generate();
+        let invite = InviteCode::signed(&remote, vec!["127.0.0.1:47001".parse().unwrap()]).unwrap();
+        commands.send(Command::Connect(invite)).unwrap();
+        wait_worker_event(
+            &events,
+            |event| matches!(event, WorkerEvent::Target(id) if id == &remote.node_id()),
+        )
+        .await;
+        commands.send(Command::StartTest).unwrap();
+        wait_worker_event(&events, |event| matches!(event, WorkerEvent::TestStarted)).await;
+        drop(commands);
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let socket = UdpSocket::bind(bind_addr).expect("worker must release its socket");
+        drop(socket);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_tester_workers_deliver_and_write_verified_local_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let (commands_a, receiver_a) = tokio_mpsc::unbounded_channel();
+        let (commands_b, receiver_b) = tokio_mpsc::unbounded_channel();
+        let (sender_a, events_a) = mpsc::channel();
+        let (sender_b, events_b) = mpsc::channel();
+        let task_a = tokio::spawn(worker(
+            receiver_a,
+            sender_a,
+            TesterArgs {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                seed_peers: Vec::new(),
+                state_dir: Some(directory.path().join("a")),
+            },
+        ));
+        let task_b = tokio::spawn(worker(
+            receiver_b,
+            sender_b,
+            TesterArgs {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                seed_peers: Vec::new(),
+                state_dir: Some(directory.path().join("b")),
+            },
+        ));
+        let ready_a = wait_worker_event(&events_a, |event| {
+            matches!(event, WorkerEvent::Ready { .. })
+        })
+        .await;
+        let ready_b = wait_worker_event(&events_b, |event| {
+            matches!(event, WorkerEvent::Ready { .. })
+        })
+        .await;
+        let WorkerEvent::Ready {
+            invite,
+            node_id: id_a,
+            ..
+        } = ready_a
+        else {
+            unreachable!()
+        };
+        let WorkerEvent::Ready { node_id: id_b, .. } = ready_b else {
+            unreachable!()
+        };
+        commands_b
+            .send(Command::Connect(InviteCode::decode(&invite).unwrap()))
+            .unwrap();
+        wait_worker_event(
+            &events_b,
+            |event| matches!(event, WorkerEvent::Target(id) if id == &id_a),
+        )
+        .await;
+        commands_b.send(Command::StartTest).unwrap();
+        wait_worker_event(
+            &events_a,
+            |event| matches!(event, WorkerEvent::Target(id) if id == &id_b),
+        )
+        .await;
+        commands_a.send(Command::StartTest).unwrap();
+        for (events, local, remote) in [(&events_a, &id_a, &id_b), (&events_b, &id_b, &id_a)] {
+            let finished = wait_worker_event(events, |event| {
+                matches!(event, WorkerEvent::TestFinished { .. })
+            })
+            .await;
+            let WorkerEvent::TestFinished {
+                report_path,
+                packet_loss,
+                wan_matrix_eligible,
+                ..
+            } = finished
+            else {
+                unreachable!()
+            };
+            let report = SignedWanTestReport::read_verified(&report_path).unwrap();
+            assert_eq!(&report.evidence.local_node_id, local);
+            assert_eq!(&report.evidence.target_node_id, remote);
+            assert_eq!(report.evidence.metrics.sent, TEST_SAMPLE_COUNT);
+            assert_eq!(report.evidence.metrics.delivered, TEST_SAMPLE_COUNT);
+            assert_eq!(packet_loss, 0.0);
+            assert!(
+                !wan_matrix_eligible,
+                "loopback must never count as WAN evidence"
+            );
+            assert!(!report.evidence.eligible_for_wan_matrix);
+        }
+        drop(commands_a);
+        drop(commands_b);
+        time::timeout(Duration::from_secs(5), task_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        time::timeout(Duration::from_secs(5), task_b)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn tester_bind_defaults_to_ipv4_and_accepts_bracketed_ipv6() {
@@ -1018,6 +1318,18 @@ mod tests {
 
         let ipv6 = TesterArgs::try_parse_from(["tester", "--bind", "[::]:47000"]).unwrap();
         assert_eq!(ipv6.bind, "[::]:47000".parse().unwrap());
+        let configured = TesterArgs::try_parse_from([
+            "tester",
+            "--peer",
+            "192.0.2.1:47000",
+            "--peer",
+            "192.0.2.2:47000",
+            "--state-dir",
+            "test-state",
+        ])
+        .unwrap();
+        assert_eq!(configured.seed_peers.len(), 2);
+        assert_eq!(configured.state_dir, Some(PathBuf::from("test-state")));
     }
 
     #[test]
